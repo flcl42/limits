@@ -21,7 +21,7 @@ usage endpoint with the local Kimi OAuth token or `KIMI_API_KEY`. Kimi local
 `usage.record` events are used only for the token-count line in the popup. It
 does not invoke `kimi -p`. The app does not write a usage state file.
 
-The same `gpt.exe` process also performs the old limits watchdog work: it
+The same `limits.exe` process also performs the old limits watchdog work: it
 monitors C: and D: free space and runs the pause/resume batch files when Claude
 or disk thresholds cross.
 
@@ -30,7 +30,7 @@ The app uses raw Win32 tray APIs and does not depend on the Windows Desktop fram
 Download the latest released executable to the current directory:
 
 ```powershell
-gh release download --pattern gpt.exe --clobber
+gh release download --repo flcl42/limits --pattern limits.exe --clobber
 ```
 
 Publish the native executable to the current directory:
@@ -39,14 +39,15 @@ Publish the native executable to the current directory:
 dotnet publish .\limits.csproj -c Release -r win-x64 -o . -p:PublishAot=true -p:SelfContained=true -p:InvariantGlobalization=true
 ```
 
-The published binary is `.\gpt.exe`.
+The published binary is `.\limits.exe`.
 
-Publish the native executable to `C:\Programs`:
+Publish the native executable to `D:\Programs`:
 
 ```powershell
 .\install.ps1
 ```
 
-The installer publishes to `publish\gpt`, asks an existing tray process to shut
-down cleanly, copies only `gpt.exe` into `C:\Programs`, and starts it. The
-installed binary is `C:\Programs\gpt.exe`.
+The installer publishes to `publish\limits`, asks an existing tray process to
+shut down cleanly, copies only `limits.exe` into `D:\Programs`, updates the
+Startup shortcut, removes old installed `gpt.exe` binaries, and starts it. The
+installed binary is `D:\Programs\limits.exe`.
