@@ -1,16 +1,23 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.Win32;
 
-namespace GptCheck;
+namespace Limits;
 
 internal static class Program
 {
     [STAThread]
-    private static int Main()
+    private static int Main(string[] args)
     {
+        if (args.Any(argument => string.Equals(argument, "--shutdown", StringComparison.OrdinalIgnoreCase)))
+        {
+            return TrayApplication.RequestShutdown();
+        }
+
         using TrayApplication application = new();
         return application.Run();
     }
@@ -23,12 +30,22 @@ internal sealed class TrayApplication : IDisposable
     private const uint TrayCallbackMessage = NativeMethods.WM_APP + 1;
     private const uint CodexResultMessage = NativeMethods.WM_APP + 2;
     private const uint ClaudeResultMessage = NativeMethods.WM_APP + 3;
+    private const uint ShutdownMessage = NativeMethods.WM_APP + 4;
+    private const uint KimiResultMessage = NativeMethods.WM_APP + 5;
+    private const uint KimiTrayIconId = 3;
     private const nuint RefreshTimerId = 1;
     private const uint RefreshIntervalMs = 300_000;
+    private const int ClaudeRefreshTimeoutSeconds = 25;
     private const uint CommandRefresh = 1001;
     private const uint CommandOpenCodexSessions = 1002;
     private const uint CommandExit = 1003;
     private const uint CommandOpenClaudeUsage = 1004;
+    private const uint CommandOpenKimiSessions = 1005;
+    private const string ShutdownEventName = @"Local\Limits.Shutdown";
+
+    private static readonly Guid CodexTrayIconGuid = new("2a642a8d-169a-4035-ad86-ea43b5e87764");
+    private static readonly Guid ClaudeTrayIconGuid = new("4654b565-47c7-49af-a257-8f26d82c0ec0");
+    private static readonly Guid KimiTrayIconGuid = new("918bd040-6a80-4b43-ae66-13a8f5bb1d57");
 
     private static readonly NativeMethods.WndProcDelegate WindowProcedure = HandleWindowMessage;
     private static TrayApplication? Current;
@@ -36,34 +53,99 @@ internal sealed class TrayApplication : IDisposable
     private readonly object _shellNotifyQueueLock = new();
     private readonly CodexUsageReader _codexUsageReader = new();
     private readonly ClaudeUsageReader _claudeUsageReader = new();
+    private readonly KimiUsageReader _kimiUsageReader = new();
     private readonly LimitWatchdog _limitWatchdog = new();
-    private readonly string _windowClassName = $"gptcheck.{Environment.ProcessId}";
+    private readonly string _windowClassName = $"limits.{Environment.ProcessId}";
+    private readonly EventWaitHandle _shutdownEvent;
+    private readonly RegisteredWaitHandle _shutdownRegistration;
+    private readonly uint _taskbarCreatedMessage;
     private Task _shellNotifyQueue = Task.CompletedTask;
 
     private IntPtr _windowHandle;
     private IntPtr _codexIconHandle;
     private IntPtr _claudeIconHandle;
+    private IntPtr _kimiIconHandle;
     private bool _codexTrayIconAdded;
     private bool _claudeTrayIconAdded;
+    private bool _kimiTrayIconAdded;
     private bool _windowClassRegistered;
     private string? _codexIconKey;
     private string? _claudeIconKey;
-    private string _codexTooltip = "gptcheck";
+    private string? _kimiIconKey;
+    private string? _codexAppliedTooltip;
+    private string? _claudeAppliedTooltip;
+    private string? _kimiAppliedTooltip;
+    private string _codexTooltip = "limits";
     private string _codexStatusText = "Loading Codex usage...";
     private string _codexDetailText = "Reading local Codex sessions.";
     private string _codexSparkUsageText = "Spark usage: loading...";
     private string _codexUpdatedText = string.Empty;
     private string _codexSourceText = string.Empty;
-    private string _claudeTooltip = "Claude usage";
+    private string _claudeTooltip = "limits";
     private string _claudeStatusText = "Loading Claude usage...";
     private string _claudeDetailText = "Reading Claude OAuth usage.";
     private string _claudeUpdatedText = string.Empty;
     private string _claudeSourceText = string.Empty;
+    private string _kimiTooltip = "limits";
+    private string _kimiStatusText = "Loading Kimi usage...";
+    private string _kimiDetailText = "Reading Kimi Code quota.";
+    private string _kimiTokenUsageText = "Kimi tokens: loading...";
+    private string _kimiUpdatedText = string.Empty;
+    private string _kimiSourceText = string.Empty;
+    private KimiUsageSnapshot? _lastKimiSnapshot;
     private volatile bool _codexRefreshInFlight;
     private volatile UsageReadResult? _pendingCodexResult;
     private volatile bool _claudeRefreshInFlight;
     private volatile ClaudeUsageReadResult? _pendingClaudeResult;
+    private volatile bool _kimiRefreshInFlight;
+    private volatile KimiUsageReadResult? _pendingKimiResult;
     private volatile bool _limitWatchdogInFlight;
+
+    public TrayApplication()
+    {
+        _shutdownEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShutdownEventName);
+        _shutdownRegistration = ThreadPool.RegisterWaitForSingleObject(
+            _shutdownEvent,
+            static (state, timedOut) =>
+            {
+                if (timedOut || state is not TrayApplication application)
+                {
+                    return;
+                }
+
+                IntPtr windowHandle = application._windowHandle;
+                if (windowHandle != IntPtr.Zero)
+                {
+                    NativeMethods.PostMessage(windowHandle, ShutdownMessage, IntPtr.Zero, IntPtr.Zero);
+                }
+            },
+            this,
+            -1,
+            executeOnlyOnce: false);
+        _taskbarCreatedMessage = NativeMethods.RegisterWindowMessage("TaskbarCreated");
+    }
+
+    public static int RequestShutdown()
+    {
+        try
+        {
+            using EventWaitHandle shutdownEvent = EventWaitHandle.OpenExisting(ShutdownEventName);
+            shutdownEvent.Set();
+            return 0;
+        }
+        catch (WaitHandleCannotBeOpenedException)
+        {
+            return 1;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return 2;
+        }
+        catch (IOException)
+        {
+            return 3;
+        }
+    }
 
     public int Run()
     {
@@ -72,6 +154,7 @@ internal sealed class TrayApplication : IDisposable
         CreateMessageWindow();
         UpdateCodexTrayIcon(TrayIconRenderer.CreateUnavailableIcon(), TrayIconRenderer.CodexUnavailableIconKey);
         UpdateClaudeTrayIcon(TrayIconRenderer.CreateClaudeUnavailableIcon(), TrayIconRenderer.ClaudeUnavailableIconKey);
+        UpdateKimiTrayIcon(TrayIconRenderer.CreateKimiUnavailableIcon(), TrayIconRenderer.KimiUnavailableIconKey);
         RefreshUsage();
         NativeMethods.SetTimer(_windowHandle, RefreshTimerId, RefreshIntervalMs, IntPtr.Zero);
 
@@ -92,6 +175,8 @@ internal sealed class TrayApplication : IDisposable
         }
 
         CleanupNativeResources();
+        _shutdownRegistration.Unregister(null);
+        _shutdownEvent.Dispose();
         GC.SuppressFinalize(this);
     }
 
@@ -119,13 +204,13 @@ internal sealed class TrayApplication : IDisposable
         _windowHandle = NativeMethods.CreateWindowEx(
             0,
             _windowClassName,
-            "gptcheck",
+            "limits",
             0,
             0,
             0,
             0,
             0,
-            NativeMethods.HWND_MESSAGE,
+            IntPtr.Zero,
             IntPtr.Zero,
             NativeMethods.GetModuleHandle(null),
             IntPtr.Zero);
@@ -140,6 +225,7 @@ internal sealed class TrayApplication : IDisposable
     {
         RefreshCodexUsage();
         RefreshClaudeUsage();
+        RefreshKimiUsage();
     }
 
     private void RefreshCodexUsage()
@@ -189,7 +275,7 @@ internal sealed class TrayApplication : IDisposable
 
         if (result.Snapshot is null)
         {
-            _codexTooltip = "gptcheck unavailable";
+            _codexTooltip = "Codex: usage unavailable";
             _codexStatusText = "No Codex usage data found";
             _codexDetailText = result.ErrorMessage ?? "No token_count events were found.";
             _codexSparkUsageText = BuildSparkUsage(result.SparkSnapshot);
@@ -225,15 +311,7 @@ internal sealed class TrayApplication : IDisposable
         // owner stops pumping. Fetch off-thread and post the result back to the UI thread.
         Task.Run(() =>
         {
-            ClaudeUsageReadResult result;
-            try
-            {
-                result = _claudeUsageReader.ReadLatestSnapshot();
-            }
-            catch (Exception exception)
-            {
-                result = new ClaudeUsageReadResult(null, exception.Message);
-            }
+            ClaudeUsageReadResult result = ReadClaudeUsageWithTimeout();
 
             _pendingClaudeResult = result;
 
@@ -243,6 +321,32 @@ internal sealed class TrayApplication : IDisposable
                 _claudeRefreshInFlight = false;
             }
         });
+    }
+
+    private ClaudeUsageReadResult ReadClaudeUsageWithTimeout()
+    {
+        Task<ClaudeUsageReadResult> readTask = Task.Run(() =>
+        {
+            try
+            {
+                return _claudeUsageReader.ReadLatestSnapshot();
+            }
+            catch (Exception exception)
+            {
+                return new ClaudeUsageReadResult(null, exception.Message);
+            }
+        });
+
+        try
+        {
+            return readTask.Wait(TimeSpan.FromSeconds(ClaudeRefreshTimeoutSeconds))
+                ? readTask.Result
+                : new ClaudeUsageReadResult(null, $"Claude usage request timed out after {ClaudeRefreshTimeoutSeconds}s.");
+        }
+        catch (AggregateException exception)
+        {
+            return new ClaudeUsageReadResult(null, exception.InnerException?.Message ?? exception.Message);
+        }
     }
 
     private void ApplyClaudeResult()
@@ -258,7 +362,7 @@ internal sealed class TrayApplication : IDisposable
 
         if (result.Snapshot is null)
         {
-            _claudeTooltip = "Claude usage unavailable";
+            _claudeTooltip = "Claude: usage unavailable";
             _claudeStatusText = "No Claude usage data found";
             _claudeDetailText = result.ErrorMessage ?? "Claude usage limits were not found.";
             _claudeUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
@@ -276,6 +380,84 @@ internal sealed class TrayApplication : IDisposable
         _claudeSourceText = snapshot.SourceFile;
         UpdateClaudeTrayIcon(TrayIconRenderer.CreateClaudeIcon(snapshot), TrayIconRenderer.GetClaudeIconKey(snapshot));
         RunLimitWatchdog(snapshot);
+    }
+
+    private void RefreshKimiUsage()
+    {
+        if (_kimiRefreshInFlight)
+        {
+            return;
+        }
+
+        _kimiRefreshInFlight = true;
+        IntPtr windowHandle = _windowHandle;
+
+        Task.Run(() =>
+        {
+            KimiUsageReadResult result;
+            try
+            {
+                result = _kimiUsageReader.ReadLatestSnapshot();
+            }
+            catch (Exception exception)
+            {
+                result = new KimiUsageReadResult(null, exception.Message);
+            }
+
+            _pendingKimiResult = result;
+
+            if (windowHandle == IntPtr.Zero ||
+                !NativeMethods.PostMessage(windowHandle, KimiResultMessage, IntPtr.Zero, IntPtr.Zero))
+            {
+                _kimiRefreshInFlight = false;
+            }
+        });
+    }
+
+    private void ApplyKimiResult()
+    {
+        KimiUsageReadResult? result = _pendingKimiResult;
+        _pendingKimiResult = null;
+        _kimiRefreshInFlight = false;
+
+        if (result is null)
+        {
+            return;
+        }
+
+        if (result.Snapshot is null)
+        {
+            if (_lastKimiSnapshot is { } lastSnapshot)
+            {
+                _kimiTooltip = BuildKimiStaleTooltip(lastSnapshot);
+                _kimiStatusText = $"{BuildKimiHeadline(lastSnapshot)} - refresh failed";
+                _kimiDetailText = result.ErrorMessage ?? "Kimi Code quota refresh failed.";
+                _kimiTokenUsageText = BuildKimiTokenUsage(lastSnapshot);
+                _kimiUpdatedText = $"Last seen {lastSnapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}; checked {DateTimeOffset.Now:HH:mm:ss}";
+                _kimiSourceText = _kimiUsageReader.UsageEndpoint;
+                UpdateKimiTrayIcon(TrayIconRenderer.CreateKimiIcon(lastSnapshot), TrayIconRenderer.GetKimiIconKey(lastSnapshot));
+                return;
+            }
+
+            _kimiTooltip = BuildKimiUnavailableTooltip(result.ErrorMessage);
+            _kimiStatusText = "No Kimi usage data found";
+            _kimiDetailText = result.ErrorMessage ?? "Kimi Code quota was not found.";
+            _kimiTokenUsageText = "Kimi tokens: unavailable";
+            _kimiUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
+            _kimiSourceText = _kimiUsageReader.UsageEndpoint;
+            UpdateKimiTrayIcon(TrayIconRenderer.CreateKimiUnavailableIcon(), TrayIconRenderer.KimiUnavailableIconKey);
+            return;
+        }
+
+        KimiUsageSnapshot snapshot = result.Snapshot;
+        _lastKimiSnapshot = snapshot;
+        _kimiTooltip = BuildKimiTooltip(snapshot);
+        _kimiStatusText = BuildKimiHeadline(snapshot);
+        _kimiDetailText = BuildKimiDetail(snapshot);
+        _kimiTokenUsageText = BuildKimiTokenUsage(snapshot);
+        _kimiUpdatedText = $"Seen {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
+        _kimiSourceText = snapshot.SourceFile;
+        UpdateKimiTrayIcon(TrayIconRenderer.CreateKimiIcon(snapshot), TrayIconRenderer.GetKimiIconKey(snapshot));
     }
 
     private void RunLimitWatchdog(ClaudeUsageSnapshot? snapshot)
@@ -307,6 +489,7 @@ internal sealed class TrayApplication : IDisposable
             ref _codexIconHandle,
             ref _codexTrayIconAdded,
             ref _codexIconKey,
+            ref _codexAppliedTooltip,
             iconKey,
             _codexTooltip);
     }
@@ -319,8 +502,22 @@ internal sealed class TrayApplication : IDisposable
             ref _claudeIconHandle,
             ref _claudeTrayIconAdded,
             ref _claudeIconKey,
+            ref _claudeAppliedTooltip,
             iconKey,
             _claudeTooltip);
+    }
+
+    private void UpdateKimiTrayIcon(IntPtr newIconHandle, string iconKey)
+    {
+        UpdateTrayIcon(
+            KimiTrayIconId,
+            newIconHandle,
+            ref _kimiIconHandle,
+            ref _kimiTrayIconAdded,
+            ref _kimiIconKey,
+            ref _kimiAppliedTooltip,
+            iconKey,
+            _kimiTooltip);
     }
 
     private void UpdateTrayIcon(
@@ -329,6 +526,7 @@ internal sealed class TrayApplication : IDisposable
         ref IntPtr iconHandle,
         ref bool trayIconAdded,
         ref string? currentIconKey,
+        ref string? currentTooltip,
         string newIconKey,
         string tooltip)
     {
@@ -337,15 +535,27 @@ internal sealed class TrayApplication : IDisposable
             return;
         }
 
-        if (trayIconAdded && string.Equals(currentIconKey, newIconKey, StringComparison.Ordinal))
+        bool iconUnchanged = trayIconAdded && string.Equals(currentIconKey, newIconKey, StringComparison.Ordinal);
+        bool tooltipUnchanged = string.Equals(currentTooltip, tooltip, StringComparison.Ordinal);
+        if (iconUnchanged && tooltipUnchanged)
         {
             NativeMethods.DestroyIcon(newIconHandle);
             return;
         }
 
-        IntPtr previousIconHandle = iconHandle;
-        iconHandle = newIconHandle;
-        currentIconKey = newIconKey;
+        IntPtr previousIconHandle = IntPtr.Zero;
+        if (iconUnchanged)
+        {
+            NativeMethods.DestroyIcon(newIconHandle);
+        }
+        else
+        {
+            previousIconHandle = iconHandle;
+            iconHandle = newIconHandle;
+            currentIconKey = newIconKey;
+        }
+
+        currentTooltip = tooltip;
 
         NativeMethods.NOTIFYICONDATA data = CreateNotifyIconData(iconId, iconHandle, tooltip);
         uint message;
@@ -376,7 +586,11 @@ internal sealed class TrayApplication : IDisposable
 
     private static void ExecuteShellNotify(uint message, NativeMethods.NOTIFYICONDATA data, IntPtr iconHandleToDestroy)
     {
-        NativeMethods.Shell_NotifyIcon(message, ref data);
+        bool notified = NativeMethods.Shell_NotifyIcon(message, ref data);
+        if (!notified && message == NativeMethods.NIM_ADD)
+        {
+            NativeMethods.Shell_NotifyIcon(NativeMethods.NIM_MODIFY, ref data);
+        }
 
         if (iconHandleToDestroy != IntPtr.Zero)
         {
@@ -391,12 +605,23 @@ internal sealed class TrayApplication : IDisposable
             cbSize = (uint)Marshal.SizeOf<NativeMethods.NOTIFYICONDATA>(),
             hWnd = _windowHandle,
             uID = iconId,
-            uFlags = NativeMethods.NIF_MESSAGE | NativeMethods.NIF_ICON | NativeMethods.NIF_TIP,
+            uFlags = NativeMethods.NIF_MESSAGE | NativeMethods.NIF_ICON | NativeMethods.NIF_TIP | NativeMethods.NIF_GUID,
             uCallbackMessage = TrayCallbackMessage,
             hIcon = iconHandle,
             szTip = TruncateTooltip(tooltip),
             szInfo = string.Empty,
-            szInfoTitle = string.Empty
+            szInfoTitle = string.Empty,
+            guidItem = GetTrayIconGuid(iconId)
+        };
+    }
+
+    private static Guid GetTrayIconGuid(uint iconId)
+    {
+        return iconId switch
+        {
+            ClaudeTrayIconId => ClaudeTrayIconGuid,
+            KimiTrayIconId => KimiTrayIconGuid,
+            _ => CodexTrayIconGuid
         };
     }
 
@@ -412,8 +637,18 @@ internal sealed class TrayApplication : IDisposable
 
     private IntPtr WndProc(IntPtr windowHandle, uint message, IntPtr wParam, IntPtr lParam)
     {
+        if (_taskbarCreatedMessage != 0 && message == _taskbarCreatedMessage)
+        {
+            RecreateTrayIcons();
+            return IntPtr.Zero;
+        }
+
         switch (message)
         {
+            case NativeMethods.WM_CLOSE:
+                NativeMethods.DestroyWindow(_windowHandle);
+                return IntPtr.Zero;
+
             case NativeMethods.WM_TIMER:
                 if ((nuint)wParam == RefreshTimerId)
                 {
@@ -431,9 +666,17 @@ internal sealed class TrayApplication : IDisposable
                 ApplyClaudeResult();
                 return IntPtr.Zero;
 
+            case KimiResultMessage:
+                ApplyKimiResult();
+                return IntPtr.Zero;
+
+            case ShutdownMessage:
+                NativeMethods.DestroyWindow(_windowHandle);
+                return IntPtr.Zero;
+
             case TrayCallbackMessage:
                 uint iconId = (uint)wParam.ToInt64();
-                if (iconId is not CodexTrayIconId and not ClaudeTrayIconId)
+                if (iconId is not CodexTrayIconId and not ClaudeTrayIconId and not KimiTrayIconId)
                 {
                     break;
                 }
@@ -461,6 +704,24 @@ internal sealed class TrayApplication : IDisposable
         return NativeMethods.DefWindowProc(windowHandle, message, wParam, lParam);
     }
 
+    private void RecreateTrayIcons()
+    {
+        _codexTrayIconAdded = false;
+        _claudeTrayIconAdded = false;
+        _kimiTrayIconAdded = false;
+        _codexIconKey = null;
+        _claudeIconKey = null;
+        _kimiIconKey = null;
+        _codexAppliedTooltip = null;
+        _claudeAppliedTooltip = null;
+        _kimiAppliedTooltip = null;
+
+        UpdateCodexTrayIcon(TrayIconRenderer.CreateUnavailableIcon(), TrayIconRenderer.CodexUnavailableIconKey);
+        UpdateClaudeTrayIcon(TrayIconRenderer.CreateClaudeUnavailableIcon(), TrayIconRenderer.ClaudeUnavailableIconKey);
+        UpdateKimiTrayIcon(TrayIconRenderer.CreateKimiUnavailableIcon(), TrayIconRenderer.KimiUnavailableIconKey);
+        RefreshUsage();
+    }
+
     private void ShowContextMenu(uint iconId)
     {
         IntPtr menuHandle = NativeMethods.CreatePopupMenu();
@@ -469,21 +730,54 @@ internal sealed class TrayApplication : IDisposable
             return;
         }
 
-        bool isClaudeMenu = iconId == ClaudeTrayIconId;
-        string statusText = isClaudeMenu ? _claudeStatusText : _codexStatusText;
-        string detailText = isClaudeMenu ? _claudeDetailText : _codexDetailText;
-        string updatedText = isClaudeMenu ? _claudeUpdatedText : _codexUpdatedText;
-        string sourceText = isClaudeMenu ? _claudeSourceText : _codexSourceText;
-        uint openCommand = isClaudeMenu ? CommandOpenClaudeUsage : CommandOpenCodexSessions;
-        string openLabel = isClaudeMenu ? "Open Claude usage settings" : "Open Codex sessions";
+        string statusText;
+        string detailText;
+        string updatedText;
+        string sourceText;
+        uint openCommand;
+        string openLabel;
+
+        switch (iconId)
+        {
+            case ClaudeTrayIconId:
+                statusText = _claudeStatusText;
+                detailText = _claudeDetailText;
+                updatedText = _claudeUpdatedText;
+                sourceText = _claudeSourceText;
+                openCommand = CommandOpenClaudeUsage;
+                openLabel = "Open Claude usage settings";
+                break;
+
+            case KimiTrayIconId:
+                statusText = _kimiStatusText;
+                detailText = _kimiDetailText;
+                updatedText = _kimiUpdatedText;
+                sourceText = _kimiSourceText;
+                openCommand = CommandOpenKimiSessions;
+                openLabel = "Open Kimi sessions";
+                break;
+
+            default:
+                statusText = _codexStatusText;
+                detailText = _codexDetailText;
+                updatedText = _codexUpdatedText;
+                sourceText = _codexSourceText;
+                openCommand = CommandOpenCodexSessions;
+                openLabel = "Open Codex sessions";
+                break;
+        }
 
         try
         {
             NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING | NativeMethods.MF_GRAYED, 0, LimitMenuText(statusText));
             NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING | NativeMethods.MF_GRAYED, 0, LimitMenuText(detailText));
-            if (!isClaudeMenu)
+            if (iconId == CodexTrayIconId)
             {
                 NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING | NativeMethods.MF_GRAYED, 0, LimitMenuText(_codexSparkUsageText));
+            }
+            else if (iconId == KimiTrayIconId)
+            {
+                NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING | NativeMethods.MF_GRAYED, 0, LimitMenuText(_kimiTokenUsageText));
             }
 
             NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING | NativeMethods.MF_GRAYED, 0, LimitMenuText(updatedText));
@@ -530,6 +824,10 @@ internal sealed class TrayApplication : IDisposable
                 OpenClaudeUsagePage();
                 break;
 
+            case CommandOpenKimiSessions:
+                OpenKimiSessionsFolder();
+                break;
+
             case CommandExit:
                 NativeMethods.DestroyWindow(_windowHandle);
                 break;
@@ -558,6 +856,19 @@ internal sealed class TrayApplication : IDisposable
         });
     }
 
+    private void OpenKimiSessionsFolder()
+    {
+        string target = Directory.Exists(_kimiUsageReader.SessionsPath)
+            ? _kimiUsageReader.SessionsPath
+            : _kimiUsageReader.KimiHomePath;
+
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = target,
+            UseShellExecute = true
+        });
+    }
+
     private void PostQuit()
     {
         _windowHandle = IntPtr.Zero;
@@ -569,6 +880,7 @@ internal sealed class TrayApplication : IDisposable
     {
         RemoveTrayIcon(CodexTrayIconId, ref _codexTrayIconAdded);
         RemoveTrayIcon(ClaudeTrayIconId, ref _claudeTrayIconAdded);
+        RemoveTrayIcon(KimiTrayIconId, ref _kimiTrayIconAdded);
 
         if (_windowHandle != IntPtr.Zero)
         {
@@ -577,6 +889,7 @@ internal sealed class TrayApplication : IDisposable
 
         DestroyIconHandle(ref _codexIconHandle);
         DestroyIconHandle(ref _claudeIconHandle);
+        DestroyIconHandle(ref _kimiIconHandle);
 
         if (_windowClassRegistered)
         {
@@ -594,9 +907,11 @@ internal sealed class TrayApplication : IDisposable
                 cbSize = (uint)Marshal.SizeOf<NativeMethods.NOTIFYICONDATA>(),
                 hWnd = _windowHandle,
                 uID = iconId,
+                uFlags = NativeMethods.NIF_GUID,
                 szTip = string.Empty,
                 szInfo = string.Empty,
-                szInfoTitle = string.Empty
+                szInfoTitle = string.Empty,
+                guidItem = GetTrayIconGuid(iconId)
             };
 
             QueueShellNotify(NativeMethods.NIM_DELETE, data, IntPtr.Zero);
@@ -615,36 +930,31 @@ internal sealed class TrayApplication : IDisposable
 
     private static string BuildCodexTooltip(CodexUsageSnapshot snapshot)
     {
-        int primaryRemaining = CodexUsageMath.GetRemainingPercent(snapshot.PrimaryUsedPercent);
-        int secondaryRemaining = CodexUsageMath.GetRemainingPercent(snapshot.SecondaryUsedPercent);
+        int weeklyRemaining = CodexUsageMath.GetWeeklyRemainingPercent(snapshot);
+        int weeklyWindow = CodexUsageMath.GetWeeklyWindowMinutes(snapshot);
 
         return TruncateTooltip(
-            $"gptcheck {FormatWindow(snapshot.PrimaryWindowMinutes)} left {primaryRemaining}% " +
-            $"{FormatWindow(snapshot.SecondaryWindowMinutes)} left {secondaryRemaining}%");
+            $"Codex: {FormatWindow(weeklyWindow)} left {weeklyRemaining}%, " +
+            FormatResetCountdown(CodexUsageMath.GetWeeklyResetAt(snapshot)));
     }
 
     private static string BuildCodexHeadline(CodexUsageSnapshot snapshot)
     {
         string planType = string.IsNullOrWhiteSpace(snapshot.PlanType) ? "plan ?" : snapshot.PlanType;
-        int primaryRemaining = CodexUsageMath.GetRemainingPercent(snapshot.PrimaryUsedPercent);
-        int secondaryRemaining = CodexUsageMath.GetRemainingPercent(snapshot.SecondaryUsedPercent);
+        int weeklyRemaining = CodexUsageMath.GetWeeklyRemainingPercent(snapshot);
 
-        return $"{planType}: {FormatWindow(snapshot.PrimaryWindowMinutes)} left {primaryRemaining}% | " +
-               $"{FormatWindow(snapshot.SecondaryWindowMinutes)} left {secondaryRemaining}% " +
-               $"({FormatResetCountdown(snapshot.SecondaryResetAt)})";
+        return $"{planType}: {FormatWindow(CodexUsageMath.GetWeeklyWindowMinutes(snapshot))} left {weeklyRemaining}% " +
+               $"({FormatResetCountdown(CodexUsageMath.GetWeeklyResetAt(snapshot))})";
     }
 
     private static string BuildCodexDetail(CodexUsageSnapshot snapshot)
     {
-        string primaryReset = snapshot.PrimaryResetAt is null
+        DateTimeOffset? weeklyResetAt = CodexUsageMath.GetWeeklyResetAt(snapshot);
+        string weeklyReset = weeklyResetAt is null
             ? "?"
-            : snapshot.PrimaryResetAt.Value.ToLocalTime().ToString("MMM dd HH:mm", CultureInfo.InvariantCulture);
-        string secondaryReset = snapshot.SecondaryResetAt is null
-            ? "?"
-            : snapshot.SecondaryResetAt.Value.ToLocalTime().ToString("MMM dd HH:mm", CultureInfo.InvariantCulture);
+            : weeklyResetAt.Value.ToLocalTime().ToString("MMM dd HH:mm", CultureInfo.InvariantCulture);
 
-        return $"Reset {FormatWindow(snapshot.PrimaryWindowMinutes)} {primaryReset}, " +
-               $"{FormatWindow(snapshot.SecondaryWindowMinutes)} {secondaryReset}";
+        return $"Reset {FormatWindow(CodexUsageMath.GetWeeklyWindowMinutes(snapshot))} {weeklyReset}";
     }
 
     private static string BuildSparkUsage(CodexUsageSnapshot? sparkSnapshot)
@@ -654,20 +964,21 @@ internal sealed class TrayApplication : IDisposable
             return "Spark usage: no recent Spark sessions";
         }
 
-        int primaryRemaining = CodexUsageMath.GetRemainingPercent(sparkSnapshot.PrimaryUsedPercent);
-        int secondaryRemaining = CodexUsageMath.GetRemainingPercent(sparkSnapshot.SecondaryUsedPercent);
+        int weeklyRemaining = CodexUsageMath.GetWeeklyRemainingPercent(sparkSnapshot);
         string sparkSeen = sparkSnapshot.Timestamp.ToLocalTime().ToString("MMM dd HH:mm", CultureInfo.InvariantCulture);
 
-        return $"Spark: {FormatWindow(sparkSnapshot.PrimaryWindowMinutes)} left {primaryRemaining}% | " +
-               $"{FormatWindow(sparkSnapshot.SecondaryWindowMinutes)} left {secondaryRemaining}% " +
-               $"({FormatResetCountdown(sparkSnapshot.SecondaryResetAt)}), Spark seen {sparkSeen}";
+        return $"Spark: {FormatWindow(CodexUsageMath.GetWeeklyWindowMinutes(sparkSnapshot))} left {weeklyRemaining}% " +
+               $"({FormatResetCountdown(CodexUsageMath.GetWeeklyResetAt(sparkSnapshot))}), Spark seen {sparkSeen}";
     }
 
     private static string BuildClaudeTooltip(ClaudeUsageSnapshot snapshot)
     {
+        int fiveHourRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.FiveHourUsedPercent);
+        int sevenDayRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.SevenDayUsedPercent);
+
         return TruncateTooltip(
-            $"Claude 5h left {ClaudeUsageMath.GetRemainingPercent(snapshot.FiveHourUsedPercent)}% " +
-            $"7d left {ClaudeUsageMath.GetRemainingPercent(snapshot.SevenDayUsedPercent)}%");
+            $"Claude: 5h left {fiveHourRemaining}%, 7d left {sevenDayRemaining}%, " +
+            FormatResetCountdown(snapshot.SevenDayResetAt));
     }
 
     private static string BuildClaudeHeadline(ClaudeUsageSnapshot snapshot)
@@ -689,6 +1000,63 @@ internal sealed class TrayApplication : IDisposable
             : snapshot.SevenDayResetAt.Value.ToLocalTime().ToString("MMM dd HH:mm", CultureInfo.InvariantCulture);
 
         return $"Reset 5h {fiveHourReset}, 7d {sevenDayReset}";
+    }
+
+    private static string BuildKimiTooltip(KimiUsageSnapshot snapshot)
+    {
+        return TruncateTooltip(
+            $"Kimi: 5h left {FormatUsagePercent(snapshot.FiveHourRemainingPercent)}, " +
+            $"7d left {FormatUsagePercent(snapshot.SevenDayRemainingPercent)}, " +
+            FormatResetCountdown(snapshot.SevenDayResetAt));
+    }
+
+    private static string BuildKimiStaleTooltip(KimiUsageSnapshot snapshot)
+    {
+        return TruncateTooltip(
+            $"Kimi: 5h left {FormatUsagePercent(snapshot.FiveHourRemainingPercent)}, " +
+            $"7d left {FormatUsagePercent(snapshot.SevenDayRemainingPercent)} (last known)");
+    }
+
+    private static string BuildKimiUnavailableTooltip(string? errorMessage)
+    {
+        if (string.IsNullOrWhiteSpace(errorMessage))
+        {
+            return "Kimi: usage unavailable";
+        }
+
+        return TruncateTooltip($"Kimi: usage unavailable ({errorMessage})");
+    }
+
+    private static string BuildKimiHeadline(KimiUsageSnapshot snapshot)
+    {
+        return $"Kimi: 5h left {FormatUsagePercent(snapshot.FiveHourRemainingPercent)} | " +
+               $"7d left {FormatUsagePercent(snapshot.SevenDayRemainingPercent)} " +
+               $"({FormatResetCountdown(snapshot.SevenDayResetAt)})";
+    }
+
+    private static string BuildKimiDetail(KimiUsageSnapshot snapshot)
+    {
+        string fiveHourReset = snapshot.FiveHourResetAt is null
+            ? "?"
+            : snapshot.FiveHourResetAt.Value.ToLocalTime().ToString("MMM dd HH:mm", CultureInfo.InvariantCulture);
+        string sevenDayReset = snapshot.SevenDayResetAt is null
+            ? "?"
+            : snapshot.SevenDayResetAt.Value.ToLocalTime().ToString("MMM dd HH:mm", CultureInfo.InvariantCulture);
+
+        return $"Left 5h {FormatUsagePercent(snapshot.FiveHourRemainingPercent)}, " +
+               $"7d {FormatUsagePercent(snapshot.SevenDayRemainingPercent)}; " +
+               $"reset 5h {fiveHourReset}, 7d {sevenDayReset}";
+    }
+
+    private static string BuildKimiTokenUsage(KimiUsageSnapshot snapshot)
+    {
+        if (snapshot.RecordCount <= 0)
+        {
+            return "Kimi tokens: no local usage.record events in 24h";
+        }
+
+        return $"Kimi tokens 24h: spent {FormatCompactTokens(snapshot.SpentTokens)}, " +
+               $"cached read {FormatCompactTokens(snapshot.CachedReadTokens)}";
     }
 
     private static string FormatWindow(int minutes)
@@ -742,6 +1110,30 @@ internal sealed class TrayApplication : IDisposable
         return $"reset in {minutes}m";
     }
 
+    private static string FormatUsagePercent(double value)
+    {
+        return $"{Math.Clamp(value, 0d, 100d):0.#}%";
+    }
+
+    private static string FormatCompactTokens(long tokens)
+    {
+        if (tokens >= 1_000_000)
+        {
+            return tokens < 10_000_000
+                ? $"{tokens / 1_000_000d:0.#}M"
+                : $"{tokens / 1_000_000d:0}M";
+        }
+
+        if (tokens >= 1_000)
+        {
+            return tokens < 100_000
+                ? $"{tokens / 1_000d:0.#}k"
+                : $"{tokens / 1_000d:0}k";
+        }
+
+        return tokens.ToString(CultureInfo.InvariantCulture);
+    }
+
     private static string TruncateTooltip(string value)
     {
         return value.Length <= 127 ? value : value[..127];
@@ -765,6 +1157,47 @@ internal static class CodexUsageMath
     {
         double remaining = 100d - usedPercent;
         return Math.Clamp((int)Math.Floor(remaining), 0, 100);
+    }
+
+    public static int GetWeeklyRemainingPercent(CodexUsageSnapshot snapshot)
+    {
+        return GetRemainingPercent(GetWeeklyUsedPercent(snapshot));
+    }
+
+    public static int GetWeeklyWindowMinutes(CodexUsageSnapshot snapshot)
+    {
+        return UseSecondaryLimit(snapshot)
+            ? snapshot.SecondaryWindowMinutes
+            : snapshot.PrimaryWindowMinutes;
+    }
+
+    public static DateTimeOffset? GetWeeklyResetAt(CodexUsageSnapshot snapshot)
+    {
+        return UseSecondaryLimit(snapshot)
+            ? snapshot.SecondaryResetAt
+            : snapshot.PrimaryResetAt;
+    }
+
+    private static double GetWeeklyUsedPercent(CodexUsageSnapshot snapshot)
+    {
+        return UseSecondaryLimit(snapshot)
+            ? snapshot.SecondaryUsedPercent
+            : snapshot.PrimaryUsedPercent;
+    }
+
+    private static bool UseSecondaryLimit(CodexUsageSnapshot snapshot)
+    {
+        if (snapshot.SecondaryWindowMinutes <= 0)
+        {
+            return false;
+        }
+
+        if (snapshot.PrimaryWindowMinutes <= 0)
+        {
+            return true;
+        }
+
+        return snapshot.SecondaryWindowMinutes > snapshot.PrimaryWindowMinutes;
     }
 }
 
@@ -794,6 +1227,10 @@ internal sealed record UsageReadResult(CodexUsageSnapshot? Snapshot, CodexUsageS
 internal sealed class CodexUsageReader
 {
     private const int MaxFilesToScan = 32;
+    private const int MaxTailBytesToRead = 4 * 1024 * 1024;
+    private const int MaxExpandedTailBytesToRead = 64 * 1024 * 1024;
+    private const int MaxExpandedTailFilesToScan = 8;
+    private const int MaxModelPrefixLinesToRead = 200;
 
     public string CodexHomePath { get; } = ResolveCodexHome();
     public string SessionsPath => Path.Combine(CodexHomePath, "sessions");
@@ -807,19 +1244,21 @@ internal sealed class CodexUsageReader
 
         try
         {
-            IEnumerable<string> recentFiles = Directory
+            List<FileInfo> recentFiles = Directory
                 .EnumerateFiles(SessionsPath, "*.jsonl", SearchOption.AllDirectories)
                 .Select(path => new FileInfo(path))
                 .OrderByDescending(file => file.LastWriteTimeUtc)
                 .Take(MaxFilesToScan)
-                .Select(file => file.FullName);
+                .ToList();
 
             CodexUsageSnapshot? latestSnapshot = null;
             CodexUsageSnapshot? latestSparkSnapshot = null;
 
-            foreach (string file in recentFiles)
+            for (int index = 0; index < recentFiles.Count; index++)
             {
-                UsageFileSnapshot fileSnapshot = TryReadFile(file);
+                UsageFileSnapshot fileSnapshot = TryReadFile(
+                    recentFiles[index].FullName,
+                    allowExpandedTailScan: index < MaxExpandedTailFilesToScan);
                 if (fileSnapshot.Latest is { } candidate &&
                     (latestSnapshot is null || candidate.Timestamp > latestSnapshot.Timestamp))
                 {
@@ -855,14 +1294,37 @@ internal sealed class CodexUsageReader
         return Path.Combine(userProfile, ".codex");
     }
 
-    private static UsageFileSnapshot TryReadFile(string path)
+    private static UsageFileSnapshot TryReadFile(string path, bool allowExpandedTailScan)
+    {
+        using FileStream stream = OpenSharedReadStream(path);
+        string? currentModel = stream.Length > MaxTailBytesToRead
+            ? TryReadInitialModel(stream)
+            : null;
+
+        UsageFileSnapshot snapshot = TryReadFileWindow(stream, path, currentModel, MaxTailBytesToRead);
+        if (snapshot.HasAny || !allowExpandedTailScan || stream.Length <= MaxTailBytesToRead)
+        {
+            return snapshot;
+        }
+
+        return TryReadFileWindow(stream, path, currentModel, MaxExpandedTailBytesToRead);
+    }
+
+    private static UsageFileSnapshot TryReadFileWindow(FileStream stream, string path, string? currentModel, int maxBytesToRead)
     {
         CodexUsageSnapshot? latest = null;
         CodexUsageSnapshot? latestSpark = null;
-        string? currentModel = null;
-
-        using FileStream stream = new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        using StreamReader reader = new(stream);
+        bool startedInsideFile = SeekToRecentTail(stream, maxBytesToRead);
+        using StreamReader reader = new(
+            stream,
+            Encoding.UTF8,
+            detectEncodingFromByteOrderMarks: true,
+            bufferSize: 4096,
+            leaveOpen: true);
+        if (startedInsideFile)
+        {
+            _ = reader.ReadLine();
+        }
 
         while (reader.ReadLine() is { } line)
         {
@@ -902,6 +1364,60 @@ internal sealed class CodexUsageReader
         }
 
         return new UsageFileSnapshot(latest, latestSpark);
+    }
+
+    private static FileStream OpenSharedReadStream(string path)
+    {
+        return new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            bufferSize: 4096,
+            FileOptions.SequentialScan);
+    }
+
+    private static string? TryReadInitialModel(FileStream stream)
+    {
+        long originalPosition = stream.Position;
+        try
+        {
+            stream.Seek(0, SeekOrigin.Begin);
+            using StreamReader reader = new(
+                stream,
+                Encoding.UTF8,
+                detectEncodingFromByteOrderMarks: true,
+                bufferSize: 4096,
+                leaveOpen: true);
+
+            for (int lineIndex = 0; lineIndex < MaxModelPrefixLinesToRead && reader.ReadLine() is { } line; lineIndex++)
+            {
+                if (line.Contains("\"type\":\"turn_context\"", StringComparison.Ordinal) &&
+                    TryReadTurnContextModel(line, out string? model) &&
+                    !string.IsNullOrWhiteSpace(model))
+                {
+                    return model;
+                }
+            }
+        }
+        finally
+        {
+            stream.Seek(originalPosition, SeekOrigin.Begin);
+        }
+
+        return null;
+    }
+
+    private static bool SeekToRecentTail(FileStream stream, int maxBytesToRead)
+    {
+        if (stream.Length <= maxBytesToRead)
+        {
+            stream.Seek(0, SeekOrigin.Begin);
+            return false;
+        }
+
+        stream.Seek(-maxBytesToRead, SeekOrigin.End);
+        return true;
     }
 
     private static bool TryReadTurnContextModel(string line, out string? model)
@@ -967,6 +1483,7 @@ internal sealed class CodexUsageReader
             string? planType = rateLimits.TryGetProperty("plan_type", out JsonElement planTypeElement)
                 ? planTypeElement.GetString()
                 : null;
+            string? snapshotModel = ResolveSnapshotModel(payload, model);
 
             return new CodexUsageSnapshot(
                 timestamp,
@@ -977,7 +1494,7 @@ internal sealed class CodexUsageReader
                 primary.ResetsAt,
                 secondary.ResetsAt,
                 planType,
-                model,
+                snapshotModel,
                 sourceFile);
         }
         catch (JsonException)
@@ -994,9 +1511,41 @@ internal sealed class CodexUsageReader
         }
     }
 
+    private static string? ResolveSnapshotModel(JsonElement payload, string? contextModel)
+    {
+        if (payload.TryGetProperty("info", out JsonElement info))
+        {
+            if (info.TryGetProperty("current_model", out JsonElement currentModelElement))
+            {
+                string? currentModel = currentModelElement.GetString();
+                if (!string.IsNullOrWhiteSpace(currentModel))
+                {
+                    return currentModel;
+                }
+            }
+
+            if (info.TryGetProperty("model", out JsonElement modelElement))
+            {
+                string? model = modelElement.GetString();
+                if (!string.IsNullOrWhiteSpace(model))
+                {
+                    return model;
+                }
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(contextModel))
+        {
+            return contextModel;
+        }
+
+        return null;
+    }
+
     private static RateLimitInfo ReadLimit(JsonElement parent, string name)
     {
-        if (!parent.TryGetProperty(name, out JsonElement limit))
+        if (!parent.TryGetProperty(name, out JsonElement limit) ||
+            limit.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
         {
             return new RateLimitInfo(0, 0, null);
         }
@@ -1025,7 +1574,10 @@ internal sealed class CodexUsageReader
         return snapshot.Model?.Contains("spark", StringComparison.OrdinalIgnoreCase) == true;
     }
 
-    private sealed record UsageFileSnapshot(CodexUsageSnapshot? Latest, CodexUsageSnapshot? LatestSpark);
+    private sealed record UsageFileSnapshot(CodexUsageSnapshot? Latest, CodexUsageSnapshot? LatestSpark)
+    {
+        public bool HasAny => Latest is not null || LatestSpark is not null;
+    }
 
     private sealed record RateLimitInfo(double UsedPercent, int WindowMinutes, DateTimeOffset? ResetsAt);
 }
@@ -1171,6 +1723,756 @@ internal sealed class ClaudeUsageReader
     }
 
     private sealed record UsageLimit(double UsedPercent, DateTimeOffset? ResetsAt);
+}
+
+internal static class KimiUsageMath
+{
+    public static int GetRemainingPercent(double remainingPercent)
+    {
+        return Math.Clamp((int)Math.Floor(remainingPercent), 0, 100);
+    }
+}
+
+internal sealed record KimiUsageSnapshot(
+    DateTimeOffset Timestamp,
+    double FiveHourUsedPercent,
+    double SevenDayUsedPercent,
+    double FiveHourRemainingPercent,
+    double SevenDayRemainingPercent,
+    DateTimeOffset? FiveHourResetAt,
+    DateTimeOffset? SevenDayResetAt,
+    long SpentTokens,
+    long InputTokens,
+    long OutputTokens,
+    long CacheCreationTokens,
+    long CachedReadTokens,
+    int RecordCount,
+    string SourceFile);
+
+internal sealed record KimiUsageReadResult(KimiUsageSnapshot? Snapshot, string? ErrorMessage);
+
+internal sealed class KimiUsageReader
+{
+    private const int MaxFilesToScan = 64;
+    private const int MaxTailBytesToRead = 16 * 1024 * 1024;
+    private const int MaxCredentialReadAttempts = 5;
+    private const int MaxUsageRequestAttempts = 3;
+    private const string DefaultKimiCodeBaseUrl = "https://api.kimi.com/coding/v1";
+    private const string DefaultOAuthHost = "https://auth.kimi.com";
+    private const string KimiClientId = "17e5f671-d194-4dfb-9706-5516cb48c098";
+    private const string OAuthBetaHeader = "oauth-2025-04-20";
+
+    private static readonly HttpClient HttpClient = new()
+    {
+        Timeout = TimeSpan.FromSeconds(20)
+    };
+
+    private readonly string _usageBaseUrl = ResolveKimiCodeBaseUrl();
+    private readonly string _oauthHost = ResolveOAuthHost();
+    private string? _cachedAccessToken;
+    private long? _cachedExpiresAt;
+
+    public string KimiHomePath { get; } = ResolveKimiHome();
+    public string SessionsPath => Path.Combine(KimiHomePath, "sessions");
+    public string CredentialsPath => Path.Combine(KimiHomePath, "credentials", "kimi-code.json");
+    public string UsageEndpoint => $"{_usageBaseUrl}/usages";
+
+    public KimiUsageReadResult ReadLatestSnapshot()
+    {
+        try
+        {
+            KimiCredential credential = ReadAccessToken(forceRefresh: false);
+            KimiQuotaSnapshot quotaSnapshot = ReadQuotaSnapshot(credential);
+            KimiLocalTokenSnapshot tokenSnapshot = ReadLocalTokenSnapshot();
+
+            return new KimiUsageReadResult(
+                new KimiUsageSnapshot(
+                    DateTimeOffset.Now,
+                    quotaSnapshot.FiveHour.UsedPercent,
+                    quotaSnapshot.SevenDay.UsedPercent,
+                    quotaSnapshot.FiveHour.RemainingPercent,
+                    quotaSnapshot.SevenDay.RemainingPercent,
+                    quotaSnapshot.FiveHour.ResetAt,
+                    quotaSnapshot.SevenDay.ResetAt,
+                    tokenSnapshot.SpentTokens,
+                    tokenSnapshot.InputTokens,
+                    tokenSnapshot.OutputTokens,
+                    tokenSnapshot.CacheCreationTokens,
+                    tokenSnapshot.CachedReadTokens,
+                    tokenSnapshot.RecordCount,
+                    UsageEndpoint),
+                null);
+        }
+        catch (Exception exception)
+        {
+            return new KimiUsageReadResult(null, exception.Message);
+        }
+    }
+
+    private KimiQuotaSnapshot ReadQuotaSnapshot(KimiCredential credential)
+    {
+        KimiUsageHttpResponse response = SendUsageRequest(credential.AccessToken);
+        if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized && credential.CanRefresh)
+        {
+            credential = ReadAccessToken(forceRefresh: true);
+            response = SendUsageRequest(credential.AccessToken);
+        }
+
+        if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            response = SendUsageRequest(credential.AccessToken, useSingularEndpoint: true);
+        }
+
+        if (!response.IsSuccessStatusCode)
+        {
+            return response.StatusCode switch
+            {
+                System.Net.HttpStatusCode.Unauthorized => throw new InvalidOperationException("Kimi token expired - run `kimi login` or set KIMI_API_KEY."),
+                System.Net.HttpStatusCode.TooManyRequests => throw new InvalidOperationException("Kimi usage endpoint rate limited the request."),
+                _ => throw new InvalidOperationException($"Kimi usage request failed: HTTP {(int)response.StatusCode}")
+            };
+        }
+
+        return ParseQuotaResponse(response.Body);
+    }
+
+    private KimiUsageHttpResponse SendUsageRequest(string accessToken, bool useSingularEndpoint = false)
+    {
+        string endpoint = useSingularEndpoint
+            ? $"{_usageBaseUrl}/usage"
+            : UsageEndpoint;
+
+        Exception? lastException = null;
+        for (int attempt = 1; attempt <= MaxUsageRequestAttempts; attempt++)
+        {
+            try
+            {
+                using HttpRequestMessage request = new(HttpMethod.Get, endpoint);
+                request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {accessToken}");
+                request.Headers.TryAddWithoutValidation("Accept", "application/json");
+                request.Headers.TryAddWithoutValidation("User-Agent", "KimiCLI/1.6 limits/1.0");
+
+                using HttpResponseMessage response = HttpClient.Send(request);
+                string responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                KimiUsageHttpResponse result = new(response.StatusCode, response.IsSuccessStatusCode, responseBody);
+                if (result.IsSuccessStatusCode ||
+                    !IsTransientStatusCode(result.StatusCode) ||
+                    attempt == MaxUsageRequestAttempts)
+                {
+                    return result;
+                }
+            }
+            catch (Exception exception) when (IsTransientHttpException(exception))
+            {
+                lastException = exception;
+                if (attempt == MaxUsageRequestAttempts)
+                {
+                    break;
+                }
+            }
+
+            Thread.Sleep(TimeSpan.FromMilliseconds(300 * attempt));
+        }
+
+        throw new InvalidOperationException($"Kimi usage request failed: {lastException?.Message ?? "transient HTTP failure"}");
+    }
+
+    private static bool IsTransientStatusCode(System.Net.HttpStatusCode statusCode)
+    {
+        int status = (int)statusCode;
+        return status == 408 || status >= 500;
+    }
+
+    private static bool IsTransientHttpException(Exception exception)
+    {
+        return exception is HttpRequestException or TaskCanceledException or IOException;
+    }
+
+    private KimiCredential ReadAccessToken(bool forceRefresh)
+    {
+        string? environmentToken = ReadEnvironmentToken();
+        if (!string.IsNullOrWhiteSpace(environmentToken))
+        {
+            return new KimiCredential(environmentToken, CanRefresh: false);
+        }
+
+        if (!File.Exists(CredentialsPath))
+        {
+            if (TryGetCachedCredential() is { } cachedCredential)
+            {
+                return cachedCredential;
+            }
+
+            throw new InvalidOperationException($"Missing Kimi credentials file: {CredentialsPath}");
+        }
+
+        JsonObject credentials;
+        try
+        {
+            credentials = ReadCredentialsObject();
+        }
+        catch (Exception exception) when (IsTransientCredentialException(exception))
+        {
+            if (TryGetCachedCredential() is { } cachedCredential)
+            {
+                return cachedCredential;
+            }
+
+            throw new InvalidOperationException($"Kimi credentials could not be read: {exception.Message}");
+        }
+
+        string? accessToken = credentials["access_token"]?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(accessToken))
+        {
+            if (TryGetCachedCredential() is { } cachedCredential)
+            {
+                return cachedCredential;
+            }
+
+            throw new InvalidOperationException("Kimi access_token was not found.");
+        }
+
+        long? expiresAt = TryReadLong(credentials["expires_at"]);
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        if (!forceRefresh && (expiresAt is null || now < expiresAt.Value - 30))
+        {
+            return CacheCredential(accessToken, expiresAt, canRefresh: true);
+        }
+
+        string? refreshToken = credentials["refresh_token"]?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(refreshToken))
+        {
+            throw new InvalidOperationException("Kimi access token expired and refresh_token was not found.");
+        }
+
+        return RefreshAccessToken(credentials, refreshToken);
+    }
+
+    private static string? ReadEnvironmentToken()
+    {
+        foreach (string name in new[] { "KIMI_API_KEY", "KIMI_CODING_API_KEY", "KIMI_API_CODE", "KIMI_CODE_API_KEY", "KIMI_CODE_ACCESS_TOKEN" })
+        {
+            string? value = Environment.GetEnvironmentVariable(name);
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                return value;
+            }
+        }
+
+        return null;
+    }
+
+    private KimiCredential? TryGetCachedCredential()
+    {
+        if (string.IsNullOrWhiteSpace(_cachedAccessToken))
+        {
+            return null;
+        }
+
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        if (_cachedExpiresAt is not null && now >= _cachedExpiresAt.Value - 30)
+        {
+            return null;
+        }
+
+        return new KimiCredential(_cachedAccessToken, CanRefresh: true);
+    }
+
+    private KimiCredential CacheCredential(string accessToken, long? expiresAt, bool canRefresh)
+    {
+        _cachedAccessToken = accessToken;
+        _cachedExpiresAt = expiresAt;
+        return new KimiCredential(accessToken, canRefresh);
+    }
+
+    private static bool IsTransientCredentialException(Exception exception)
+    {
+        return exception is IOException or JsonException or UnauthorizedAccessException;
+    }
+
+    private KimiCredential RefreshAccessToken(JsonObject credentials, string refreshToken)
+    {
+        string tokenEndpoint = $"{_oauthHost}/v1/oauth/token";
+        using HttpRequestMessage request = new(HttpMethod.Post, tokenEndpoint);
+        request.Headers.TryAddWithoutValidation("anthropic-beta", OAuthBetaHeader);
+        request.Headers.TryAddWithoutValidation("User-Agent", "KimiCLI/1.6 limits/1.0");
+
+        JsonObject requestBody = new()
+        {
+            ["grant_type"] = "refresh_token",
+            ["refresh_token"] = refreshToken,
+            ["client_id"] = KimiClientId
+        };
+        request.Content = new StringContent(requestBody.ToJsonString(), Encoding.UTF8, "application/json");
+
+        using HttpResponseMessage response = HttpClient.Send(request);
+        string responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException($"Kimi OAuth refresh failed: HTTP {(int)response.StatusCode}");
+        }
+
+        using JsonDocument document = JsonDocument.Parse(responseBody);
+        JsonElement root = document.RootElement;
+        string? accessToken = root.TryGetProperty("access_token", out JsonElement accessTokenElement)
+            ? accessTokenElement.GetString()
+            : null;
+        if (string.IsNullOrWhiteSpace(accessToken))
+        {
+            throw new InvalidOperationException("Kimi OAuth refresh response did not include access_token.");
+        }
+
+        if (!root.TryGetProperty("expires_in", out JsonElement expiresInElement) ||
+            !TryReadDouble(expiresInElement, out double expiresIn) ||
+            expiresIn <= 0)
+        {
+            throw new InvalidOperationException("Kimi OAuth refresh response did not include expires_in.");
+        }
+
+        string newRefreshToken = root.TryGetProperty("refresh_token", out JsonElement refreshTokenElement)
+            ? refreshTokenElement.GetString() ?? refreshToken
+            : refreshToken;
+        long newExpiresAt = DateTimeOffset.UtcNow.AddSeconds(expiresIn).ToUnixTimeSeconds();
+
+        credentials["version"] = "1.0";
+        credentials["type"] = "oauth_token";
+        credentials["access_token"] = accessToken;
+        credentials["expires_at"] = newExpiresAt;
+        credentials["refresh_token"] = newRefreshToken;
+        WriteCredentialsObject(credentials);
+
+        return CacheCredential(accessToken, newExpiresAt, canRefresh: true);
+    }
+
+    private JsonObject ReadCredentialsObject()
+    {
+        Exception? lastException = null;
+        for (int attempt = 1; attempt <= MaxCredentialReadAttempts; attempt++)
+        {
+            try
+            {
+                using FileStream stream = new(CredentialsPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                JsonNode? node = JsonNode.Parse(stream);
+                return node as JsonObject ?? throw new InvalidOperationException("Kimi credentials file is not a JSON object.");
+            }
+            catch (Exception exception) when (IsTransientCredentialException(exception))
+            {
+                lastException = exception;
+                if (attempt == MaxCredentialReadAttempts)
+                {
+                    break;
+                }
+
+                Thread.Sleep(TimeSpan.FromMilliseconds(100 * attempt));
+            }
+        }
+
+        throw lastException ?? new IOException("Kimi credentials file could not be read.");
+    }
+
+    private void WriteCredentialsObject(JsonObject credentials)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(CredentialsPath)!);
+        string tempPath = $"{CredentialsPath}.{Environment.ProcessId}.tmp";
+        File.WriteAllText(
+            tempPath,
+            credentials.ToJsonString(new JsonSerializerOptions { WriteIndented = true }),
+            Encoding.UTF8);
+        File.Move(tempPath, CredentialsPath, overwrite: true);
+    }
+
+    private KimiLocalTokenSnapshot ReadLocalTokenSnapshot()
+    {
+        DateTimeOffset windowStart = DateTimeOffset.Now.AddHours(-24);
+        if (!Directory.Exists(SessionsPath))
+        {
+            return KimiLocalTokenSnapshot.Empty(windowStart);
+        }
+
+        try
+        {
+            long windowStartMilliseconds = windowStart.ToUnixTimeMilliseconds();
+            KimiUsageAccumulator accumulator = new(windowStart);
+
+            foreach (FileInfo file in Directory
+                         .EnumerateFiles(SessionsPath, "wire.jsonl", SearchOption.AllDirectories)
+                         .Select(path => new FileInfo(path))
+                         .OrderByDescending(file => file.LastWriteTimeUtc)
+                         .Take(MaxFilesToScan))
+            {
+                TryReadFile(file.FullName, windowStartMilliseconds, accumulator);
+            }
+
+            return accumulator.ToSnapshot();
+        }
+        catch
+        {
+            return KimiLocalTokenSnapshot.Empty(windowStart);
+        }
+    }
+
+    private static KimiQuotaSnapshot ParseQuotaResponse(string responseBody)
+    {
+        using JsonDocument document = JsonDocument.Parse(responseBody);
+        JsonElement root = document.RootElement;
+
+        if (!root.TryGetProperty("usage", out JsonElement weeklyUsage) ||
+            weeklyUsage.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException("Kimi usage response did not include weekly usage.");
+        }
+
+        KimiQuotaLimit sevenDay = ReadQuotaLimit(weeklyUsage);
+        KimiQuotaLimit? fiveHour = null;
+        KimiQuotaLimit? firstLimit = null;
+
+        if (root.TryGetProperty("limits", out JsonElement limits) &&
+            limits.ValueKind == JsonValueKind.Array)
+        {
+            foreach (JsonElement item in limits.EnumerateArray())
+            {
+                JsonElement detail = item.TryGetProperty("detail", out JsonElement detailElement) &&
+                                     detailElement.ValueKind == JsonValueKind.Object
+                    ? detailElement
+                    : item;
+
+                KimiQuotaLimit candidate = ReadQuotaLimit(detail);
+                firstLimit ??= candidate;
+
+                if (IsFiveHourLimit(item))
+                {
+                    fiveHour = candidate;
+                    break;
+                }
+            }
+        }
+
+        fiveHour ??= firstLimit ?? throw new InvalidOperationException("Kimi usage response did not include a 5-hour limit.");
+        return new KimiQuotaSnapshot(fiveHour, sevenDay);
+    }
+
+    private static bool IsFiveHourLimit(JsonElement limitElement)
+    {
+        if (!limitElement.TryGetProperty("window", out JsonElement window) ||
+            window.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        double? duration = ReadJsonDouble(window, "duration");
+        string timeUnit = ReadJsonString(window, "timeUnit") ?? ReadJsonString(window, "time_unit") ?? string.Empty;
+
+        return duration == 300 && timeUnit.Contains("MINUTE", StringComparison.OrdinalIgnoreCase) ||
+               duration == 5 && timeUnit.Contains("HOUR", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static KimiQuotaLimit ReadQuotaLimit(JsonElement data)
+    {
+        double limit = ReadJsonDouble(data, "limit") ?? ReadJsonDouble(data, "limit_amount") ?? 0d;
+        double used = ReadJsonDouble(data, "used") ?? ReadJsonDouble(data, "used_amount") ?? 0d;
+        double? remaining = ReadJsonDouble(data, "remaining");
+
+        double usedPercent = limit > 0 ? used / limit * 100d : used;
+        double remainingPercent = limit > 0
+            ? (remaining ?? Math.Max(0d, limit - used)) / limit * 100d
+            : Math.Max(0d, 100d - usedPercent);
+
+        return new KimiQuotaLimit(
+            Math.Clamp(usedPercent, 0d, 100d),
+            Math.Clamp(remainingPercent, 0d, 100d),
+            ReadResetAt(data));
+    }
+
+    private static DateTimeOffset? ReadResetAt(JsonElement data)
+    {
+        foreach (string propertyName in new[] { "resetTime", "reset_time", "resetAt", "reset_at" })
+        {
+            if (!data.TryGetProperty(propertyName, out JsonElement element))
+            {
+                continue;
+            }
+
+            if (element.ValueKind == JsonValueKind.String &&
+                DateTimeOffset.TryParse(element.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out DateTimeOffset parsed))
+            {
+                return parsed;
+            }
+
+            if (element.ValueKind == JsonValueKind.Number &&
+                element.TryGetInt64(out long timestamp))
+            {
+                return timestamp > 10_000_000_000
+                    ? DateTimeOffset.FromUnixTimeMilliseconds(timestamp)
+                    : DateTimeOffset.FromUnixTimeSeconds(timestamp);
+            }
+        }
+
+        return null;
+    }
+
+    private static string ResolveKimiHome()
+    {
+        string? configuredHome = Environment.GetEnvironmentVariable("KIMI_HOME");
+        if (!string.IsNullOrWhiteSpace(configuredHome))
+        {
+            return Environment.ExpandEnvironmentVariables(configuredHome);
+        }
+
+        string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        return Path.Combine(userProfile, ".kimi-code");
+    }
+
+    private static string ResolveKimiCodeBaseUrl()
+    {
+        string? configuredBaseUrl = Environment.GetEnvironmentVariable("KIMI_CODE_BASE_URL");
+        return string.IsNullOrWhiteSpace(configuredBaseUrl)
+            ? DefaultKimiCodeBaseUrl
+            : configuredBaseUrl.TrimEnd('/');
+    }
+
+    private static string ResolveOAuthHost()
+    {
+        string? configuredHost = Environment.GetEnvironmentVariable("KIMI_CODE_OAUTH_HOST") ??
+                                 Environment.GetEnvironmentVariable("KIMI_OAUTH_HOST");
+        return string.IsNullOrWhiteSpace(configuredHost)
+            ? DefaultOAuthHost
+            : configuredHost.TrimEnd('/');
+    }
+
+    private static void TryReadFile(string path, long windowStartMilliseconds, KimiUsageAccumulator accumulator)
+    {
+        try
+        {
+            using FileStream stream = new(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete,
+                bufferSize: 4096,
+                FileOptions.SequentialScan);
+
+            bool startedInsideFile = SeekToRecentTail(stream);
+            using StreamReader reader = new(
+                stream,
+                Encoding.UTF8,
+                detectEncodingFromByteOrderMarks: true,
+                bufferSize: 4096,
+                leaveOpen: false);
+            if (startedInsideFile)
+            {
+                _ = reader.ReadLine();
+            }
+
+            while (reader.ReadLine() is { } line)
+            {
+                if (!line.Contains("\"type\":\"usage.record\"", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                TryAddUsageRecord(line, path, windowStartMilliseconds, accumulator);
+            }
+        }
+        catch (IOException)
+        {
+            // Kimi may be actively writing a session file; skip that file for this refresh.
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // A single unreadable file should not hide usage from the other sessions.
+        }
+    }
+
+    private static bool SeekToRecentTail(FileStream stream)
+    {
+        if (stream.Length <= MaxTailBytesToRead)
+        {
+            stream.Seek(0, SeekOrigin.Begin);
+            return false;
+        }
+
+        stream.Seek(-MaxTailBytesToRead, SeekOrigin.End);
+        return true;
+    }
+
+    private static void TryAddUsageRecord(
+        string line,
+        string sourceFile,
+        long windowStartMilliseconds,
+        KimiUsageAccumulator accumulator)
+    {
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(line);
+            JsonElement root = document.RootElement;
+            if (!root.TryGetProperty("type", out JsonElement typeElement) ||
+                !string.Equals(typeElement.GetString(), "usage.record", StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            if (!root.TryGetProperty("time", out JsonElement timeElement) ||
+                !timeElement.TryGetInt64(out long timestampMilliseconds) ||
+                timestampMilliseconds < windowStartMilliseconds)
+            {
+                return;
+            }
+
+            if (!root.TryGetProperty("usage", out JsonElement usage) ||
+                usage.ValueKind != JsonValueKind.Object)
+            {
+                return;
+            }
+
+            accumulator.Add(
+                DateTimeOffset.FromUnixTimeMilliseconds(timestampMilliseconds),
+                ReadUsageTokenValue(usage, "inputOther"),
+                ReadUsageTokenValue(usage, "output"),
+                ReadUsageTokenValue(usage, "inputCacheCreation"),
+                ReadUsageTokenValue(usage, "inputCacheRead"),
+                sourceFile);
+        }
+        catch (JsonException)
+        {
+        }
+        catch (InvalidOperationException)
+        {
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+        }
+    }
+
+    private static long ReadUsageTokenValue(JsonElement usage, string propertyName)
+    {
+        return usage.TryGetProperty(propertyName, out JsonElement element) &&
+               element.ValueKind == JsonValueKind.Number &&
+               element.TryGetInt64(out long value)
+            ? Math.Max(0, value)
+            : 0;
+    }
+
+    private static double? ReadJsonDouble(JsonElement element, string propertyName)
+    {
+        return element.TryGetProperty(propertyName, out JsonElement valueElement) &&
+               TryReadDouble(valueElement, out double value)
+            ? value
+            : null;
+    }
+
+    private static string? ReadJsonString(JsonElement element, string propertyName)
+    {
+        return element.TryGetProperty(propertyName, out JsonElement valueElement) &&
+               valueElement.ValueKind == JsonValueKind.String
+            ? valueElement.GetString()
+            : null;
+    }
+
+    private static bool TryReadDouble(JsonElement element, out double value)
+    {
+        if (element.ValueKind == JsonValueKind.Number)
+        {
+            return element.TryGetDouble(out value);
+        }
+
+        if (element.ValueKind == JsonValueKind.String &&
+            double.TryParse(element.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out value))
+        {
+            return true;
+        }
+
+        value = 0;
+        return false;
+    }
+
+    private static long? TryReadLong(JsonNode? node)
+    {
+        if (node is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return node.GetValue<long>();
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+        catch (FormatException)
+        {
+            return null;
+        }
+    }
+
+    private sealed record KimiCredential(string AccessToken, bool CanRefresh);
+
+    private sealed record KimiUsageHttpResponse(System.Net.HttpStatusCode StatusCode, bool IsSuccessStatusCode, string Body);
+
+    private sealed record KimiQuotaSnapshot(KimiQuotaLimit FiveHour, KimiQuotaLimit SevenDay);
+
+    private sealed record KimiQuotaLimit(double UsedPercent, double RemainingPercent, DateTimeOffset? ResetAt);
+
+    private sealed record KimiLocalTokenSnapshot(
+        DateTimeOffset WindowStart,
+        long SpentTokens,
+        long InputTokens,
+        long OutputTokens,
+        long CacheCreationTokens,
+        long CachedReadTokens,
+        int RecordCount)
+    {
+        public static KimiLocalTokenSnapshot Empty(DateTimeOffset windowStart)
+        {
+            return new KimiLocalTokenSnapshot(windowStart, 0, 0, 0, 0, 0, 0);
+        }
+    }
+
+    private sealed class KimiUsageAccumulator
+    {
+        private readonly DateTimeOffset _windowStart;
+        private long _inputTokens;
+        private long _outputTokens;
+        private long _cacheCreationTokens;
+        private long _cachedReadTokens;
+        private int _recordCount;
+
+        public KimiUsageAccumulator(DateTimeOffset windowStart)
+        {
+            _windowStart = windowStart;
+        }
+
+        public void Add(
+            DateTimeOffset timestamp,
+            long inputTokens,
+            long outputTokens,
+            long cacheCreationTokens,
+            long cachedReadTokens,
+            string sourceFile)
+        {
+            _ = timestamp;
+            _ = sourceFile;
+            _inputTokens += inputTokens;
+            _outputTokens += outputTokens;
+            _cacheCreationTokens += cacheCreationTokens;
+            _cachedReadTokens += cachedReadTokens;
+            _recordCount++;
+        }
+
+        public KimiLocalTokenSnapshot ToSnapshot()
+        {
+            long spentTokens = _inputTokens + _outputTokens + _cacheCreationTokens;
+            return new KimiLocalTokenSnapshot(
+                _windowStart,
+                spentTokens,
+                _inputTokens,
+                _outputTokens,
+                _cacheCreationTokens,
+                _cachedReadTokens,
+                _recordCount);
+        }
+    }
 }
 
 internal sealed class LimitWatchdog
@@ -1359,10 +2661,12 @@ internal static class TrayIconRenderer
 
     public const string CodexUnavailableIconKey = "codex:?:?";
     public const string ClaudeUnavailableIconKey = "claude:?:?";
+    public const string KimiUnavailableIconKey = "kimi:?";
 
     // Brand marker colors are fixed, not theme-dependent.
     private const uint OpenAiBrandColor = 0xFF10A37F;
     private const uint ClaudeBrandColor = 0xFFD97757;
+    private const uint KimiBrandColor = 0xFF23B7F0;
 
     private static readonly IconPalette LightThemePalette = new(
         UnknownColor: 0xFF444444,
@@ -1393,28 +2697,24 @@ internal static class TrayIconRenderer
     public static IntPtr CreateUsageIcon(CodexUsageSnapshot snapshot)
     {
         IconPalette palette = GetPalette();
-        int primaryRemaining = CodexUsageMath.GetRemainingPercent(snapshot.PrimaryUsedPercent);
-        int secondaryRemaining = CodexUsageMath.GetRemainingPercent(snapshot.SecondaryUsedPercent);
+        int weeklyRemaining = CodexUsageMath.GetWeeklyRemainingPercent(snapshot);
 
-        return CreateIcon(
-            primaryRemaining.ToString(CultureInfo.InvariantCulture),
-            ColorForRemaining(primaryRemaining, palette),
-            secondaryRemaining.ToString(CultureInfo.InvariantCulture),
-            ColorForRemaining(secondaryRemaining, palette),
+        return CreateCenteredIcon(
+            weeklyRemaining.ToString(CultureInfo.InvariantCulture),
+            ColorForRemaining(weeklyRemaining, palette),
             OpenAiBrandColor);
     }
 
     public static string GetCodexIconKey(CodexUsageSnapshot snapshot)
     {
-        int primaryRemaining = CodexUsageMath.GetRemainingPercent(snapshot.PrimaryUsedPercent);
-        int secondaryRemaining = CodexUsageMath.GetRemainingPercent(snapshot.SecondaryUsedPercent);
-        return $"codex:{primaryRemaining}:{secondaryRemaining}";
+        int weeklyRemaining = CodexUsageMath.GetWeeklyRemainingPercent(snapshot);
+        return $"codex:{weeklyRemaining}";
     }
 
     public static IntPtr CreateUnavailableIcon()
     {
         IconPalette palette = GetPalette();
-        return CreateIcon("?", palette.UnknownColor, "?", palette.UnknownColor, OpenAiBrandColor);
+        return CreateCenteredIcon("?", palette.UnknownColor, OpenAiBrandColor);
     }
 
     public static IntPtr CreateClaudeIcon(ClaudeUsageSnapshot snapshot)
@@ -1444,6 +2744,33 @@ internal static class TrayIconRenderer
         return CreateIcon("?", palette.UnknownColor, "?", palette.UnknownColor, ClaudeBrandColor);
     }
 
+    public static IntPtr CreateKimiIcon(KimiUsageSnapshot snapshot)
+    {
+        IconPalette palette = GetPalette();
+        int fiveHourRemaining = KimiUsageMath.GetRemainingPercent(snapshot.FiveHourRemainingPercent);
+        int sevenDayRemaining = KimiUsageMath.GetRemainingPercent(snapshot.SevenDayRemainingPercent);
+
+        return CreateIcon(
+            fiveHourRemaining.ToString(CultureInfo.InvariantCulture),
+            ColorForRemaining(fiveHourRemaining, palette),
+            sevenDayRemaining.ToString(CultureInfo.InvariantCulture),
+            ColorForRemaining(sevenDayRemaining, palette),
+            KimiBrandColor);
+    }
+
+    public static string GetKimiIconKey(KimiUsageSnapshot snapshot)
+    {
+        int fiveHourRemaining = KimiUsageMath.GetRemainingPercent(snapshot.FiveHourRemainingPercent);
+        int sevenDayRemaining = KimiUsageMath.GetRemainingPercent(snapshot.SevenDayRemainingPercent);
+        return $"kimi:{fiveHourRemaining}:{sevenDayRemaining}";
+    }
+
+    public static IntPtr CreateKimiUnavailableIcon()
+    {
+        IconPalette palette = GetPalette();
+        return CreateIcon("?", palette.UnknownColor, "?", palette.UnknownColor, KimiBrandColor);
+    }
+
     private static IntPtr CreateIcon(
         string topText,
         uint topColor,
@@ -1458,9 +2785,20 @@ internal static class TrayIconRenderer
         return CreateNativeIcon(pixels);
     }
 
+    private static IntPtr CreateCenteredIcon(
+        string text,
+        uint textColor,
+        uint brandMarkerColor)
+    {
+        uint[] pixels = new uint[IconSize * IconSize];
+        DrawBrandTriangle(pixels, brandMarkerColor);
+        DrawText(pixels, text, (IconSize - GlyphHeight) / 2, textColor);
+        return CreateNativeIcon(pixels);
+    }
+
     private static void DrawBrandTriangle(uint[] pixels, uint color)
     {
-        const int markerSize = 4;
+        const int markerSize = 2;
         int startY = IconSize - markerSize;
 
         for (int y = startY; y < IconSize; y++)
@@ -1622,10 +2960,9 @@ internal static class TrayIconRenderer
 
 internal static class NativeMethods
 {
-    public static readonly IntPtr HWND_MESSAGE = new(-3);
-
     public const uint WM_NULL = 0x0000;
     public const uint WM_DESTROY = 0x0002;
+    public const uint WM_CLOSE = 0x0010;
     public const uint WM_CONTEXTMENU = 0x007B;
     public const uint WM_TIMER = 0x0113;
     public const uint WM_LBUTTONDBLCLK = 0x0203;
@@ -1639,6 +2976,7 @@ internal static class NativeMethods
     public const uint NIF_MESSAGE = 0x00000001;
     public const uint NIF_ICON = 0x00000002;
     public const uint NIF_TIP = 0x00000004;
+    public const uint NIF_GUID = 0x00000020;
 
     public const uint MF_STRING = 0x00000000;
     public const uint MF_GRAYED = 0x00000001;
@@ -1758,6 +3096,9 @@ internal static class NativeMethods
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern ushort RegisterClassEx(ref WNDCLASSEX windowClass);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern uint RegisterWindowMessage(string messageName);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern bool UnregisterClass(string className, IntPtr instanceHandle);
