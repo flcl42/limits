@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>gpt</AssemblyName>
     <RootNamespace>Limits</RootNamespace>
-    <Version>1.1.0</Version>
+    <Version>1.1.1</Version>
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">

@@ -1760,7 +1760,6 @@ internal sealed class KimiUsageReader
     private const string DefaultKimiCodeBaseUrl = "https://api.kimi.com/coding/v1";
     private const string DefaultOAuthHost = "https://auth.kimi.com";
     private const string KimiClientId = "17e5f671-d194-4dfb-9706-5516cb48c098";
-    private const string OAuthBetaHeader = "oauth-2025-04-20";
 
     private static readonly HttpClient HttpClient = new()
     {
@@ -1992,18 +1991,17 @@ internal sealed class KimiUsageReader
 
     private KimiCredential RefreshAccessToken(JsonObject credentials, string refreshToken)
     {
-        string tokenEndpoint = $"{_oauthHost}/v1/oauth/token";
+        string tokenEndpoint = $"{_oauthHost}/api/oauth/token";
         using HttpRequestMessage request = new(HttpMethod.Post, tokenEndpoint);
-        request.Headers.TryAddWithoutValidation("anthropic-beta", OAuthBetaHeader);
+        request.Headers.TryAddWithoutValidation("Accept", "application/json");
         request.Headers.TryAddWithoutValidation("User-Agent", "KimiCLI/1.6 limits/1.0");
 
-        JsonObject requestBody = new()
+        request.Content = new FormUrlEncodedContent(new Dictionary<string, string>
         {
+            ["client_id"] = KimiClientId,
             ["grant_type"] = "refresh_token",
-            ["refresh_token"] = refreshToken,
-            ["client_id"] = KimiClientId
-        };
-        request.Content = new StringContent(requestBody.ToJsonString(), Encoding.UTF8, "application/json");
+            ["refresh_token"] = refreshToken
+        });
 
         using HttpResponseMessage response = HttpClient.Send(request);
         string responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
