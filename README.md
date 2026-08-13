@@ -11,10 +11,12 @@ compact notification-area icons.
 - DeepSeek icon: remaining USD balance with a trailing `$` and DeepSeek-blue
   marker
 
-Codex, Claude, and Kimi each show up to seven separated dots along the bottom
-edge. The dots represent days until the weekly reset; one disappears as each
-day expires. Exact percentages, balances, reset times, source paths, and manual
-refresh commands remain available from each icon's popup menu.
+Codex, Claude, and Kimi each show up to seven vertical dots along the left edge.
+The dots represent days until the weekly reset; one disappears as each day
+expires. The middle dot has two blank pixels above and below it, splitting the
+strip into countable groups. Exact percentages, balances, reset times, source
+paths, and manual refresh commands remain available from each icon's popup
+menu.
 
 Codex status is read from local session files under `%CODEX_HOME%\sessions` or
 `%USERPROFILE%\.codex\sessions`. Claude status is read from Claude Code's

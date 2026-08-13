@@ -3243,11 +3243,10 @@ internal static class TrayIconRenderer
 
     private static void DrawResetDayDots(uint[] pixels, int count, uint color)
     {
-        const int y = IconSize - 1;
+        ReadOnlySpan<int> rows = [0, 2, 4, 7, 10, 12, 14];
         for (int index = 0; index < count; index++)
         {
-            int x = 1 + (index * 2);
-            pixels[(y * IconSize) + x] = color;
+            pixels[rows[index] * IconSize] = color;
         }
     }
 
