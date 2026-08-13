@@ -3074,24 +3074,6 @@ internal static class TrayIconRenderer
         ['?'] = ["1110", "0001", "0010", "0010", "0000", "0010", "0000"]
     };
 
-    private static readonly IReadOnlyDictionary<char, string[]> CompactGlyphs = new Dictionary<char, string[]>
-    {
-        ['0'] = ["111", "101", "101", "101", "111"],
-        ['1'] = ["010", "110", "010", "010", "111"],
-        ['2'] = ["110", "001", "010", "100", "111"],
-        ['3'] = ["110", "001", "010", "001", "110"],
-        ['4'] = ["101", "101", "111", "001", "001"],
-        ['5'] = ["111", "100", "110", "001", "110"],
-        ['6'] = ["011", "100", "111", "101", "111"],
-        ['7'] = ["111", "001", "010", "010", "010"],
-        ['8'] = ["111", "101", "111", "101", "111"],
-        ['9'] = ["111", "101", "111", "001", "110"],
-        ['.'] = ["000", "000", "000", "000", "010"],
-        ['$'] = ["010", "111", "110", "011", "010"],
-        ['k'] = ["100", "101", "110", "101", "101"],
-        ['?'] = ["110", "001", "010", "000", "010"]
-    };
-
     public static IntPtr CreateUsageIcon(CodexUsageSnapshot snapshot)
     {
         IconPalette palette = GetPalette();
@@ -3179,10 +3161,17 @@ internal static class TrayIconRenderer
     {
         IconPalette palette = GetPalette();
         uint balanceColor = ColorForBalance(snapshot.TotalBalance, snapshot.IsAvailable, palette);
-        uint[] pixels = new uint[IconSize * IconSize];
-        DrawBrandTriangle(pixels, DeepSeekBrandColor);
-        DrawCompactText(pixels, FormatBalanceIconText(snapshot.TotalBalance), 5, balanceColor);
-        return CreateNativeIcon(pixels);
+        string text = FormatBalanceIconText(snapshot.TotalBalance);
+
+        if (text == "infinity")
+        {
+            uint[] infinityPixels = new uint[IconSize * IconSize];
+            DrawBrandTriangle(infinityPixels, DeepSeekBrandColor);
+            DrawInfinity(infinityPixels, balanceColor);
+            return CreateNativeIcon(infinityPixels);
+        }
+
+        return CreateCenteredIcon(text, balanceColor, DeepSeekBrandColor);
     }
 
     public static string GetDeepSeekIconKey(DeepSeekBalanceSnapshot snapshot)
@@ -3193,10 +3182,7 @@ internal static class TrayIconRenderer
     public static IntPtr CreateDeepSeekUnavailableIcon()
     {
         IconPalette palette = GetPalette();
-        uint[] pixels = new uint[IconSize * IconSize];
-        DrawBrandTriangle(pixels, DeepSeekBrandColor);
-        DrawCompactText(pixels, "?", 5, palette.UnknownColor);
-        return CreateNativeIcon(pixels);
+        return CreateCenteredIcon("?", palette.UnknownColor, DeepSeekBrandColor);
     }
 
     private static IntPtr CreateIcon(
@@ -3304,35 +3290,26 @@ internal static class TrayIconRenderer
         }
     }
 
-    private static void DrawCompactText(uint[] pixels, string text, int y, uint color)
+    private static void DrawInfinity(uint[] pixels, uint color)
     {
-        const int glyphWidth = 3;
-        const int glyphHeight = 5;
-        const int glyphSpacing = 1;
-        int width = (text.Length * glyphWidth) + Math.Max(0, text.Length - 1) * glyphSpacing;
-        int startX = Math.Max(0, (IconSize - width) / 2);
+        string[] rows =
+        [
+            "00110001100",
+            "01001010010",
+            "10000100001",
+            "01001010010",
+            "00110001100"
+        ];
+        const int startX = 2;
+        const int startY = 5;
 
-        for (int index = 0; index < text.Length; index++)
+        for (int row = 0; row < rows.Length; row++)
         {
-            char value = CompactGlyphs.ContainsKey(text[index]) ? text[index] : '?';
-            string[] rows = CompactGlyphs[value];
-            int glyphX = startX + (index * (glyphWidth + glyphSpacing));
-
-            for (int rowIndex = 0; rowIndex < glyphHeight; rowIndex++)
+            for (int column = 0; column < rows[row].Length; column++)
             {
-                for (int columnIndex = 0; columnIndex < glyphWidth; columnIndex++)
+                if (rows[row][column] == '1')
                 {
-                    if (rows[rowIndex][columnIndex] != '1')
-                    {
-                        continue;
-                    }
-
-                    int pixelX = glyphX + columnIndex;
-                    int pixelY = y + rowIndex;
-                    if (pixelX >= 0 && pixelX < IconSize && pixelY >= 0 && pixelY < IconSize)
-                    {
-                        pixels[(pixelY * IconSize) + pixelX] = color;
-                    }
+                    pixels[((startY + row) * IconSize) + startX + column] = color;
                 }
             }
         }
@@ -3340,32 +3317,13 @@ internal static class TrayIconRenderer
 
     private static string FormatBalanceIconText(decimal amount)
     {
-        amount = Math.Max(0, amount);
-        if (amount >= 1000)
+        decimal wholeDollars = Math.Floor(Math.Max(0, amount));
+        if (wholeDollars > 100)
         {
-            decimal thousands = Math.Min(9, Math.Floor(amount / 1000));
-            return $"{thousands.ToString("0", CultureInfo.InvariantCulture)}k$";
+            return "infinity";
         }
 
-        if (amount >= 10)
-        {
-            decimal wholeDollars = Math.Min(999, Math.Floor(amount));
-            return $"{wholeDollars.ToString("0", CultureInfo.InvariantCulture)}$";
-        }
-
-        if (amount >= 1)
-        {
-            decimal tenths = Math.Floor(amount * 10) / 10;
-            return $"{tenths.ToString("0.0", CultureInfo.InvariantCulture)}$";
-        }
-
-        if (amount > 0)
-        {
-            decimal cents = Math.Floor(amount * 100) / 100;
-            return $"{cents.ToString(".00", CultureInfo.InvariantCulture)}$";
-        }
-
-        return "0$";
+        return wholeDollars.ToString("0", CultureInfo.InvariantCulture);
     }
 
     private static IntPtr CreateNativeIcon(uint[] pixels)

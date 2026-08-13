@@ -8,8 +8,8 @@ compact notification-area icons.
   Claude-orange marker
 - Kimi icon: remaining 5-hour percent on top, 7-day percent on bottom, and
   Kimi-blue marker
-- DeepSeek icon: remaining USD balance with a trailing `$` and DeepSeek-blue
-  marker
+- DeepSeek icon: floored whole-dollar balance in large digits and DeepSeek-blue
+  marker; floored values above `100` display infinity
 
 Codex, Claude, and Kimi each show up to seven vertical dots along the left edge.
 The dots represent days until the weekly reset; one disappears as each day
