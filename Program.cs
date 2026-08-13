@@ -32,7 +32,9 @@ internal sealed class TrayApplication : IDisposable
     private const uint ClaudeResultMessage = NativeMethods.WM_APP + 3;
     private const uint ShutdownMessage = NativeMethods.WM_APP + 4;
     private const uint KimiResultMessage = NativeMethods.WM_APP + 5;
+    private const uint DeepSeekResultMessage = NativeMethods.WM_APP + 6;
     private const uint KimiTrayIconId = 3;
+    private const uint DeepSeekTrayIconId = 4;
     private const nuint RefreshTimerId = 1;
     private const uint RefreshIntervalMs = 300_000;
     private const int ClaudeRefreshTimeoutSeconds = 25;
@@ -41,11 +43,13 @@ internal sealed class TrayApplication : IDisposable
     private const uint CommandExit = 1003;
     private const uint CommandOpenClaudeUsage = 1004;
     private const uint CommandOpenKimiSessions = 1005;
+    private const uint CommandOpenDeepSeekBilling = 1006;
     private const string ShutdownEventName = @"Local\Limits.Shutdown";
 
     private static readonly Guid CodexTrayIconGuid = new("2a642a8d-169a-4035-ad86-ea43b5e87764");
     private static readonly Guid ClaudeTrayIconGuid = new("4654b565-47c7-49af-a257-8f26d82c0ec0");
     private static readonly Guid KimiTrayIconGuid = new("918bd040-6a80-4b43-ae66-13a8f5bb1d57");
+    private static readonly Guid DeepSeekTrayIconGuid = new("36f5599d-63ad-4d36-b75d-8498b2df37bf");
 
     private static readonly NativeMethods.WndProcDelegate WindowProcedure = HandleWindowMessage;
     private static TrayApplication? Current;
@@ -54,6 +58,7 @@ internal sealed class TrayApplication : IDisposable
     private readonly CodexUsageReader _codexUsageReader = new();
     private readonly ClaudeUsageReader _claudeUsageReader = new();
     private readonly KimiUsageReader _kimiUsageReader = new();
+    private readonly DeepSeekBalanceReader _deepSeekBalanceReader = new();
     private readonly LimitWatchdog _limitWatchdog = new();
     private readonly string _windowClassName = $"limits.{Environment.ProcessId}";
     private readonly EventWaitHandle _shutdownEvent;
@@ -65,16 +70,20 @@ internal sealed class TrayApplication : IDisposable
     private IntPtr _codexIconHandle;
     private IntPtr _claudeIconHandle;
     private IntPtr _kimiIconHandle;
+    private IntPtr _deepSeekIconHandle;
     private bool _codexTrayIconAdded;
     private bool _claudeTrayIconAdded;
     private bool _kimiTrayIconAdded;
+    private bool _deepSeekTrayIconAdded;
     private bool _windowClassRegistered;
     private string? _codexIconKey;
     private string? _claudeIconKey;
     private string? _kimiIconKey;
+    private string? _deepSeekIconKey;
     private string? _codexAppliedTooltip;
     private string? _claudeAppliedTooltip;
     private string? _kimiAppliedTooltip;
+    private string? _deepSeekAppliedTooltip;
     private string _codexTooltip = "limits";
     private string _codexStatusText = "Loading Codex usage...";
     private string _codexDetailText = "Reading local Codex sessions.";
@@ -93,12 +102,20 @@ internal sealed class TrayApplication : IDisposable
     private string _kimiUpdatedText = string.Empty;
     private string _kimiSourceText = string.Empty;
     private KimiUsageSnapshot? _lastKimiSnapshot;
+    private string _deepSeekTooltip = "limits";
+    private string _deepSeekStatusText = "Loading DeepSeek balance...";
+    private string _deepSeekDetailText = "Reading DeepCode configuration.";
+    private string _deepSeekUpdatedText = string.Empty;
+    private string _deepSeekSourceText = string.Empty;
+    private DeepSeekBalanceSnapshot? _lastDeepSeekSnapshot;
     private volatile bool _codexRefreshInFlight;
     private volatile UsageReadResult? _pendingCodexResult;
     private volatile bool _claudeRefreshInFlight;
     private volatile ClaudeUsageReadResult? _pendingClaudeResult;
     private volatile bool _kimiRefreshInFlight;
     private volatile KimiUsageReadResult? _pendingKimiResult;
+    private volatile bool _deepSeekRefreshInFlight;
+    private volatile DeepSeekBalanceReadResult? _pendingDeepSeekResult;
     private volatile bool _limitWatchdogInFlight;
 
     public TrayApplication()
@@ -155,6 +172,7 @@ internal sealed class TrayApplication : IDisposable
         UpdateCodexTrayIcon(TrayIconRenderer.CreateUnavailableIcon(), TrayIconRenderer.CodexUnavailableIconKey);
         UpdateClaudeTrayIcon(TrayIconRenderer.CreateClaudeUnavailableIcon(), TrayIconRenderer.ClaudeUnavailableIconKey);
         UpdateKimiTrayIcon(TrayIconRenderer.CreateKimiUnavailableIcon(), TrayIconRenderer.KimiUnavailableIconKey);
+        UpdateDeepSeekTrayIcon(TrayIconRenderer.CreateDeepSeekUnavailableIcon(), TrayIconRenderer.DeepSeekUnavailableIconKey);
         RefreshUsage();
         NativeMethods.SetTimer(_windowHandle, RefreshTimerId, RefreshIntervalMs, IntPtr.Zero);
 
@@ -226,6 +244,7 @@ internal sealed class TrayApplication : IDisposable
         RefreshCodexUsage();
         RefreshClaudeUsage();
         RefreshKimiUsage();
+        RefreshDeepSeekBalance();
     }
 
     private void RefreshCodexUsage()
@@ -460,6 +479,87 @@ internal sealed class TrayApplication : IDisposable
         UpdateKimiTrayIcon(TrayIconRenderer.CreateKimiIcon(snapshot), TrayIconRenderer.GetKimiIconKey(snapshot));
     }
 
+    private void RefreshDeepSeekBalance()
+    {
+        if (_deepSeekRefreshInFlight)
+        {
+            return;
+        }
+
+        _deepSeekRefreshInFlight = true;
+        IntPtr windowHandle = _windowHandle;
+
+        Task.Run(() =>
+        {
+            DeepSeekBalanceReadResult result;
+            try
+            {
+                result = _deepSeekBalanceReader.ReadLatestSnapshot();
+            }
+            catch (Exception exception)
+            {
+                result = new DeepSeekBalanceReadResult(null, exception.Message);
+            }
+
+            _pendingDeepSeekResult = result;
+
+            if (windowHandle == IntPtr.Zero ||
+                !NativeMethods.PostMessage(windowHandle, DeepSeekResultMessage, IntPtr.Zero, IntPtr.Zero))
+            {
+                _deepSeekRefreshInFlight = false;
+            }
+        });
+    }
+
+    private void ApplyDeepSeekResult()
+    {
+        DeepSeekBalanceReadResult? result = _pendingDeepSeekResult;
+        _pendingDeepSeekResult = null;
+        _deepSeekRefreshInFlight = false;
+
+        if (result is null)
+        {
+            return;
+        }
+
+        if (result.Snapshot is null)
+        {
+            if (_lastDeepSeekSnapshot is { } lastSnapshot)
+            {
+                _deepSeekTooltip = $"{BuildDeepSeekTooltip(lastSnapshot)} (last known)";
+                _deepSeekStatusText = $"{BuildDeepSeekHeadline(lastSnapshot)} - refresh failed";
+                _deepSeekDetailText = result.ErrorMessage ?? "DeepSeek balance refresh failed.";
+                _deepSeekUpdatedText = $"Last seen {lastSnapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}; checked {DateTimeOffset.Now:HH:mm:ss}";
+                _deepSeekSourceText = _deepSeekBalanceReader.SettingsPath;
+                UpdateDeepSeekTrayIcon(
+                    TrayIconRenderer.CreateDeepSeekIcon(lastSnapshot),
+                    TrayIconRenderer.GetDeepSeekIconKey(lastSnapshot));
+                return;
+            }
+
+            _deepSeekTooltip = BuildDeepSeekUnavailableTooltip(result.ErrorMessage);
+            _deepSeekStatusText = "No DeepSeek balance data found";
+            _deepSeekDetailText = result.ErrorMessage ?? "DeepCode configuration was not found.";
+            _deepSeekUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
+            _deepSeekSourceText = _deepSeekBalanceReader.SettingsPath;
+            UpdateDeepSeekTrayIcon(
+                TrayIconRenderer.CreateDeepSeekUnavailableIcon(),
+                TrayIconRenderer.DeepSeekUnavailableIconKey);
+            return;
+        }
+
+        DeepSeekBalanceSnapshot snapshot = result.Snapshot;
+        _lastDeepSeekSnapshot = snapshot;
+        _deepSeekTooltip = BuildDeepSeekTooltip(snapshot);
+        _deepSeekStatusText = BuildDeepSeekHeadline(snapshot);
+        _deepSeekDetailText = BuildDeepSeekDetail(snapshot);
+        _deepSeekUpdatedText = $"Seen {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
+        _deepSeekSourceText = snapshot.SourceFile;
+        UpdateDeepSeekTrayIcon(
+            TrayIconRenderer.CreateDeepSeekIcon(snapshot),
+            TrayIconRenderer.GetDeepSeekIconKey(snapshot));
+    }
+
     private void RunLimitWatchdog(ClaudeUsageSnapshot? snapshot)
     {
         if (_limitWatchdogInFlight)
@@ -518,6 +618,19 @@ internal sealed class TrayApplication : IDisposable
             ref _kimiAppliedTooltip,
             iconKey,
             _kimiTooltip);
+    }
+
+    private void UpdateDeepSeekTrayIcon(IntPtr newIconHandle, string iconKey)
+    {
+        UpdateTrayIcon(
+            DeepSeekTrayIconId,
+            newIconHandle,
+            ref _deepSeekIconHandle,
+            ref _deepSeekTrayIconAdded,
+            ref _deepSeekIconKey,
+            ref _deepSeekAppliedTooltip,
+            iconKey,
+            _deepSeekTooltip);
     }
 
     private void UpdateTrayIcon(
@@ -621,6 +734,7 @@ internal sealed class TrayApplication : IDisposable
         {
             ClaudeTrayIconId => ClaudeTrayIconGuid,
             KimiTrayIconId => KimiTrayIconGuid,
+            DeepSeekTrayIconId => DeepSeekTrayIconGuid,
             _ => CodexTrayIconGuid
         };
     }
@@ -670,13 +784,20 @@ internal sealed class TrayApplication : IDisposable
                 ApplyKimiResult();
                 return IntPtr.Zero;
 
+            case DeepSeekResultMessage:
+                ApplyDeepSeekResult();
+                return IntPtr.Zero;
+
             case ShutdownMessage:
                 NativeMethods.DestroyWindow(_windowHandle);
                 return IntPtr.Zero;
 
             case TrayCallbackMessage:
                 uint iconId = (uint)wParam.ToInt64();
-                if (iconId is not CodexTrayIconId and not ClaudeTrayIconId and not KimiTrayIconId)
+                if (iconId is not CodexTrayIconId and
+                    not ClaudeTrayIconId and
+                    not KimiTrayIconId and
+                    not DeepSeekTrayIconId)
                 {
                     break;
                 }
@@ -709,16 +830,20 @@ internal sealed class TrayApplication : IDisposable
         _codexTrayIconAdded = false;
         _claudeTrayIconAdded = false;
         _kimiTrayIconAdded = false;
+        _deepSeekTrayIconAdded = false;
         _codexIconKey = null;
         _claudeIconKey = null;
         _kimiIconKey = null;
+        _deepSeekIconKey = null;
         _codexAppliedTooltip = null;
         _claudeAppliedTooltip = null;
         _kimiAppliedTooltip = null;
+        _deepSeekAppliedTooltip = null;
 
         UpdateCodexTrayIcon(TrayIconRenderer.CreateUnavailableIcon(), TrayIconRenderer.CodexUnavailableIconKey);
         UpdateClaudeTrayIcon(TrayIconRenderer.CreateClaudeUnavailableIcon(), TrayIconRenderer.ClaudeUnavailableIconKey);
         UpdateKimiTrayIcon(TrayIconRenderer.CreateKimiUnavailableIcon(), TrayIconRenderer.KimiUnavailableIconKey);
+        UpdateDeepSeekTrayIcon(TrayIconRenderer.CreateDeepSeekUnavailableIcon(), TrayIconRenderer.DeepSeekUnavailableIconKey);
         RefreshUsage();
     }
 
@@ -755,6 +880,15 @@ internal sealed class TrayApplication : IDisposable
                 sourceText = _kimiSourceText;
                 openCommand = CommandOpenKimiSessions;
                 openLabel = "Open Kimi sessions";
+                break;
+
+            case DeepSeekTrayIconId:
+                statusText = _deepSeekStatusText;
+                detailText = _deepSeekDetailText;
+                updatedText = _deepSeekUpdatedText;
+                sourceText = _deepSeekSourceText;
+                openCommand = CommandOpenDeepSeekBilling;
+                openLabel = "Open DeepSeek billing";
                 break;
 
             default:
@@ -828,6 +962,10 @@ internal sealed class TrayApplication : IDisposable
                 OpenKimiSessionsFolder();
                 break;
 
+            case CommandOpenDeepSeekBilling:
+                OpenDeepSeekBillingPage();
+                break;
+
             case CommandExit:
                 NativeMethods.DestroyWindow(_windowHandle);
                 break;
@@ -869,6 +1007,15 @@ internal sealed class TrayApplication : IDisposable
         });
     }
 
+    private static void OpenDeepSeekBillingPage()
+    {
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = "https://platform.deepseek.com/usage",
+            UseShellExecute = true
+        });
+    }
+
     private void PostQuit()
     {
         _windowHandle = IntPtr.Zero;
@@ -881,6 +1028,7 @@ internal sealed class TrayApplication : IDisposable
         RemoveTrayIcon(CodexTrayIconId, ref _codexTrayIconAdded);
         RemoveTrayIcon(ClaudeTrayIconId, ref _claudeTrayIconAdded);
         RemoveTrayIcon(KimiTrayIconId, ref _kimiTrayIconAdded);
+        RemoveTrayIcon(DeepSeekTrayIconId, ref _deepSeekTrayIconAdded);
 
         if (_windowHandle != IntPtr.Zero)
         {
@@ -890,6 +1038,7 @@ internal sealed class TrayApplication : IDisposable
         DestroyIconHandle(ref _codexIconHandle);
         DestroyIconHandle(ref _claudeIconHandle);
         DestroyIconHandle(ref _kimiIconHandle);
+        DestroyIconHandle(ref _deepSeekIconHandle);
 
         if (_windowClassRegistered)
         {
@@ -1057,6 +1206,38 @@ internal sealed class TrayApplication : IDisposable
 
         return $"Kimi tokens 24h: spent {FormatCompactTokens(snapshot.SpentTokens)}, " +
                $"cached read {FormatCompactTokens(snapshot.CachedReadTokens)}";
+    }
+
+    private static string BuildDeepSeekTooltip(DeepSeekBalanceSnapshot snapshot)
+    {
+        return TruncateTooltip($"DeepSeek: {FormatDeepSeekBalance(snapshot.TotalBalance)} left via DeepCode");
+    }
+
+    private static string BuildDeepSeekUnavailableTooltip(string? errorMessage)
+    {
+        if (string.IsNullOrWhiteSpace(errorMessage))
+        {
+            return "DeepSeek: balance unavailable";
+        }
+
+        return TruncateTooltip($"DeepSeek: balance unavailable ({errorMessage})");
+    }
+
+    private static string BuildDeepSeekHeadline(DeepSeekBalanceSnapshot snapshot)
+    {
+        string availability = snapshot.IsAvailable ? "available" : "unavailable for API calls";
+        return $"DeepSeek: {FormatDeepSeekBalance(snapshot.TotalBalance)} left ({availability})";
+    }
+
+    private static string BuildDeepSeekDetail(DeepSeekBalanceSnapshot snapshot)
+    {
+        return $"Topped up {FormatDeepSeekBalance(snapshot.ToppedUpBalance)}, " +
+               $"granted {FormatDeepSeekBalance(snapshot.GrantedBalance)}";
+    }
+
+    private static string FormatDeepSeekBalance(decimal amount)
+    {
+        return $"${amount.ToString("0.00", CultureInfo.InvariantCulture)}";
     }
 
     private static string FormatWindow(int minutes)
@@ -2473,6 +2654,205 @@ internal sealed class KimiUsageReader
     }
 }
 
+internal sealed record DeepSeekBalanceSnapshot(
+    decimal TotalBalance,
+    decimal GrantedBalance,
+    decimal ToppedUpBalance,
+    bool IsAvailable,
+    DateTimeOffset Timestamp,
+    string SourceFile,
+    string BalanceEndpoint);
+
+internal sealed record DeepSeekBalanceReadResult(DeepSeekBalanceSnapshot? Snapshot, string? ErrorMessage);
+
+internal sealed class DeepSeekBalanceReader
+{
+    private const string DefaultBaseUrl = "https://api.deepseek.com";
+    private static readonly HttpClient HttpClient = new()
+    {
+        Timeout = TimeSpan.FromSeconds(20)
+    };
+
+    public string SettingsPath { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".deepcode",
+        "settings.json");
+
+    public DeepSeekBalanceReadResult ReadLatestSnapshot()
+    {
+        try
+        {
+            DeepCodeConfiguration configuration = ReadDeepCodeConfiguration();
+            string endpoint = BuildBalanceEndpoint(configuration.BaseUrl);
+
+            using HttpRequestMessage request = new(HttpMethod.Get, endpoint);
+            request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(
+                "Bearer",
+                configuration.ApiKey);
+            request.Headers.Accept.ParseAdd("application/json");
+            request.Headers.UserAgent.ParseAdd("DeepCode/limits");
+
+            using HttpResponseMessage response = HttpClient.Send(request);
+            if (!response.IsSuccessStatusCode)
+            {
+                string message = response.StatusCode switch
+                {
+                    System.Net.HttpStatusCode.Unauthorized => "DeepCode API key was rejected by DeepSeek.",
+                    System.Net.HttpStatusCode.PaymentRequired => "DeepSeek reports insufficient balance.",
+                    System.Net.HttpStatusCode.TooManyRequests => "DeepSeek balance endpoint rate limited the request.",
+                    _ => $"DeepSeek balance request failed: HTTP {(int)response.StatusCode}"
+                };
+                throw new InvalidOperationException(message);
+            }
+
+            string responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            DeepSeekBalanceSnapshot snapshot = ParseBalanceResponse(
+                responseBody,
+                configuration.Source,
+                endpoint);
+            return new DeepSeekBalanceReadResult(snapshot, null);
+        }
+        catch (Exception exception) when (exception is
+            HttpRequestException or
+            TaskCanceledException or
+            IOException or
+            JsonException or
+            InvalidOperationException or
+            UnauthorizedAccessException)
+        {
+            return new DeepSeekBalanceReadResult(null, exception.Message);
+        }
+    }
+
+    private DeepCodeConfiguration ReadDeepCodeConfiguration()
+    {
+        string? apiKey = null;
+        string? baseUrl = null;
+
+        if (File.Exists(SettingsPath))
+        {
+            using JsonDocument document = JsonDocument.Parse(File.ReadAllText(SettingsPath));
+            JsonElement root = document.RootElement;
+            if (root.TryGetProperty("env", out JsonElement env) && env.ValueKind == JsonValueKind.Object)
+            {
+                apiKey = ReadNonEmptyString(env, "API_KEY");
+                baseUrl = ReadNonEmptyString(env, "BASE_URL");
+            }
+        }
+
+        string? environmentApiKey = Environment.GetEnvironmentVariable("DEEPCODE_API_KEY");
+        string? environmentBaseUrl = Environment.GetEnvironmentVariable("DEEPCODE_BASE_URL");
+        apiKey = string.IsNullOrWhiteSpace(environmentApiKey) ? apiKey : environmentApiKey.Trim();
+        baseUrl = string.IsNullOrWhiteSpace(environmentBaseUrl) ? baseUrl : environmentBaseUrl.Trim();
+
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            throw new InvalidOperationException($"DeepCode API key was not found in {SettingsPath} or DEEPCODE_API_KEY.");
+        }
+
+        string source = string.IsNullOrWhiteSpace(environmentApiKey)
+            ? SettingsPath
+            : "DEEPCODE_API_KEY";
+        return new DeepCodeConfiguration(apiKey, baseUrl ?? DefaultBaseUrl, source);
+    }
+
+    private static string BuildBalanceEndpoint(string configuredBaseUrl)
+    {
+        string baseUrl = configuredBaseUrl.Trim().TrimEnd('/');
+        if (baseUrl.EndsWith("/anthropic", StringComparison.OrdinalIgnoreCase))
+        {
+            baseUrl = baseUrl[..^"/anthropic".Length];
+        }
+        else if (baseUrl.EndsWith("/v1", StringComparison.OrdinalIgnoreCase))
+        {
+            baseUrl = baseUrl[..^"/v1".Length];
+        }
+
+        if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out Uri? uri) ||
+            uri.Scheme is not ("http" or "https"))
+        {
+            throw new InvalidOperationException("DeepCode BASE_URL is not a valid HTTP URL.");
+        }
+
+        return $"{baseUrl}/user/balance";
+    }
+
+    private static DeepSeekBalanceSnapshot ParseBalanceResponse(
+        string responseBody,
+        string source,
+        string endpoint)
+    {
+        using JsonDocument document = JsonDocument.Parse(responseBody);
+        JsonElement root = document.RootElement;
+        bool isAvailable = root.TryGetProperty("is_available", out JsonElement availableElement) &&
+                           availableElement.ValueKind == JsonValueKind.True;
+
+        if (!root.TryGetProperty("balance_infos", out JsonElement balances) ||
+            balances.ValueKind != JsonValueKind.Array)
+        {
+            throw new InvalidOperationException("DeepSeek balance response did not include balance_infos.");
+        }
+
+        foreach (JsonElement balance in balances.EnumerateArray())
+        {
+            if (!string.Equals(ReadNonEmptyString(balance, "currency"), "USD", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            return new DeepSeekBalanceSnapshot(
+                ReadDecimal(balance, "total_balance"),
+                ReadDecimal(balance, "granted_balance"),
+                ReadDecimal(balance, "topped_up_balance"),
+                isAvailable,
+                DateTimeOffset.UtcNow,
+                source,
+                endpoint);
+        }
+
+        throw new InvalidOperationException("DeepSeek balance response did not include a USD balance.");
+    }
+
+    private static decimal ReadDecimal(JsonElement parent, string propertyName)
+    {
+        if (!parent.TryGetProperty(propertyName, out JsonElement element))
+        {
+            throw new InvalidOperationException($"DeepSeek balance response did not include {propertyName}.");
+        }
+
+        if (element.ValueKind == JsonValueKind.Number && element.TryGetDecimal(out decimal numericValue))
+        {
+            return numericValue;
+        }
+
+        if (element.ValueKind == JsonValueKind.String &&
+            decimal.TryParse(
+                element.GetString(),
+                NumberStyles.Number,
+                CultureInfo.InvariantCulture,
+                out decimal stringValue))
+        {
+            return stringValue;
+        }
+
+        throw new InvalidOperationException($"DeepSeek balance response has an invalid {propertyName}.");
+    }
+
+    private static string? ReadNonEmptyString(JsonElement parent, string propertyName)
+    {
+        if (!parent.TryGetProperty(propertyName, out JsonElement element) ||
+            element.ValueKind != JsonValueKind.String)
+        {
+            return null;
+        }
+
+        string? value = element.GetString();
+        return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+    }
+
+    private sealed record DeepCodeConfiguration(string ApiKey, string BaseUrl, string Source);
+}
+
 internal sealed class LimitWatchdog
 {
     private const double ThresholdRemainingPercent = 5.0d;
@@ -2660,11 +3040,13 @@ internal static class TrayIconRenderer
     public const string CodexUnavailableIconKey = "codex:?:?";
     public const string ClaudeUnavailableIconKey = "claude:?:?";
     public const string KimiUnavailableIconKey = "kimi:?";
+    public const string DeepSeekUnavailableIconKey = "deepseek:?";
 
     // Brand marker colors are fixed, not theme-dependent.
     private const uint OpenAiBrandColor = 0xFF10A37F;
     private const uint ClaudeBrandColor = 0xFFD97757;
     private const uint KimiBrandColor = 0xFF23B7F0;
+    private const uint DeepSeekBrandColor = 0xFF4D6BFE;
 
     private static readonly IconPalette LightThemePalette = new(
         UnknownColor: 0xFF444444,
@@ -2692,6 +3074,24 @@ internal static class TrayIconRenderer
         ['?'] = ["1110", "0001", "0010", "0010", "0000", "0010", "0000"]
     };
 
+    private static readonly IReadOnlyDictionary<char, string[]> CompactGlyphs = new Dictionary<char, string[]>
+    {
+        ['0'] = ["111", "101", "101", "101", "111"],
+        ['1'] = ["010", "110", "010", "010", "111"],
+        ['2'] = ["110", "001", "010", "100", "111"],
+        ['3'] = ["110", "001", "010", "001", "110"],
+        ['4'] = ["101", "101", "111", "001", "001"],
+        ['5'] = ["111", "100", "110", "001", "110"],
+        ['6'] = ["011", "100", "111", "101", "111"],
+        ['7'] = ["111", "001", "010", "010", "010"],
+        ['8'] = ["111", "101", "111", "101", "111"],
+        ['9'] = ["111", "101", "111", "001", "110"],
+        ['.'] = ["000", "000", "000", "000", "010"],
+        ['$'] = ["010", "111", "110", "011", "010"],
+        ['k'] = ["100", "101", "110", "101", "101"],
+        ['?'] = ["110", "001", "010", "000", "010"]
+    };
+
     public static IntPtr CreateUsageIcon(CodexUsageSnapshot snapshot)
     {
         IconPalette palette = GetPalette();
@@ -2700,13 +3100,15 @@ internal static class TrayIconRenderer
         return CreateCenteredIcon(
             weeklyRemaining.ToString(CultureInfo.InvariantCulture),
             ColorForRemaining(weeklyRemaining, palette),
-            OpenAiBrandColor);
+            OpenAiBrandColor,
+            CodexUsageMath.GetWeeklyResetAt(snapshot));
     }
 
     public static string GetCodexIconKey(CodexUsageSnapshot snapshot)
     {
         int weeklyRemaining = CodexUsageMath.GetWeeklyRemainingPercent(snapshot);
-        return $"codex:{weeklyRemaining}";
+        int resetDays = GetResetDayDotCount(CodexUsageMath.GetWeeklyResetAt(snapshot));
+        return $"codex:{weeklyRemaining}:{resetDays}";
     }
 
     public static IntPtr CreateUnavailableIcon()
@@ -2726,14 +3128,16 @@ internal static class TrayIconRenderer
             ColorForRemaining(fiveHourRemaining, palette),
             sevenDayRemaining.ToString(CultureInfo.InvariantCulture),
             ColorForRemaining(sevenDayRemaining, palette),
-            ClaudeBrandColor);
+            ClaudeBrandColor,
+            snapshot.SevenDayResetAt);
     }
 
     public static string GetClaudeIconKey(ClaudeUsageSnapshot snapshot)
     {
         int fiveHourRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.FiveHourUsedPercent);
         int sevenDayRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.SevenDayUsedPercent);
-        return $"claude:{fiveHourRemaining}:{sevenDayRemaining}";
+        int resetDays = GetResetDayDotCount(snapshot.SevenDayResetAt);
+        return $"claude:{fiveHourRemaining}:{sevenDayRemaining}:{resetDays}";
     }
 
     public static IntPtr CreateClaudeUnavailableIcon()
@@ -2753,14 +3157,16 @@ internal static class TrayIconRenderer
             ColorForRemaining(fiveHourRemaining, palette),
             sevenDayRemaining.ToString(CultureInfo.InvariantCulture),
             ColorForRemaining(sevenDayRemaining, palette),
-            KimiBrandColor);
+            KimiBrandColor,
+            snapshot.SevenDayResetAt);
     }
 
     public static string GetKimiIconKey(KimiUsageSnapshot snapshot)
     {
         int fiveHourRemaining = KimiUsageMath.GetRemainingPercent(snapshot.FiveHourRemainingPercent);
         int sevenDayRemaining = KimiUsageMath.GetRemainingPercent(snapshot.SevenDayRemainingPercent);
-        return $"kimi:{fiveHourRemaining}:{sevenDayRemaining}";
+        int resetDays = GetResetDayDotCount(snapshot.SevenDayResetAt);
+        return $"kimi:{fiveHourRemaining}:{sevenDayRemaining}:{resetDays}";
     }
 
     public static IntPtr CreateKimiUnavailableIcon()
@@ -2769,29 +3175,80 @@ internal static class TrayIconRenderer
         return CreateIcon("?", palette.UnknownColor, "?", palette.UnknownColor, KimiBrandColor);
     }
 
+    public static IntPtr CreateDeepSeekIcon(DeepSeekBalanceSnapshot snapshot)
+    {
+        IconPalette palette = GetPalette();
+        uint balanceColor = ColorForBalance(snapshot.TotalBalance, snapshot.IsAvailable, palette);
+        uint[] pixels = new uint[IconSize * IconSize];
+        DrawBrandTriangle(pixels, DeepSeekBrandColor);
+        DrawCompactText(pixels, FormatBalanceIconText(snapshot.TotalBalance), 5, balanceColor);
+        return CreateNativeIcon(pixels);
+    }
+
+    public static string GetDeepSeekIconKey(DeepSeekBalanceSnapshot snapshot)
+    {
+        return $"deepseek:{FormatBalanceIconText(snapshot.TotalBalance)}:{snapshot.IsAvailable}";
+    }
+
+    public static IntPtr CreateDeepSeekUnavailableIcon()
+    {
+        IconPalette palette = GetPalette();
+        uint[] pixels = new uint[IconSize * IconSize];
+        DrawBrandTriangle(pixels, DeepSeekBrandColor);
+        DrawCompactText(pixels, "?", 5, palette.UnknownColor);
+        return CreateNativeIcon(pixels);
+    }
+
     private static IntPtr CreateIcon(
         string topText,
         uint topColor,
         string bottomText,
         uint bottomColor,
-        uint brandMarkerColor)
+        uint brandMarkerColor,
+        DateTimeOffset? weeklyResetAt = null)
     {
         uint[] pixels = new uint[IconSize * IconSize];
         DrawBrandTriangle(pixels, brandMarkerColor);
         DrawText(pixels, topText, 0, topColor);
         DrawText(pixels, bottomText, 8, bottomColor);
+        DrawResetDayDots(pixels, GetResetDayDotCount(weeklyResetAt), bottomColor);
         return CreateNativeIcon(pixels);
     }
 
     private static IntPtr CreateCenteredIcon(
         string text,
         uint textColor,
-        uint brandMarkerColor)
+        uint brandMarkerColor,
+        DateTimeOffset? weeklyResetAt = null)
     {
         uint[] pixels = new uint[IconSize * IconSize];
         DrawBrandTriangle(pixels, brandMarkerColor);
         DrawText(pixels, text, (IconSize - GlyphHeight) / 2, textColor);
+        DrawResetDayDots(pixels, GetResetDayDotCount(weeklyResetAt), textColor);
         return CreateNativeIcon(pixels);
+    }
+
+    private static int GetResetDayDotCount(DateTimeOffset? resetAt)
+    {
+        if (resetAt is null)
+        {
+            return 0;
+        }
+
+        double daysRemaining = (resetAt.Value - DateTimeOffset.Now).TotalDays;
+        return daysRemaining <= 0
+            ? 0
+            : Math.Clamp((int)Math.Ceiling(daysRemaining), 0, 7);
+    }
+
+    private static void DrawResetDayDots(uint[] pixels, int count, uint color)
+    {
+        const int y = IconSize - 1;
+        for (int index = 0; index < count; index++)
+        {
+            int x = 1 + (index * 2);
+            pixels[(y * IconSize) + x] = color;
+        }
     }
 
     private static void DrawBrandTriangle(uint[] pixels, uint color)
@@ -2846,6 +3303,70 @@ internal static class TrayIconRenderer
                 pixels[(pixelY * IconSize) + pixelX] = color;
             }
         }
+    }
+
+    private static void DrawCompactText(uint[] pixels, string text, int y, uint color)
+    {
+        const int glyphWidth = 3;
+        const int glyphHeight = 5;
+        const int glyphSpacing = 1;
+        int width = (text.Length * glyphWidth) + Math.Max(0, text.Length - 1) * glyphSpacing;
+        int startX = Math.Max(0, (IconSize - width) / 2);
+
+        for (int index = 0; index < text.Length; index++)
+        {
+            char value = CompactGlyphs.ContainsKey(text[index]) ? text[index] : '?';
+            string[] rows = CompactGlyphs[value];
+            int glyphX = startX + (index * (glyphWidth + glyphSpacing));
+
+            for (int rowIndex = 0; rowIndex < glyphHeight; rowIndex++)
+            {
+                for (int columnIndex = 0; columnIndex < glyphWidth; columnIndex++)
+                {
+                    if (rows[rowIndex][columnIndex] != '1')
+                    {
+                        continue;
+                    }
+
+                    int pixelX = glyphX + columnIndex;
+                    int pixelY = y + rowIndex;
+                    if (pixelX >= 0 && pixelX < IconSize && pixelY >= 0 && pixelY < IconSize)
+                    {
+                        pixels[(pixelY * IconSize) + pixelX] = color;
+                    }
+                }
+            }
+        }
+    }
+
+    private static string FormatBalanceIconText(decimal amount)
+    {
+        amount = Math.Max(0, amount);
+        if (amount >= 1000)
+        {
+            decimal thousands = Math.Min(9, Math.Floor(amount / 1000));
+            return $"{thousands.ToString("0", CultureInfo.InvariantCulture)}k$";
+        }
+
+        if (amount >= 10)
+        {
+            decimal wholeDollars = Math.Min(999, Math.Floor(amount));
+            return $"{wholeDollars.ToString("0", CultureInfo.InvariantCulture)}$";
+        }
+
+        if (amount >= 1)
+        {
+            decimal tenths = Math.Floor(amount * 10) / 10;
+            return $"{tenths.ToString("0.0", CultureInfo.InvariantCulture)}$";
+        }
+
+        if (amount > 0)
+        {
+            decimal cents = Math.Floor(amount * 100) / 100;
+            return $"{cents.ToString(".00", CultureInfo.InvariantCulture)}$";
+        }
+
+        return "0$";
     }
 
     private static IntPtr CreateNativeIcon(uint[] pixels)
@@ -2920,6 +3441,21 @@ internal static class TrayIconRenderer
         }
 
         if (remainingPercent <= 40)
+        {
+            return palette.WarningColor;
+        }
+
+        return palette.SafeColor;
+    }
+
+    private static uint ColorForBalance(decimal balance, bool isAvailable, IconPalette palette)
+    {
+        if (!isAvailable || balance <= 1)
+        {
+            return palette.DangerColor;
+        }
+
+        if (balance <= 5)
         {
             return palette.WarningColor;
         }

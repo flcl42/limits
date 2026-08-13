@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>limits</AssemblyName>
     <RootNamespace>Limits</RootNamespace>
-    <Version>1.2.0</Version>
+    <Version>1.3.0</Version>
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">

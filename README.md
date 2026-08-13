@@ -1,25 +1,38 @@
 # limits
 
-Windows tray app that reads local Codex session files from `%CODEX_HOME%\\sessions` or `%USERPROFILE%\\.codex\\sessions` and shows remaining allowance as digits:
+Windows tray app that shows Codex, Claude, Kimi, and DeepSeek allowance in
+compact notification-area icons.
 
-- Codex icon: centered remaining weekly percent
+- Codex icon: centered remaining weekly percent and OpenAI-green marker
+- Claude icon: remaining 5-hour percent on top, weekly percent on bottom, and
+  Claude-orange marker
+- Kimi icon: remaining 5-hour percent on top, 7-day percent on bottom, and
+  Kimi-blue marker
+- DeepSeek icon: remaining USD balance with a trailing `$` and DeepSeek-blue
+  marker
 
-It also adds tray icons for Claude and Kimi usage:
+Codex, Claude, and Kimi each show up to seven separated dots along the bottom
+edge. The dots represent days until the weekly reset; one disappears as each
+day expires. Exact percentages, balances, reset times, source paths, and manual
+refresh commands remain available from each icon's popup menu.
 
-- Codex icon: small OpenAI-green triangle in the bottom-right corner
-- Claude icon: small Claude-orange triangle in the bottom-right corner
-- Claude icon digits: remaining 5-hour percent on top and remaining weekly percent on bottom
-- Claude popup menu: exact reset times and usage source
-- Kimi icon: small Kimi-blue triangle in the bottom-right corner
-- Kimi icon digits: remaining 5-hour percent on top and remaining 7-day percent on bottom
-- Kimi popup menu: used and remaining percent, reset times, last-24h local token count, and usage source
+Codex status is read from local session files under `%CODEX_HOME%\sessions` or
+`%USERPROFILE%\.codex\sessions`. Claude status is read from Claude Code's
+OAuth usage metadata endpoint; the app does not invoke `claude -p /usage`.
 
-Claude status is read from Claude Code's OAuth usage metadata endpoint. It does
-not invoke `claude -p /usage`. Kimi quota status is read from the Kimi Code
-usage endpoint with the local Kimi OAuth token or `KIMI_API_KEY`. Kimi local
-`%KIMI_HOME%\\sessions` or `%USERPROFILE%\\.kimi-code\\sessions`
+Kimi quota status is read from the Kimi Code usage endpoint with the local Kimi
+OAuth token or `KIMI_API_KEY`. Kimi local
+`%KIMI_HOME%\sessions` or `%USERPROFILE%\.kimi-code\sessions`
 `usage.record` events are used only for the token-count line in the popup. It
 does not invoke `kimi -p`. The app does not write a usage state file.
+
+DeepSeek balance is read from DeepSeek's
+[`/user/balance`](https://api-docs.deepseek.com/api/get-user-balance/) endpoint
+using the API key and base URL configured by DeepCode in
+`%USERPROFILE%\.deepcode\settings.json`. `DEEPCODE_API_KEY` and
+`DEEPCODE_BASE_URL` override that file, matching DeepCode's environment
+precedence. The key is used only as a bearer credential and is never displayed
+or written by `limits`.
 
 The same `limits.exe` process also performs the old limits watchdog work: it
 monitors C: and D: free space and runs the pause/resume batch files when Claude
