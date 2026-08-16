@@ -18,9 +18,16 @@ strip into countable groups. Exact percentages, balances, reset times, source
 paths, and manual refresh commands remain available from each icon's popup
 menu.
 
-Codex status is read from local session files under `%CODEX_HOME%\sessions` or
-`%USERPROFILE%\.codex\sessions`. Claude status is read from Claude Code's
-OAuth usage metadata endpoint; the app does not invoke `claude -p /usage`.
+Codex status is read from the authenticated current-account usage endpoint
+using `%CODEX_HOME%\auth.json` or `%USERPROFILE%\.codex\auth.json`. The regular
+and Spark limits are read separately so concurrent sessions cannot replace the
+regular allowance with Spark's allowance. Local session files are used only as
+a fallback when the account endpoint is unavailable.
+
+Claude status is read from Claude Code's OAuth usage metadata endpoint. An
+expired access token is refreshed with the stored refresh token, and the last
+valid usage remains visible during transient refresh failures. The app does not
+invoke `claude -p /usage`.
 
 Kimi quota status is read from the Kimi Code usage endpoint with the local Kimi
 OAuth token or `KIMI_API_KEY`. Kimi local

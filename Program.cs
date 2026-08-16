@@ -86,7 +86,7 @@ internal sealed class TrayApplication : IDisposable
     private string? _deepSeekAppliedTooltip;
     private string _codexTooltip = "limits";
     private string _codexStatusText = "Loading Codex usage...";
-    private string _codexDetailText = "Reading local Codex sessions.";
+    private string _codexDetailText = "Reading Codex account usage.";
     private string _codexSparkUsageText = "Spark usage: loading...";
     private string _codexUpdatedText = string.Empty;
     private string _codexSourceText = string.Empty;
@@ -95,6 +95,7 @@ internal sealed class TrayApplication : IDisposable
     private string _claudeDetailText = "Reading Claude OAuth usage.";
     private string _claudeUpdatedText = string.Empty;
     private string _claudeSourceText = string.Empty;
+    private ClaudeUsageSnapshot? _lastClaudeSnapshot;
     private string _kimiTooltip = "limits";
     private string _kimiStatusText = "Loading Kimi usage...";
     private string _kimiDetailText = "Reading Kimi Code quota.";
@@ -381,6 +382,20 @@ internal sealed class TrayApplication : IDisposable
 
         if (result.Snapshot is null)
         {
+            if (_lastClaudeSnapshot is { } lastSnapshot)
+            {
+                _claudeTooltip = BuildClaudeStaleTooltip(lastSnapshot);
+                _claudeStatusText = $"{BuildClaudeHeadline(lastSnapshot)} - refresh failed";
+                _claudeDetailText = result.ErrorMessage ?? "Claude usage refresh failed.";
+                _claudeUpdatedText = $"Last good {lastSnapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
+                _claudeSourceText = _claudeUsageReader.CredentialsPath;
+                UpdateClaudeTrayIcon(
+                    TrayIconRenderer.CreateClaudeIcon(lastSnapshot),
+                    TrayIconRenderer.GetClaudeIconKey(lastSnapshot));
+                RunLimitWatchdog(lastSnapshot);
+                return;
+            }
+
             _claudeTooltip = "Claude: usage unavailable";
             _claudeStatusText = "No Claude usage data found";
             _claudeDetailText = result.ErrorMessage ?? "Claude usage limits were not found.";
@@ -392,6 +407,7 @@ internal sealed class TrayApplication : IDisposable
         }
 
         ClaudeUsageSnapshot snapshot = result.Snapshot;
+        _lastClaudeSnapshot = snapshot;
         _claudeTooltip = BuildClaudeTooltip(snapshot);
         _claudeStatusText = BuildClaudeHeadline(snapshot);
         _claudeDetailText = BuildClaudeDetail(snapshot);
@@ -1130,6 +1146,15 @@ internal sealed class TrayApplication : IDisposable
             FormatResetCountdown(snapshot.SevenDayResetAt));
     }
 
+    private static string BuildClaudeStaleTooltip(ClaudeUsageSnapshot snapshot)
+    {
+        int fiveHourRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.FiveHourUsedPercent);
+        int sevenDayRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.SevenDayUsedPercent);
+
+        return TruncateTooltip(
+            $"Claude: 5h left {fiveHourRemaining}%, 7d left {sevenDayRemaining}% (last known)");
+    }
+
     private static string BuildClaudeHeadline(ClaudeUsageSnapshot snapshot)
     {
         int fiveHourRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.FiveHourUsedPercent);
@@ -1407,16 +1432,195 @@ internal sealed record UsageReadResult(CodexUsageSnapshot? Snapshot, CodexUsageS
 
 internal sealed class CodexUsageReader
 {
+    private const string UsageEndpoint = "https://chatgpt.com/backend-api/wham/usage";
     private const int MaxFilesToScan = 32;
     private const int MaxTailBytesToRead = 4 * 1024 * 1024;
     private const int MaxExpandedTailBytesToRead = 64 * 1024 * 1024;
     private const int MaxExpandedTailFilesToScan = 8;
     private const int MaxModelPrefixLinesToRead = 200;
+    private static readonly HttpClient HttpClient = new()
+    {
+        Timeout = TimeSpan.FromSeconds(20)
+    };
 
     public string CodexHomePath { get; } = ResolveCodexHome();
     public string SessionsPath => Path.Combine(CodexHomePath, "sessions");
+    public string AuthPath => Path.Combine(CodexHomePath, "auth.json");
 
     public UsageReadResult ReadLatestSnapshot()
+    {
+        UsageReadResult accountResult = ReadAccountSnapshot();
+        if (accountResult.Snapshot is not null)
+        {
+            return accountResult;
+        }
+
+        UsageReadResult sessionResult = ReadLatestSessionSnapshot();
+        if (sessionResult.Snapshot is not null)
+        {
+            return sessionResult;
+        }
+
+        string error = string.Join(
+            " ",
+            new[] { accountResult.ErrorMessage, sessionResult.ErrorMessage }
+                .Where(message => !string.IsNullOrWhiteSpace(message)));
+        return new UsageReadResult(null, sessionResult.SparkSnapshot, error);
+    }
+
+    private UsageReadResult ReadAccountSnapshot()
+    {
+        if (!File.Exists(AuthPath))
+        {
+            return new UsageReadResult(null, null, $"Missing Codex credentials file: {AuthPath}");
+        }
+
+        try
+        {
+            CodexCredential credential = ReadCredential();
+            using HttpRequestMessage request = new(HttpMethod.Get, UsageEndpoint);
+            request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {credential.AccessToken}");
+            request.Headers.TryAddWithoutValidation("ChatGPT-Account-Id", credential.AccountId);
+            request.Headers.TryAddWithoutValidation("Accept", "application/json");
+            request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.3");
+
+            using HttpResponseMessage response = HttpClient.Send(request);
+            string responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            if (!response.IsSuccessStatusCode)
+            {
+                return new UsageReadResult(
+                    null,
+                    null,
+                    $"Codex account usage request failed: HTTP {(int)response.StatusCode}");
+            }
+
+            UsageReadResult? parsed = ParseAccountUsageResponse(responseBody);
+            return parsed ?? new UsageReadResult(null, null, "Codex account usage response did not include a regular limit.");
+        }
+        catch (Exception exception)
+        {
+            return new UsageReadResult(null, null, exception.Message);
+        }
+    }
+
+    private CodexCredential ReadCredential()
+    {
+        using FileStream stream = new(AuthPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using JsonDocument document = JsonDocument.Parse(stream);
+        JsonElement root = document.RootElement;
+        if (!root.TryGetProperty("tokens", out JsonElement tokens) ||
+            !tokens.TryGetProperty("access_token", out JsonElement accessTokenElement) ||
+            !tokens.TryGetProperty("account_id", out JsonElement accountIdElement) ||
+            string.IsNullOrWhiteSpace(accessTokenElement.GetString()) ||
+            string.IsNullOrWhiteSpace(accountIdElement.GetString()))
+        {
+            throw new InvalidOperationException("Codex ChatGPT OAuth credentials were not found.");
+        }
+
+        return new CodexCredential(accessTokenElement.GetString()!, accountIdElement.GetString()!);
+    }
+
+    private static UsageReadResult? ParseAccountUsageResponse(string responseBody)
+    {
+        using JsonDocument document = JsonDocument.Parse(responseBody);
+        JsonElement root = document.RootElement;
+        string? planType = root.TryGetProperty("plan_type", out JsonElement planTypeElement)
+            ? planTypeElement.GetString()
+            : null;
+        if (!root.TryGetProperty("rate_limit", out JsonElement regularLimit))
+        {
+            return null;
+        }
+
+        DateTimeOffset timestamp = DateTimeOffset.Now;
+        CodexUsageSnapshot? regularSnapshot = ParseAccountLimit(
+            regularLimit,
+            timestamp,
+            planType,
+            model: null);
+        if (regularSnapshot is null)
+        {
+            return null;
+        }
+
+        CodexUsageSnapshot? sparkSnapshot = null;
+        if (root.TryGetProperty("additional_rate_limits", out JsonElement additionalLimits) &&
+            additionalLimits.ValueKind == JsonValueKind.Array)
+        {
+            foreach (JsonElement additionalLimit in additionalLimits.EnumerateArray())
+            {
+                string? limitName = additionalLimit.TryGetProperty("limit_name", out JsonElement limitNameElement)
+                    ? limitNameElement.GetString()
+                    : null;
+                string? meteredFeature = additionalLimit.TryGetProperty("metered_feature", out JsonElement meteredFeatureElement)
+                    ? meteredFeatureElement.GetString()
+                    : null;
+                bool isSpark = limitName?.Contains("spark", StringComparison.OrdinalIgnoreCase) == true ||
+                               meteredFeature?.Contains("bengalfox", StringComparison.OrdinalIgnoreCase) == true;
+                if (!isSpark || !additionalLimit.TryGetProperty("rate_limit", out JsonElement sparkLimit))
+                {
+                    continue;
+                }
+
+                sparkSnapshot = ParseAccountLimit(sparkLimit, timestamp, planType, limitName ?? meteredFeature);
+                break;
+            }
+        }
+
+        return new UsageReadResult(regularSnapshot, sparkSnapshot, null);
+    }
+
+    private static CodexUsageSnapshot? ParseAccountLimit(
+        JsonElement limit,
+        DateTimeOffset timestamp,
+        string? planType,
+        string? model)
+    {
+        RateLimitInfo primary = ReadAccountLimitWindow(limit, "primary_window");
+        RateLimitInfo secondary = ReadAccountLimitWindow(limit, "secondary_window");
+        if (primary.WindowMinutes <= 0 && secondary.WindowMinutes <= 0)
+        {
+            return null;
+        }
+
+        return new CodexUsageSnapshot(
+            timestamp,
+            primary.UsedPercent,
+            secondary.UsedPercent,
+            primary.WindowMinutes,
+            secondary.WindowMinutes,
+            primary.ResetsAt,
+            secondary.ResetsAt,
+            planType,
+            model,
+            UsageEndpoint);
+    }
+
+    private static RateLimitInfo ReadAccountLimitWindow(JsonElement parent, string name)
+    {
+        if (!parent.TryGetProperty(name, out JsonElement window) || window.ValueKind != JsonValueKind.Object)
+        {
+            return new RateLimitInfo(0, 0, null);
+        }
+
+        double usedPercent = window.TryGetProperty("used_percent", out JsonElement usedPercentElement)
+            ? usedPercentElement.GetDouble()
+            : 0;
+        int windowMinutes = window.TryGetProperty("limit_window_seconds", out JsonElement windowSecondsElement) &&
+                            windowSecondsElement.TryGetInt32(out int windowSeconds)
+            ? Math.Max(1, windowSeconds / 60)
+            : 0;
+        DateTimeOffset? resetsAt = null;
+        if (window.TryGetProperty("reset_at", out JsonElement resetAtElement) &&
+            resetAtElement.TryGetInt64(out long resetAtSeconds))
+        {
+            resetsAt = DateTimeOffset.FromUnixTimeSeconds(resetAtSeconds);
+        }
+
+        return new RateLimitInfo(usedPercent, windowMinutes, resetsAt);
+    }
+
+    private UsageReadResult ReadLatestSessionSnapshot()
     {
         if (!Directory.Exists(SessionsPath))
         {
@@ -1533,12 +1737,13 @@ internal sealed class CodexUsageReader
                 continue;
             }
 
-            if (latest is null || parsed.Timestamp > latest.Timestamp)
+            bool isSpark = IsSparkSnapshot(parsed);
+            if (!isSpark && (latest is null || parsed.Timestamp > latest.Timestamp))
             {
                 latest = parsed;
             }
 
-            if (IsSparkSnapshot(parsed) && (latestSpark is null || parsed.Timestamp > latestSpark.Timestamp))
+            if (isSpark && (latestSpark is null || parsed.Timestamp > latestSpark.Timestamp))
             {
                 latestSpark = parsed;
             }
@@ -1664,7 +1869,7 @@ internal sealed class CodexUsageReader
             string? planType = rateLimits.TryGetProperty("plan_type", out JsonElement planTypeElement)
                 ? planTypeElement.GetString()
                 : null;
-            string? snapshotModel = ResolveSnapshotModel(payload, model);
+            string? snapshotModel = ResolveSnapshotModel(rateLimits, payload, model);
 
             return new CodexUsageSnapshot(
                 timestamp,
@@ -1692,8 +1897,27 @@ internal sealed class CodexUsageReader
         }
     }
 
-    private static string? ResolveSnapshotModel(JsonElement payload, string? contextModel)
+    private static string? ResolveSnapshotModel(JsonElement rateLimits, JsonElement payload, string? contextModel)
     {
+        if (rateLimits.TryGetProperty("limit_name", out JsonElement limitNameElement))
+        {
+            string? limitName = limitNameElement.GetString();
+            if (!string.IsNullOrWhiteSpace(limitName))
+            {
+                return limitName;
+            }
+        }
+
+        if (rateLimits.TryGetProperty("limit_id", out JsonElement limitIdElement))
+        {
+            string? limitId = limitIdElement.GetString();
+            if (!string.IsNullOrWhiteSpace(limitId) &&
+                !string.Equals(limitId, "codex", StringComparison.OrdinalIgnoreCase))
+            {
+                return limitId;
+            }
+        }
+
         if (payload.TryGetProperty("info", out JsonElement info))
         {
             if (info.TryGetProperty("current_model", out JsonElement currentModelElement))
@@ -1761,6 +1985,8 @@ internal sealed class CodexUsageReader
     }
 
     private sealed record RateLimitInfo(double UsedPercent, int WindowMinutes, DateTimeOffset? ResetsAt);
+
+    private sealed record CodexCredential(string AccessToken, string AccountId);
 }
 
 internal sealed record ClaudeUsageSnapshot(
@@ -1776,9 +2002,12 @@ internal sealed record ClaudeUsageReadResult(ClaudeUsageSnapshot? Snapshot, stri
 internal sealed class ClaudeUsageReader
 {
     private const string UsageEndpoint = "https://api.anthropic.com/api/oauth/usage";
+    private const string TokenEndpoint = "https://platform.claude.com/v1/oauth/token";
+    private const string OAuthClientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+    private static readonly object CredentialRefreshLock = new();
     private static readonly HttpClient HttpClient = new()
     {
-        Timeout = TimeSpan.FromSeconds(20)
+        Timeout = TimeSpan.FromSeconds(7)
     };
 
     public string ClaudeHomePath { get; } = ResolveClaudeHome();
@@ -1786,35 +2015,25 @@ internal sealed class ClaudeUsageReader
 
     public ClaudeUsageReadResult ReadLatestSnapshot()
     {
-        if (!File.Exists(CredentialsPath))
-        {
-            return new ClaudeUsageReadResult(null, $"Missing Claude credentials file: {CredentialsPath}");
-        }
-
         try
         {
-            string? accessToken = ReadAccessToken();
-            if (string.IsNullOrWhiteSpace(accessToken))
+            ClaudeCredential credential = ReadCredential();
+            ClaudeHttpResponse response = SendUsageRequest(credential.AccessToken);
+            if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized && credential.CanRefresh)
             {
-                return new ClaudeUsageReadResult(null, "Claude OAuth access token was not found.");
+                credential = RefreshCredential(credential);
+                response = SendUsageRequest(credential.AccessToken);
             }
 
-            using HttpRequestMessage request = new(HttpMethod.Get, UsageEndpoint);
-            request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {accessToken}");
-            request.Headers.TryAddWithoutValidation("Accept", "application/json");
-            request.Headers.TryAddWithoutValidation("User-Agent", "gpttrack/1.0");
-
-            using HttpResponseMessage response = HttpClient.Send(request);
-            string responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
             if (!response.IsSuccessStatusCode)
             {
                 string reason = response.StatusCode == System.Net.HttpStatusCode.Unauthorized
-                    ? "Claude token expired - re-login in Claude Code"
+                    ? "Claude OAuth token expired and could not be refreshed - run `claude login`"
                     : $"Claude usage request failed: HTTP {(int)response.StatusCode}";
                 return new ClaudeUsageReadResult(null, reason);
             }
 
-            ClaudeUsageSnapshot? snapshot = ParseUsageResponse(responseBody);
+            ClaudeUsageSnapshot? snapshot = ParseUsageResponse(response.Body);
             return snapshot is null
                 ? new ClaudeUsageReadResult(null, "Claude usage response did not include five_hour and seven_day limits.")
                 : new ClaudeUsageReadResult(snapshot, null);
@@ -1823,6 +2042,18 @@ internal sealed class ClaudeUsageReader
         {
             return new ClaudeUsageReadResult(null, exception.Message);
         }
+    }
+
+    private static ClaudeHttpResponse SendUsageRequest(string accessToken)
+    {
+        using HttpRequestMessage request = new(HttpMethod.Get, UsageEndpoint);
+        request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {accessToken}");
+        request.Headers.TryAddWithoutValidation("Accept", "application/json");
+        request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.3");
+
+        using HttpResponseMessage response = HttpClient.Send(request);
+        string responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        return new ClaudeHttpResponse(response.StatusCode, responseBody);
     }
 
     private static string ResolveClaudeHome()
@@ -1837,25 +2068,154 @@ internal sealed class ClaudeUsageReader
         return Path.Combine(userProfile, ".claude");
     }
 
-    private string? ReadAccessToken()
+    private ClaudeCredential ReadCredential()
     {
         string? environmentToken = Environment.GetEnvironmentVariable("CLAUDE_CODE_OAUTH_TOKEN");
         if (!string.IsNullOrWhiteSpace(environmentToken))
         {
-            return environmentToken;
+            return new ClaudeCredential(environmentToken, null, true);
         }
 
+        if (!File.Exists(CredentialsPath))
+        {
+            throw new FileNotFoundException($"Missing Claude credentials file: {CredentialsPath}", CredentialsPath);
+        }
+
+        return ReadStoredCredential();
+    }
+
+    private ClaudeCredential ReadStoredCredential()
+    {
         using FileStream stream = new(CredentialsPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         using JsonDocument document = JsonDocument.Parse(stream);
         JsonElement root = document.RootElement;
-
-        if (root.TryGetProperty("claudeAiOauth", out JsonElement oauth) &&
-            oauth.TryGetProperty("accessToken", out JsonElement accessTokenElement))
+        if (!root.TryGetProperty("claudeAiOauth", out JsonElement oauth) ||
+            !oauth.TryGetProperty("accessToken", out JsonElement accessTokenElement) ||
+            string.IsNullOrWhiteSpace(accessTokenElement.GetString()))
         {
-            return accessTokenElement.GetString();
+            throw new InvalidOperationException("Claude OAuth access token was not found.");
         }
 
-        return null;
+        string? refreshToken = oauth.TryGetProperty("refreshToken", out JsonElement refreshTokenElement)
+            ? refreshTokenElement.GetString()
+            : null;
+        return new ClaudeCredential(accessTokenElement.GetString()!, refreshToken, false);
+    }
+
+    private ClaudeCredential RefreshCredential(ClaudeCredential staleCredential)
+    {
+        lock (CredentialRefreshLock)
+        {
+            ClaudeCredential currentCredential = ReadStoredCredential();
+            if (!string.Equals(currentCredential.AccessToken, staleCredential.AccessToken, StringComparison.Ordinal) ||
+                !string.Equals(currentCredential.RefreshToken, staleCredential.RefreshToken, StringComparison.Ordinal))
+            {
+                return currentCredential;
+            }
+
+            if (string.IsNullOrWhiteSpace(currentCredential.RefreshToken))
+            {
+                throw new InvalidOperationException("Claude OAuth refresh token was not found.");
+            }
+
+            string requestBody = new JsonObject
+            {
+                ["grant_type"] = "refresh_token",
+                ["refresh_token"] = currentCredential.RefreshToken,
+                ["client_id"] = OAuthClientId
+            }.ToJsonString();
+            using HttpRequestMessage request = new(HttpMethod.Post, TokenEndpoint)
+            {
+                Content = new StringContent(requestBody, Encoding.UTF8, "application/json")
+            };
+            request.Headers.TryAddWithoutValidation("Accept", "application/json");
+            request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.3");
+
+            using HttpResponseMessage response = HttpClient.Send(request);
+            string responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            if (!response.IsSuccessStatusCode)
+            {
+                ClaudeCredential latestCredential = ReadStoredCredential();
+                if (!string.Equals(latestCredential.AccessToken, currentCredential.AccessToken, StringComparison.Ordinal))
+                {
+                    return latestCredential;
+                }
+
+                throw new InvalidOperationException($"Claude OAuth refresh failed: HTTP {(int)response.StatusCode}");
+            }
+
+            using JsonDocument document = JsonDocument.Parse(responseBody);
+            JsonElement root = document.RootElement;
+            if (!root.TryGetProperty("access_token", out JsonElement accessTokenElement) ||
+                string.IsNullOrWhiteSpace(accessTokenElement.GetString()))
+            {
+                throw new InvalidOperationException("Claude OAuth refresh response did not include an access token.");
+            }
+
+            string accessToken = accessTokenElement.GetString()!;
+            string refreshToken = root.TryGetProperty("refresh_token", out JsonElement refreshTokenElement) &&
+                                  !string.IsNullOrWhiteSpace(refreshTokenElement.GetString())
+                ? refreshTokenElement.GetString()!
+                : currentCredential.RefreshToken;
+            long expiresInSeconds = root.TryGetProperty("expires_in", out JsonElement expiresInElement) &&
+                                    expiresInElement.TryGetInt64(out long expiresIn)
+                ? expiresIn
+                : 28_800;
+            long expiresAtMilliseconds = DateTimeOffset.UtcNow.AddSeconds(expiresInSeconds).ToUnixTimeMilliseconds();
+
+            return WriteRefreshedCredential(
+                currentCredential,
+                accessToken,
+                refreshToken,
+                expiresAtMilliseconds);
+        }
+    }
+
+    private ClaudeCredential WriteRefreshedCredential(
+        ClaudeCredential originalCredential,
+        string accessToken,
+        string refreshToken,
+        long expiresAtMilliseconds)
+    {
+        ClaudeCredential latestCredential = ReadStoredCredential();
+        if (!string.Equals(latestCredential.RefreshToken, originalCredential.RefreshToken, StringComparison.Ordinal))
+        {
+            return latestCredential;
+        }
+
+        JsonNode? root;
+        using (FileStream stream = new(CredentialsPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+        {
+            root = JsonNode.Parse(stream);
+        }
+
+        if (root?["claudeAiOauth"] is not JsonObject oauth)
+        {
+            throw new InvalidOperationException("Claude OAuth credential object was not found.");
+        }
+
+        oauth["accessToken"] = accessToken;
+        oauth["refreshToken"] = refreshToken;
+        oauth["expiresAt"] = expiresAtMilliseconds;
+
+        string temporaryPath = $"{CredentialsPath}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp";
+        try
+        {
+            File.WriteAllText(
+                temporaryPath,
+                root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }),
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            File.Move(temporaryPath, CredentialsPath, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temporaryPath))
+            {
+                File.Delete(temporaryPath);
+            }
+        }
+
+        return new ClaudeCredential(accessToken, refreshToken, false);
     }
 
     private static ClaudeUsageSnapshot? ParseUsageResponse(string responseBody)
@@ -1904,6 +2264,16 @@ internal sealed class ClaudeUsageReader
     }
 
     private sealed record UsageLimit(double UsedPercent, DateTimeOffset? ResetsAt);
+
+    private sealed record ClaudeHttpResponse(System.Net.HttpStatusCode StatusCode, string Body)
+    {
+        public bool IsSuccessStatusCode => (int)StatusCode is >= 200 and <= 299;
+    }
+
+    private sealed record ClaudeCredential(string AccessToken, string? RefreshToken, bool IsEnvironmentToken)
+    {
+        public bool CanRefresh => !IsEnvironmentToken && !string.IsNullOrWhiteSpace(RefreshToken);
+    }
 }
 
 internal static class KimiUsageMath
