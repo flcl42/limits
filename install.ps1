@@ -1,13 +1,13 @@
 $ErrorActionPreference = 'Stop'
 
-$installDir = 'D:\Programs'
+$installDir = 'C:\Programs'
 $stageDir = Join-Path $PSScriptRoot 'publish\limits'
 $projectPath = Join-Path $PSScriptRoot 'limits.csproj'
 $stagedExe = Join-Path $stageDir 'limits.exe'
 $targetExe = Join-Path $installDir 'limits.exe'
+$elevatedTaskName = 'limits'
 $oldExeTargets = @(
-    'C:\Programs\gpt.exe',
-    'D:\Programs\gpt.exe'
+    'C:\Programs\gpt.exe'
 )
 $oldStartupShortcutNames = @(
     'gpt.lnk',
@@ -17,7 +17,11 @@ $trayIconGuids = @(
     '{2A642A8D-169A-4035-AD86-EA43B5E87764}',
     '{4654B565-47C7-49AF-A257-8F26D82C0EC0}',
     '{918BD040-6A80-4B43-AE66-13A8F5BB1D57}',
-    '{36F5599D-63AD-4D36-B75D-8498B2DF37BF}'
+    '{36F5599D-63AD-4D36-B75D-8498B2DF37BF}',
+    '{7F0A7C1F-5D91-4C97-AEBF-6E0B4D4E2E1C}',
+    '{C8D1D0C3-5B6A-4C0E-9A73-96ABF4C7785E}',
+    '{A1D68E24-7E92-4BCB-A2BF-13F8A7E8C6D1}',
+    '{B2E79F35-8FA3-4CDC-B3C0-24A9B8F9D7E2}'
 )
 
 function Get-LimitsProcesses {
@@ -64,28 +68,56 @@ function Remove-OldGptInstallations {
     }
 }
 
-function Set-LimitsStartupShortcut {
+function Set-LimitsElevatedStartup {
     $startupDir = [Environment]::GetFolderPath('Startup')
-    if ([string]::IsNullOrWhiteSpace($startupDir)) {
+    if (-not [string]::IsNullOrWhiteSpace($startupDir)) {
+        $shortcutPath = Join-Path $startupDir 'limits.lnk'
+        if (Test-Path -LiteralPath $shortcutPath) {
+            Remove-Item -LiteralPath $shortcutPath -Force
+        }
+    }
+
+    foreach ($shortcutName in $oldStartupShortcutNames) {
+        if (-not [string]::IsNullOrWhiteSpace($startupDir)) {
+            $oldShortcutPath = Join-Path $startupDir $shortcutName
+            if (Test-Path -LiteralPath $oldShortcutPath) {
+                Remove-Item -LiteralPath $oldShortcutPath -Force
+            }
+        }
+    }
+
+    $existingTask = Get-ScheduledTask -TaskName $elevatedTaskName -ErrorAction SilentlyContinue
+    if ($null -ne $existingTask -and
+        $existingTask.Principal.RunLevel -eq 'Highest' -and
+        $existingTask.Actions.Execute -ieq $targetExe) {
         return
     }
 
-    New-Item -ItemType Directory -Path $startupDir -Force | Out-Null
-    $shortcutPath = Join-Path $startupDir 'limits.lnk'
-    $shell = New-Object -ComObject WScript.Shell
-    $shortcut = $shell.CreateShortcut($shortcutPath)
-    $shortcut.TargetPath = $targetExe
-    $shortcut.WorkingDirectory = $installDir
-    $shortcut.IconLocation = "$targetExe,0"
-    $shortcut.Description = 'limits tray usage monitor'
-    $shortcut.Save()
-
-    foreach ($shortcutName in $oldStartupShortcutNames) {
-        $oldShortcutPath = Join-Path $startupDir $shortcutName
-        if (Test-Path -LiteralPath $oldShortcutPath) {
-            Remove-Item -LiteralPath $oldShortcutPath -Force
-        }
+    $taskRun = '"' + $targetExe + '"'
+    $taskArguments = @(
+        '/Create',
+        '/TN', $elevatedTaskName,
+        '/TR', $taskRun,
+        '/SC', 'ONLOGON',
+        '/RL', 'HIGHEST',
+        '/RU', $env:USERNAME,
+        '/IT',
+        '/F'
+    )
+    $taskProcess = Start-Process -FilePath "$env:SystemRoot\System32\schtasks.exe" `
+        -Verb RunAs -ArgumentList $taskArguments -Wait -PassThru
+    if ($taskProcess.ExitCode -ne 0) {
+        throw "Could not register the elevated $elevatedTaskName logon task (exit code $($taskProcess.ExitCode))."
     }
+
+    $task = Get-ScheduledTask -TaskName $elevatedTaskName -ErrorAction SilentlyContinue
+    if ($null -eq $task -or $task.Principal.RunLevel -ne 'Highest') {
+        throw "The elevated $elevatedTaskName logon task was not registered with the highest run level."
+    }
+}
+
+function Start-LimitsElevated {
+    Start-ScheduledTask -TaskName $elevatedTaskName
 }
 
 function Promote-LimitsTrayIcons {
@@ -134,12 +166,12 @@ Stop-Limits
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 Remove-OldGptInstallations
 Copy-Item -LiteralPath $stagedExe -Destination $targetExe -Force
-Set-LimitsStartupShortcut
+Set-LimitsElevatedStartup
 
-Start-Process -FilePath $targetExe
+Start-LimitsElevated
 if (Promote-LimitsTrayIcons) {
     Stop-Limits
-    Start-Process -FilePath $targetExe
+    Start-LimitsElevated
 }
 
 Write-Host "Installed and started $targetExe"

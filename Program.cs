@@ -1,6 +1,9 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Net;
+using System.Net.WebSockets;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -18,9 +21,26 @@ internal static class Program
             return TrayApplication.RequestShutdown();
         }
 
+        if (args.Any(argument => string.Equals(argument, "--disk-settings", StringComparison.OrdinalIgnoreCase)))
+        {
+            return TrayApplication.RequestOpenDiskSettings();
+        }
+
         using TrayApplication application = new();
         return application.Run();
     }
+}
+
+internal enum TrayIconKind
+{
+    Codex,
+    Claude,
+    Kimi,
+    DeepSeek,
+    Disk,
+    OpenCode,
+    Temperature,
+    CpuGpuLoad
 }
 
 internal sealed class TrayApplication : IDisposable
@@ -33,10 +53,21 @@ internal sealed class TrayApplication : IDisposable
     private const uint ShutdownMessage = NativeMethods.WM_APP + 4;
     private const uint KimiResultMessage = NativeMethods.WM_APP + 5;
     private const uint DeepSeekResultMessage = NativeMethods.WM_APP + 6;
+    private const uint DiskResultMessage = NativeMethods.WM_APP + 7;
+    private const uint OpenDiskSettingsMessage = NativeMethods.WM_APP + 8;
+    private const uint OpenCodeResultMessage = NativeMethods.WM_APP + 9;
+    private const uint HardwareResultMessage = NativeMethods.WM_APP + 10;
+    private const uint UnetResultMessage = NativeMethods.WM_APP + 11;
     private const uint KimiTrayIconId = 3;
     private const uint DeepSeekTrayIconId = 4;
+    private const uint DiskTrayIconId = 5;
+    private const uint OpenCodeTrayIconId = 6;
+    private const uint TemperatureTrayIconId = 7;
+    private const uint MemoryTrayIconId = 8;
     private const nuint RefreshTimerId = 1;
+    private const nuint HardwareRefreshTimerId = 2;
     private const uint RefreshIntervalMs = 300_000;
+    private const uint HardwareRefreshIntervalMs = 10_000;
     private const int ClaudeRefreshTimeoutSeconds = 25;
     private const uint CommandRefresh = 1001;
     private const uint CommandOpenCodexSessions = 1002;
@@ -44,12 +75,33 @@ internal sealed class TrayApplication : IDisposable
     private const uint CommandOpenClaudeUsage = 1004;
     private const uint CommandOpenKimiSessions = 1005;
     private const uint CommandOpenDeepSeekBilling = 1006;
+    private const uint CommandOpenDiskSettings = 1007;
+    private const uint CommandOpenOpenCodeData = 1008;
+    private const uint CommandOpenTaskManager = 1009;
+    private const uint CommandToggleFirstTrayIcon = 1100;
+    private const uint CommandToggleLastTrayIcon = 1107;
     private const string ShutdownEventName = @"Local\Limits.Shutdown";
+    private const string OpenDiskSettingsEventName = @"Local\Limits.OpenDiskSettings";
 
     private static readonly Guid CodexTrayIconGuid = new("2a642a8d-169a-4035-ad86-ea43b5e87764");
     private static readonly Guid ClaudeTrayIconGuid = new("4654b565-47c7-49af-a257-8f26d82c0ec0");
     private static readonly Guid KimiTrayIconGuid = new("918bd040-6a80-4b43-ae66-13a8f5bb1d57");
     private static readonly Guid DeepSeekTrayIconGuid = new("36f5599d-63ad-4d36-b75d-8498b2df37bf");
+    private static readonly Guid DiskTrayIconGuid = new("7f0a7c1f-5d91-4c97-aebf-6e0b4d4e2e1c");
+    private static readonly Guid OpenCodeTrayIconGuid = new("c8d1d0c3-5b6a-4c0e-9a73-96abf4c7785e");
+    private static readonly Guid TemperatureTrayIconGuid = new("a1d68e24-7e92-4bcb-a2bf-13f8a7e8c6d1");
+    private static readonly Guid MemoryTrayIconGuid = new("b2e79f35-8fa3-4cdc-b3c0-24a9b8f9d7e2");
+    private static readonly TrayIconKind[] TrayIconsInVisibilityMenu =
+    [
+        TrayIconKind.Codex,
+        TrayIconKind.Claude,
+        TrayIconKind.Kimi,
+        TrayIconKind.DeepSeek,
+        TrayIconKind.Disk,
+        TrayIconKind.OpenCode,
+        TrayIconKind.Temperature,
+        TrayIconKind.CpuGpuLoad
+    ];
 
     private static readonly NativeMethods.WndProcDelegate WindowProcedure = HandleWindowMessage;
     private static TrayApplication? Current;
@@ -59,10 +111,18 @@ internal sealed class TrayApplication : IDisposable
     private readonly ClaudeUsageReader _claudeUsageReader = new();
     private readonly KimiUsageReader _kimiUsageReader = new();
     private readonly DeepSeekBalanceReader _deepSeekBalanceReader = new();
-    private readonly LimitWatchdog _limitWatchdog = new();
+    private readonly UnetBalanceReader _unetBalanceReader = new();
+    private readonly OpenCodeUsageReader _openCodeUsageReader = new();
+    private readonly HardwareMonitor _hardwareMonitor = new();
+    private readonly DiskMonitor _diskMonitor = new();
+    private readonly TrayIconSettingsStore _trayIconSettingsStore = new();
+    private readonly CounterWebSocketServer _counterWebSocketServer = new();
+    private readonly LimitWatchdog _limitWatchdog;
     private readonly string _windowClassName = $"limits.{Environment.ProcessId}";
     private readonly EventWaitHandle _shutdownEvent;
     private readonly RegisteredWaitHandle _shutdownRegistration;
+    private readonly EventWaitHandle _openDiskSettingsEvent;
+    private readonly RegisteredWaitHandle _openDiskSettingsRegistration;
     private readonly uint _taskbarCreatedMessage;
     private Task _shellNotifyQueue = Task.CompletedTask;
 
@@ -71,25 +131,43 @@ internal sealed class TrayApplication : IDisposable
     private IntPtr _claudeIconHandle;
     private IntPtr _kimiIconHandle;
     private IntPtr _deepSeekIconHandle;
+    private IntPtr _diskIconHandle;
+    private IntPtr _openCodeIconHandle;
+    private IntPtr _temperatureIconHandle;
+    private IntPtr _memoryIconHandle;
     private bool _codexTrayIconAdded;
     private bool _claudeTrayIconAdded;
     private bool _kimiTrayIconAdded;
     private bool _deepSeekTrayIconAdded;
+    private bool _diskTrayIconAdded;
+    private bool _openCodeTrayIconAdded;
+    private bool _temperatureTrayIconAdded;
+    private bool _memoryTrayIconAdded;
     private bool _windowClassRegistered;
     private string? _codexIconKey;
     private string? _claudeIconKey;
     private string? _kimiIconKey;
     private string? _deepSeekIconKey;
+    private string? _diskIconKey;
+    private string? _openCodeIconKey;
+    private string? _temperatureIconKey;
+    private string? _memoryIconKey;
     private string? _codexAppliedTooltip;
     private string? _claudeAppliedTooltip;
     private string? _kimiAppliedTooltip;
     private string? _deepSeekAppliedTooltip;
+    private string? _diskAppliedTooltip;
+    private string? _openCodeAppliedTooltip;
+    private string? _temperatureAppliedTooltip;
+    private string? _memoryAppliedTooltip;
     private string _codexTooltip = "limits";
     private string _codexStatusText = "Loading Codex usage...";
     private string _codexDetailText = "Reading Codex account usage.";
     private string _codexSparkUsageText = "Spark usage: loading...";
     private string _codexUpdatedText = string.Empty;
     private string _codexSourceText = string.Empty;
+    private CodexUsageSnapshot? _lastCodexSnapshot;
+    private CodexUsageSnapshot? _lastCodexSparkSnapshot;
     private string _claudeTooltip = "limits";
     private string _claudeStatusText = "Loading Claude usage...";
     private string _claudeDetailText = "Reading Claude OAuth usage.";
@@ -108,7 +186,33 @@ internal sealed class TrayApplication : IDisposable
     private string _deepSeekDetailText = "Reading DeepCode configuration.";
     private string _deepSeekUpdatedText = string.Empty;
     private string _deepSeekSourceText = string.Empty;
+    private string _diskTooltip = "limits";
+    private string _diskStatusText = "Loading disk space...";
+    private string _diskDetailText = "Reading selected disk space limits.";
+    private string _diskUpdatedText = string.Empty;
+    private string _diskSourceText = string.Empty;
+    private string _openCodeTooltip = "limits";
+    private string _openCodeStatusText = "Loading OpenCode Go quota...";
+    private string _openCodeDetailText = "Reading OpenCode token statistics and Go quota.";
+    private string _openCodeUpdatedText = string.Empty;
+    private string _openCodeSourceText = string.Empty;
+    private string _temperatureTooltip = "limits";
+    private string _temperatureStatusText = "Loading CPU/GPU temperature...";
+    private string _temperatureDetailText = "Reading hardware temperature sensors.";
+    private string _temperatureUpdatedText = string.Empty;
+    private string _temperatureSourceText = string.Empty;
+    private string _memoryTooltip = "limits";
+    private string _memoryStatusText = "Loading CPU/GPU usage...";
+    private string _memoryDetailText = "Reading CPU and GPU utilization.";
+    private string _memoryUpdatedText = string.Empty;
+    private string _memorySourceText = string.Empty;
     private DeepSeekBalanceSnapshot? _lastDeepSeekSnapshot;
+    private DiskSpaceSnapshot? _lastDiskSnapshot;
+    private OpenCodeUsageSnapshot? _lastOpenCodeSnapshot;
+    private OpenCodeGoUsageSnapshot? _lastOpenCodeGoSnapshot;
+    private string? _openCodeGoUsageError;
+    private HardwareSnapshot? _lastHardwareSnapshot;
+    private UnetBalanceSnapshot? _lastUnetSnapshot;
     private volatile bool _codexRefreshInFlight;
     private volatile UsageReadResult? _pendingCodexResult;
     private volatile bool _claudeRefreshInFlight;
@@ -117,7 +221,18 @@ internal sealed class TrayApplication : IDisposable
     private volatile KimiUsageReadResult? _pendingKimiResult;
     private volatile bool _deepSeekRefreshInFlight;
     private volatile DeepSeekBalanceReadResult? _pendingDeepSeekResult;
+    private volatile bool _unetRefreshInFlight;
+    private volatile UnetBalanceReadResult? _pendingUnetResult;
+    private volatile DiskSpaceSnapshot? _pendingDiskResult;
+    private volatile bool _openCodeRefreshInFlight;
+    private volatile OpenCodeUsageReadResult? _pendingOpenCodeResult;
+    private volatile bool _hardwareRefreshInFlight;
+    private volatile HardwareReadResult? _pendingHardwareResult;
     private volatile bool _limitWatchdogInFlight;
+    private volatile bool _diskRefreshInFlight;
+    private readonly Dictionary<string, DateTimeOffset> _lastDiskAlertAt = new(StringComparer.OrdinalIgnoreCase);
+    private DiskSettingsWindow? _diskSettingsWindow;
+    private TrayIconSettings _trayIconSettings;
 
     public TrayApplication()
     {
@@ -140,7 +255,28 @@ internal sealed class TrayApplication : IDisposable
             this,
             -1,
             executeOnlyOnce: false);
+        _openDiskSettingsEvent = new EventWaitHandle(false, EventResetMode.AutoReset, OpenDiskSettingsEventName);
+        _openDiskSettingsRegistration = ThreadPool.RegisterWaitForSingleObject(
+            _openDiskSettingsEvent,
+            static (state, timedOut) =>
+            {
+                if (timedOut || state is not TrayApplication application)
+                {
+                    return;
+                }
+
+                IntPtr windowHandle = application._windowHandle;
+                if (windowHandle != IntPtr.Zero)
+                {
+                    NativeMethods.PostMessage(windowHandle, OpenDiskSettingsMessage, IntPtr.Zero, IntPtr.Zero);
+                }
+            },
+            this,
+            -1,
+            executeOnlyOnce: false);
         _taskbarCreatedMessage = NativeMethods.RegisterWindowMessage("TaskbarCreated");
+        _trayIconSettings = _trayIconSettingsStore.Load();
+        _limitWatchdog = new LimitWatchdog(_diskMonitor);
     }
 
     public static int RequestShutdown()
@@ -165,17 +301,37 @@ internal sealed class TrayApplication : IDisposable
         }
     }
 
+    public static int RequestOpenDiskSettings()
+    {
+        try
+        {
+            using EventWaitHandle openSettingsEvent = EventWaitHandle.OpenExisting(OpenDiskSettingsEventName);
+            openSettingsEvent.Set();
+            return 0;
+        }
+        catch (WaitHandleCannotBeOpenedException)
+        {
+            return 1;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return 2;
+        }
+        catch (IOException)
+        {
+            return 3;
+        }
+    }
+
     public int Run()
     {
         Current = this;
         RegisterWindowClass();
         CreateMessageWindow();
-        UpdateCodexTrayIcon(TrayIconRenderer.CreateUnavailableIcon(), TrayIconRenderer.CodexUnavailableIconKey);
-        UpdateClaudeTrayIcon(TrayIconRenderer.CreateClaudeUnavailableIcon(), TrayIconRenderer.ClaudeUnavailableIconKey);
-        UpdateKimiTrayIcon(TrayIconRenderer.CreateKimiUnavailableIcon(), TrayIconRenderer.KimiUnavailableIconKey);
-        UpdateDeepSeekTrayIcon(TrayIconRenderer.CreateDeepSeekUnavailableIcon(), TrayIconRenderer.DeepSeekUnavailableIconKey);
+        _counterWebSocketServer.Start(BuildCounterJson());
         RefreshUsage();
         NativeMethods.SetTimer(_windowHandle, RefreshTimerId, RefreshIntervalMs, IntPtr.Zero);
+        NativeMethods.SetTimer(_windowHandle, HardwareRefreshTimerId, HardwareRefreshIntervalMs, IntPtr.Zero);
 
         while (NativeMethods.GetMessage(out NativeMethods.MSG message, IntPtr.Zero, 0, 0) > 0)
         {
@@ -188,6 +344,8 @@ internal sealed class TrayApplication : IDisposable
 
     public void Dispose()
     {
+        _counterWebSocketServer.Dispose();
+
         if (_windowHandle != IntPtr.Zero)
         {
             NativeMethods.DestroyWindow(_windowHandle);
@@ -196,6 +354,8 @@ internal sealed class TrayApplication : IDisposable
         CleanupNativeResources();
         _shutdownRegistration.Unregister(null);
         _shutdownEvent.Dispose();
+        _openDiskSettingsRegistration.Unregister(null);
+        _openDiskSettingsEvent.Dispose();
         GC.SuppressFinalize(this);
     }
 
@@ -246,6 +406,117 @@ internal sealed class TrayApplication : IDisposable
         RefreshClaudeUsage();
         RefreshKimiUsage();
         RefreshDeepSeekBalance();
+        RefreshUnetBalances();
+        RefreshDiskSpace();
+        RefreshOpenCodeUsage();
+        RefreshHardware();
+    }
+
+    private void RefreshUnetBalances()
+    {
+        if (_unetRefreshInFlight)
+        {
+            return;
+        }
+
+        _unetRefreshInFlight = true;
+        IntPtr windowHandle = _windowHandle;
+
+        Task.Run(() =>
+        {
+            UnetBalanceReadResult result;
+            try
+            {
+                result = _unetBalanceReader.ReadLatestSnapshot();
+            }
+            catch (Exception)
+            {
+                result = new UnetBalanceReadResult(null, "UNET balance refresh failed.");
+            }
+
+            _pendingUnetResult = result;
+
+            if (windowHandle == IntPtr.Zero ||
+                !NativeMethods.PostMessage(windowHandle, UnetResultMessage, IntPtr.Zero, IntPtr.Zero))
+            {
+                _unetRefreshInFlight = false;
+            }
+        });
+    }
+
+    private void ApplyUnetResult()
+    {
+        UnetBalanceReadResult? result = _pendingUnetResult;
+        _pendingUnetResult = null;
+        _unetRefreshInFlight = false;
+
+        if (result is not null)
+        {
+            _lastUnetSnapshot = result.Snapshot;
+        }
+    }
+
+    private void RefreshDiskSpace()
+    {
+        if (_diskRefreshInFlight)
+        {
+            return;
+        }
+
+        _diskRefreshInFlight = true;
+        IntPtr windowHandle = _windowHandle;
+
+        Task.Run(() =>
+        {
+            DiskSpaceSnapshot result;
+            try
+            {
+                result = _diskMonitor.ReadSnapshot();
+            }
+            catch (Exception exception)
+            {
+                result = _diskMonitor.CreateErrorSnapshot(exception.Message);
+            }
+
+            _pendingDiskResult = result;
+
+            if (windowHandle == IntPtr.Zero ||
+                !NativeMethods.PostMessage(windowHandle, DiskResultMessage, IntPtr.Zero, IntPtr.Zero))
+            {
+                _diskRefreshInFlight = false;
+            }
+        });
+    }
+
+    private void ApplyDiskResult()
+    {
+        DiskSpaceSnapshot? result = _pendingDiskResult;
+        _pendingDiskResult = null;
+        _diskRefreshInFlight = false;
+
+        if (result is null)
+        {
+            return;
+        }
+
+        _lastDiskSnapshot = result;
+        _diskTooltip = BuildDiskTooltip(result);
+        _diskStatusText = BuildDiskHeadline(result);
+        _diskDetailText = BuildDiskDetail(result);
+        _diskUpdatedText = $"Checked {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss}";
+        _diskSourceText = _diskMonitor.SettingsPath;
+        // Keep the notification area quiet unless a selected drive is actually
+        // at or below its red free-space limit.
+        if (!string.IsNullOrWhiteSpace(result.LowDriveLetters))
+        {
+            UpdateDiskTrayIcon(TrayIconRenderer.CreateDiskIcon(result), TrayIconRenderer.GetDiskIconKey(result));
+        }
+        else
+        {
+            HideDiskTrayIcon();
+        }
+        AlertDiskLimits(result);
+        RunLimitWatchdog(_lastClaudeSnapshot);
     }
 
     private void RefreshCodexUsage()
@@ -295,6 +566,11 @@ internal sealed class TrayApplication : IDisposable
 
         if (result.Snapshot is null)
         {
+            if (result.SparkSnapshot is not null)
+            {
+                _lastCodexSparkSnapshot = result.SparkSnapshot;
+            }
+
             _codexTooltip = "Codex: usage unavailable";
             _codexStatusText = "No Codex usage data found";
             _codexDetailText = result.ErrorMessage ?? "No token_count events were found.";
@@ -306,6 +582,11 @@ internal sealed class TrayApplication : IDisposable
         }
 
         CodexUsageSnapshot snapshot = result.Snapshot;
+        _lastCodexSnapshot = snapshot;
+        if (result.SparkSnapshot is not null)
+        {
+            _lastCodexSparkSnapshot = result.SparkSnapshot;
+        }
         _codexTooltip = BuildCodexTooltip(snapshot);
         _codexStatusText = BuildCodexHeadline(snapshot);
         _codexDetailText = BuildCodexDetail(snapshot);
@@ -576,6 +857,503 @@ internal sealed class TrayApplication : IDisposable
             TrayIconRenderer.GetDeepSeekIconKey(snapshot));
     }
 
+    private void RefreshOpenCodeUsage()
+    {
+        if (_openCodeRefreshInFlight)
+        {
+            return;
+        }
+
+        _openCodeRefreshInFlight = true;
+        IntPtr windowHandle = _windowHandle;
+
+        Task.Run(() =>
+        {
+            OpenCodeUsageReadResult result;
+            try
+            {
+                result = _openCodeUsageReader.ReadLatestSnapshot();
+            }
+            catch (Exception exception)
+            {
+                result = new OpenCodeUsageReadResult(
+                    null,
+                    null,
+                    "OpenCode Go quota refresh failed.",
+                    exception.Message);
+            }
+
+            _pendingOpenCodeResult = result;
+
+            if (windowHandle == IntPtr.Zero ||
+                !NativeMethods.PostMessage(windowHandle, OpenCodeResultMessage, IntPtr.Zero, IntPtr.Zero))
+            {
+                _openCodeRefreshInFlight = false;
+            }
+        });
+    }
+
+    private void ApplyOpenCodeResult()
+    {
+        OpenCodeUsageReadResult? result = _pendingOpenCodeResult;
+        _pendingOpenCodeResult = null;
+        _openCodeRefreshInFlight = false;
+
+        if (result is null)
+        {
+            return;
+        }
+
+        if (result.GoUsage is not null)
+        {
+            _lastOpenCodeGoSnapshot = result.GoUsage;
+            _openCodeGoUsageError = null;
+        }
+        else if (!string.IsNullOrWhiteSpace(result.GoUsageError))
+        {
+            _openCodeGoUsageError = result.GoUsageError;
+        }
+
+        OpenCodeGoUsageSnapshot? goSnapshot = _lastOpenCodeGoSnapshot;
+        if (result.Snapshot is null)
+        {
+            if (goSnapshot is not null)
+            {
+                _openCodeTooltip = BuildOpenCodeGoTooltip(goSnapshot, isStale: result.GoUsage is null);
+                _openCodeStatusText = BuildOpenCodeGoHeadline(goSnapshot);
+                _openCodeDetailText = result.ErrorMessage is null
+                    ? BuildOpenCodeGoDetail(goSnapshot)
+                    : $"{result.ErrorMessage}; {BuildOpenCodeGoDetail(goSnapshot)}";
+                _openCodeUpdatedText = $"Seen {goSnapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
+                _openCodeSourceText = goSnapshot.Source;
+                UpdateOpenCodeTrayIcon(
+                    TrayIconRenderer.CreateOpenCodeIcon(goSnapshot),
+                    TrayIconRenderer.GetOpenCodeIconKey(goSnapshot));
+                return;
+            }
+
+            _openCodeTooltip = BuildOpenCodeUnavailableTooltip(result.ErrorMessage);
+            _openCodeStatusText = "No OpenCode usage data found";
+            _openCodeDetailText = result.ErrorMessage ?? "OpenCode statistics were not found.";
+            _openCodeUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
+            _openCodeSourceText = _openCodeUsageReader.DatabasePath;
+            UpdateOpenCodeTrayIcon(
+                TrayIconRenderer.CreateOpenCodeUnavailableIcon(),
+                TrayIconRenderer.OpenCodeUnavailableIconKey);
+            return;
+        }
+
+        OpenCodeUsageSnapshot snapshot = result.Snapshot;
+        _lastOpenCodeSnapshot = snapshot;
+        _openCodeTooltip = BuildOpenCodeTooltip(snapshot, goSnapshot, _openCodeGoUsageError);
+        _openCodeStatusText = BuildOpenCodeHeadline(snapshot, goSnapshot);
+        _openCodeDetailText = BuildOpenCodeDetail(snapshot, goSnapshot, _openCodeGoUsageError);
+        _openCodeUpdatedText = $"Checked {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
+        _openCodeSourceText = goSnapshot?.Source ?? snapshot.SourceFile;
+        if (goSnapshot is not null)
+        {
+            UpdateOpenCodeTrayIcon(
+                TrayIconRenderer.CreateOpenCodeIcon(goSnapshot),
+                TrayIconRenderer.GetOpenCodeIconKey(goSnapshot));
+        }
+        else
+        {
+            UpdateOpenCodeTrayIcon(
+                TrayIconRenderer.CreateOpenCodeUnavailableIcon(),
+                TrayIconRenderer.OpenCodeUnavailableIconKey);
+        }
+    }
+
+    private void RefreshHardware()
+    {
+        if (_hardwareRefreshInFlight)
+        {
+            return;
+        }
+
+        _hardwareRefreshInFlight = true;
+        IntPtr windowHandle = _windowHandle;
+
+        Task.Run(() =>
+        {
+            HardwareReadResult result;
+            try
+            {
+                result = _hardwareMonitor.ReadSnapshot();
+            }
+            catch (Exception exception)
+            {
+                result = new HardwareReadResult(null, exception.Message);
+            }
+
+            _pendingHardwareResult = result;
+
+            if (windowHandle == IntPtr.Zero ||
+                !NativeMethods.PostMessage(windowHandle, HardwareResultMessage, IntPtr.Zero, IntPtr.Zero))
+            {
+                _hardwareRefreshInFlight = false;
+            }
+        });
+    }
+
+    private void ApplyHardwareResult()
+    {
+        HardwareReadResult? result = _pendingHardwareResult;
+        _pendingHardwareResult = null;
+        _hardwareRefreshInFlight = false;
+
+        if (result is null)
+        {
+            return;
+        }
+
+        if (result.Snapshot is null)
+        {
+            string error = result.ErrorMessage ?? "Hardware readings were not available.";
+            _temperatureTooltip = "Temperature: unavailable";
+            _temperatureStatusText = "CPU/GPU temperature unavailable";
+            _temperatureDetailText = error;
+            _temperatureUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
+            _temperatureSourceText = _hardwareMonitor.SourceDescription;
+            _memoryTooltip = "Usage: unavailable";
+            _memoryStatusText = "CPU/GPU usage unavailable";
+            _memoryDetailText = error;
+            _memoryUpdatedText = _temperatureUpdatedText;
+            _memorySourceText = _hardwareMonitor.SourceDescription;
+            UpdateTemperatureTrayIcon(
+                TrayIconRenderer.CreateTemperatureUnavailableIcon(),
+                TrayIconRenderer.TemperatureUnavailableIconKey);
+            UpdateMemoryTrayIcon(
+                TrayIconRenderer.CreateMemoryUnavailableIcon(),
+                TrayIconRenderer.MemoryUnavailableIconKey);
+            return;
+        }
+
+        HardwareSnapshot snapshot = result.Snapshot;
+        _lastHardwareSnapshot = snapshot;
+        _temperatureTooltip = BuildTemperatureTooltip(snapshot);
+        _temperatureStatusText = BuildTemperatureHeadline(snapshot);
+        _temperatureDetailText = BuildTemperatureDetail(snapshot);
+        _temperatureUpdatedText = $"Checked {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
+        _temperatureSourceText = snapshot.SourceDescription;
+        _memoryTooltip = BuildUsageTooltip(snapshot);
+        _memoryStatusText = BuildUsageHeadline(snapshot);
+        _memoryDetailText = BuildUsageDetail(snapshot);
+        _memoryUpdatedText = _temperatureUpdatedText;
+        _memorySourceText = snapshot.SourceDescription;
+        UpdateTemperatureTrayIcon(
+            TrayIconRenderer.CreateTemperatureIcon(snapshot),
+            TrayIconRenderer.GetTemperatureIconKey(snapshot));
+        UpdateMemoryTrayIcon(
+            TrayIconRenderer.CreateMemoryIcon(snapshot),
+            TrayIconRenderer.GetMemoryIconKey(snapshot));
+    }
+
+    private void PublishCounterState()
+    {
+        _counterWebSocketServer.Publish(BuildCounterJson());
+    }
+
+    private string BuildCounterJson()
+    {
+        JsonObject root = new()
+        {
+            ["type"] = "limits.counters",
+            ["version"] = 1,
+            ["updatedAt"] = FormatCounterTimestamp(DateTimeOffset.UtcNow)
+        };
+        root["codex"] = BuildCodexCounterJson(_lastCodexSnapshot, _lastCodexSparkSnapshot);
+        root["claude"] = BuildClaudeCounterJson(_lastClaudeSnapshot);
+        root["kimi"] = BuildKimiCounterJson(_lastKimiSnapshot);
+        root["deepSeek"] = BuildDeepSeekCounterJson(_lastDeepSeekSnapshot);
+        root["unet"] = BuildUnetCounterJson(_lastUnetSnapshot);
+        root["openCode"] = BuildOpenCodeCounterJson(
+            _lastOpenCodeSnapshot,
+            _lastOpenCodeGoSnapshot,
+            _openCodeGoUsageError);
+        root["hardware"] = BuildHardwareCounterJson(_lastHardwareSnapshot);
+        root["disk"] = BuildDiskCounterJson(_lastDiskSnapshot);
+        return root.ToJsonString();
+    }
+
+    private static JsonObject? BuildCodexCounterJson(
+        CodexUsageSnapshot? snapshot,
+        CodexUsageSnapshot? sparkSnapshot)
+    {
+        if (snapshot is null)
+        {
+            return null;
+        }
+
+        JsonObject result = BuildCodexLimitCounterJson(snapshot);
+        result["spark"] = sparkSnapshot is null ? null : BuildCodexLimitCounterJson(sparkSnapshot);
+        return result;
+    }
+
+    private static JsonObject BuildCodexLimitCounterJson(CodexUsageSnapshot snapshot)
+    {
+        JsonObject result = new()
+        {
+            ["timestamp"] = FormatCounterTimestamp(snapshot.Timestamp),
+            ["primaryWindowMinutes"] = snapshot.PrimaryWindowMinutes,
+            ["secondaryWindowMinutes"] = snapshot.SecondaryWindowMinutes,
+            ["primaryResetAt"] = FormatCounterTimestamp(snapshot.PrimaryResetAt),
+            ["secondaryResetAt"] = FormatCounterTimestamp(snapshot.SecondaryResetAt),
+            ["planType"] = snapshot.PlanType,
+            ["model"] = snapshot.Model
+        };
+        SetPercent(result, "primaryUsedPercent", snapshot.PrimaryUsedPercent);
+        SetPercent(result, "primaryRemainingPercent", 100d - snapshot.PrimaryUsedPercent);
+        SetPercent(result, "secondaryUsedPercent", snapshot.SecondaryUsedPercent);
+        SetPercent(result, "secondaryRemainingPercent", 100d - snapshot.SecondaryUsedPercent);
+        return result;
+    }
+
+    private static JsonObject? BuildClaudeCounterJson(ClaudeUsageSnapshot? snapshot)
+    {
+        if (snapshot is null)
+        {
+            return null;
+        }
+
+        JsonObject result = new()
+        {
+            ["timestamp"] = FormatCounterTimestamp(snapshot.Timestamp),
+            ["fiveHourResetAt"] = FormatCounterTimestamp(snapshot.FiveHourResetAt),
+            ["sevenDayResetAt"] = FormatCounterTimestamp(snapshot.SevenDayResetAt),
+            ["fiveHourRemainingPercent"] = ClaudeUsageMath.GetRemainingPercent(snapshot.FiveHourUsedPercent),
+            ["sevenDayRemainingPercent"] = ClaudeUsageMath.GetRemainingPercent(snapshot.SevenDayUsedPercent)
+        };
+        SetPercent(result, "fiveHourUsedPercent", snapshot.FiveHourUsedPercent);
+        SetPercent(result, "sevenDayUsedPercent", snapshot.SevenDayUsedPercent);
+        return result;
+    }
+
+    private static JsonObject? BuildKimiCounterJson(KimiUsageSnapshot? snapshot)
+    {
+        if (snapshot is null)
+        {
+            return null;
+        }
+
+        JsonObject result = new()
+        {
+            ["timestamp"] = FormatCounterTimestamp(snapshot.Timestamp),
+            ["fiveHourResetAt"] = FormatCounterTimestamp(snapshot.FiveHourResetAt),
+            ["sevenDayResetAt"] = FormatCounterTimestamp(snapshot.SevenDayResetAt),
+            ["spentTokens"] = snapshot.SpentTokens,
+            ["inputTokens"] = snapshot.InputTokens,
+            ["outputTokens"] = snapshot.OutputTokens,
+            ["cacheCreationTokens"] = snapshot.CacheCreationTokens,
+            ["cachedReadTokens"] = snapshot.CachedReadTokens,
+            ["recordCount"] = snapshot.RecordCount
+        };
+        SetPercent(result, "fiveHourUsedPercent", snapshot.FiveHourUsedPercent);
+        SetPercent(result, "sevenDayUsedPercent", snapshot.SevenDayUsedPercent);
+        SetPercent(result, "fiveHourRemainingPercent", snapshot.FiveHourRemainingPercent);
+        SetPercent(result, "sevenDayRemainingPercent", snapshot.SevenDayRemainingPercent);
+        return result;
+    }
+
+    private static JsonObject? BuildDeepSeekCounterJson(DeepSeekBalanceSnapshot? snapshot)
+    {
+        if (snapshot is null)
+        {
+            return null;
+        }
+
+        return new JsonObject
+        {
+            ["totalBalance"] = snapshot.TotalBalance,
+            ["grantedBalance"] = snapshot.GrantedBalance,
+            ["toppedUpBalance"] = snapshot.ToppedUpBalance,
+            ["isAvailable"] = snapshot.IsAvailable,
+            ["timestamp"] = FormatCounterTimestamp(snapshot.Timestamp)
+        };
+    }
+
+    private static JsonObject? BuildUnetCounterJson(UnetBalanceSnapshot? snapshot)
+    {
+        if (snapshot is null)
+        {
+            return null;
+        }
+
+        JsonArray accounts = new();
+        foreach (UnetAccountBalance account in snapshot.Accounts)
+        {
+            JsonObject accountJson = new()
+            {
+                ["username"] = account.Username,
+                ["currency"] = account.Currency,
+                ["isAvailable"] = account.IsAvailable,
+                ["error"] = account.Error
+            };
+            SetNullableDecimal(accountJson, "balance", account.Balance);
+            accounts.Add((JsonNode)accountJson);
+        }
+
+        return new JsonObject
+        {
+            ["timestamp"] = FormatCounterTimestamp(snapshot.Timestamp),
+            ["isAvailable"] = snapshot.Accounts.Any(account => account.IsAvailable),
+            ["accounts"] = accounts
+        };
+    }
+
+    private static JsonObject? BuildOpenCodeCounterJson(
+        OpenCodeUsageSnapshot? snapshot,
+        OpenCodeGoUsageSnapshot? goUsage,
+        string? goUsageError)
+    {
+        if (snapshot is null && goUsage is null && string.IsNullOrWhiteSpace(goUsageError))
+        {
+            return null;
+        }
+
+        JsonObject result = new();
+        if (snapshot is not null)
+        {
+            result["sessionCount"] = snapshot.SessionCount;
+            result["inputTokens"] = snapshot.InputTokens;
+            result["outputTokens"] = snapshot.OutputTokens;
+            result["reasoningTokens"] = snapshot.ReasoningTokens;
+            result["cacheReadTokens"] = snapshot.CacheReadTokens;
+            result["cacheWriteTokens"] = snapshot.CacheWriteTokens;
+            result["totalTokens"] = snapshot.TotalTokens;
+            result["cost"] = snapshot.Cost;
+            result["timestamp"] = FormatCounterTimestamp(snapshot.Timestamp);
+            result["windowStart"] = FormatCounterTimestamp(snapshot.WindowStart);
+            result["latestActivityAt"] = FormatCounterTimestamp(snapshot.LatestActivityAt);
+        }
+
+        result["go"] = goUsage is null ? null : BuildOpenCodeGoCounterJson(goUsage);
+        if (!string.IsNullOrWhiteSpace(goUsageError))
+        {
+            result["goError"] = goUsageError;
+        }
+
+        return result;
+    }
+
+    private static JsonObject BuildOpenCodeGoCounterJson(OpenCodeGoUsageSnapshot snapshot)
+    {
+        return new JsonObject
+        {
+            ["timestamp"] = FormatCounterTimestamp(snapshot.Timestamp),
+            ["source"] = snapshot.Source,
+            ["isAvailable"] = true,
+            ["rolling"] = BuildOpenCodeGoWindowCounterJson(snapshot.Rolling, OpenCodeGoLimits.RollingUsd),
+            ["weekly"] = BuildOpenCodeGoWindowCounterJson(snapshot.Weekly, OpenCodeGoLimits.WeeklyUsd),
+            ["monthly"] = BuildOpenCodeGoWindowCounterJson(snapshot.Monthly, OpenCodeGoLimits.MonthlyUsd)
+        };
+    }
+
+    private static JsonObject BuildOpenCodeGoWindowCounterJson(
+        OpenCodeGoUsageWindow window,
+        decimal limitUsd)
+    {
+        double usedPercent = Math.Clamp(window.UsedPercent, 0d, 100d);
+        return new JsonObject
+        {
+            ["status"] = window.Status,
+            ["usedPercent"] = usedPercent,
+            ["remainingPercent"] = Math.Clamp(100d - usedPercent, 0d, 100d),
+            ["limitUsd"] = limitUsd,
+            ["resetAt"] = FormatCounterTimestamp(window.ResetAt)
+        };
+    }
+
+    private static JsonObject? BuildHardwareCounterJson(HardwareSnapshot? snapshot)
+    {
+        if (snapshot is null)
+        {
+            return null;
+        }
+
+        JsonObject result = new()
+        {
+            ["timestamp"] = FormatCounterTimestamp(snapshot.Timestamp),
+            ["gpuName"] = snapshot.GpuName
+        };
+        SetNullableDouble(result, "cpuTemperatureC", snapshot.CpuTemperatureC);
+        SetNullableDouble(result, "gpuTemperatureC", snapshot.GpuTemperatureC);
+        SetPercent(result, "cpuUsagePercent", snapshot.CpuUsagePercent);
+        SetPercent(result, "gpuUsagePercent", snapshot.GpuUsagePercent);
+        return result;
+    }
+
+    private static JsonObject? BuildDiskCounterJson(DiskSpaceSnapshot? snapshot)
+    {
+        if (snapshot is null)
+        {
+            return null;
+        }
+
+        JsonArray drives = new();
+        foreach (DiskSpaceStatus drive in snapshot.Drives)
+        {
+            JsonObject driveJson = new()
+            {
+                ["drive"] = drive.DriveLetter,
+                ["redLimitGb"] = drive.RedLimitGb,
+                ["isLow"] = drive.IsLow,
+                ["isUnavailable"] = drive.IsUnavailable,
+                ["error"] = drive.Error
+            };
+            SetNullableLong(driveJson, "freeBytes", drive.FreeBytes);
+            SetNullableDouble(
+                driveJson,
+                "freeGigabytes",
+                drive.FreeBytes is { } freeBytes ? freeBytes / (1024d * 1024d * 1024d) : null);
+            drives.Add((JsonNode)driveJson);
+        }
+
+        return new JsonObject
+        {
+            ["checkedAt"] = FormatCounterTimestamp(snapshot.CheckedAt),
+            ["healthy"] = snapshot.IsHealthy,
+            ["hasLowSpace"] = snapshot.Drives.Any(drive => drive.IsLow),
+            ["hasUnavailableDrives"] = snapshot.HasUnavailableDrives,
+            ["lowDriveLetters"] = snapshot.LowDriveLetters,
+            ["unavailableDriveLetters"] = snapshot.UnavailableDriveLetters,
+            ["drives"] = drives
+        };
+    }
+
+    private static string? FormatCounterTimestamp(DateTimeOffset? timestamp)
+    {
+        return timestamp?.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
+    }
+
+    private static void SetPercent(JsonObject target, string propertyName, double? value)
+    {
+        target[propertyName] = value is { } number && double.IsFinite(number)
+            ? JsonValue.Create(Math.Clamp(number, 0d, 100d))
+            : null;
+    }
+
+    private static void SetNullableDouble(JsonObject target, string propertyName, double? value)
+    {
+        target[propertyName] = value is { } number && double.IsFinite(number)
+            ? JsonValue.Create(number)
+            : null;
+    }
+
+    private static void SetNullableDecimal(JsonObject target, string propertyName, decimal? value)
+    {
+        target[propertyName] = value is { } number
+            ? JsonValue.Create(number)
+            : null;
+    }
+
+    private static void SetNullableLong(JsonObject target, string propertyName, long? value)
+    {
+        target[propertyName] = value is { } number
+            ? JsonValue.Create(number)
+            : null;
+    }
+
     private void RunLimitWatchdog(ClaudeUsageSnapshot? snapshot)
     {
         if (_limitWatchdogInFlight)
@@ -599,6 +1377,18 @@ internal sealed class TrayApplication : IDisposable
 
     private void UpdateCodexTrayIcon(IntPtr newIconHandle, string iconKey)
     {
+        if (!_trayIconSettings.IsVisible(TrayIconKind.Codex))
+        {
+            SuppressTrayIcon(
+                CodexTrayIconId,
+                newIconHandle,
+                ref _codexIconHandle,
+                ref _codexTrayIconAdded,
+                ref _codexIconKey,
+                ref _codexAppliedTooltip);
+            return;
+        }
+
         UpdateTrayIcon(
             CodexTrayIconId,
             newIconHandle,
@@ -612,6 +1402,18 @@ internal sealed class TrayApplication : IDisposable
 
     private void UpdateClaudeTrayIcon(IntPtr newIconHandle, string iconKey)
     {
+        if (!_trayIconSettings.IsVisible(TrayIconKind.Claude))
+        {
+            SuppressTrayIcon(
+                ClaudeTrayIconId,
+                newIconHandle,
+                ref _claudeIconHandle,
+                ref _claudeTrayIconAdded,
+                ref _claudeIconKey,
+                ref _claudeAppliedTooltip);
+            return;
+        }
+
         UpdateTrayIcon(
             ClaudeTrayIconId,
             newIconHandle,
@@ -625,6 +1427,18 @@ internal sealed class TrayApplication : IDisposable
 
     private void UpdateKimiTrayIcon(IntPtr newIconHandle, string iconKey)
     {
+        if (!_trayIconSettings.IsVisible(TrayIconKind.Kimi))
+        {
+            SuppressTrayIcon(
+                KimiTrayIconId,
+                newIconHandle,
+                ref _kimiIconHandle,
+                ref _kimiTrayIconAdded,
+                ref _kimiIconKey,
+                ref _kimiAppliedTooltip);
+            return;
+        }
+
         UpdateTrayIcon(
             KimiTrayIconId,
             newIconHandle,
@@ -638,6 +1452,18 @@ internal sealed class TrayApplication : IDisposable
 
     private void UpdateDeepSeekTrayIcon(IntPtr newIconHandle, string iconKey)
     {
+        if (!_trayIconSettings.IsVisible(TrayIconKind.DeepSeek))
+        {
+            SuppressTrayIcon(
+                DeepSeekTrayIconId,
+                newIconHandle,
+                ref _deepSeekIconHandle,
+                ref _deepSeekTrayIconAdded,
+                ref _deepSeekIconKey,
+                ref _deepSeekAppliedTooltip);
+            return;
+        }
+
         UpdateTrayIcon(
             DeepSeekTrayIconId,
             newIconHandle,
@@ -647,6 +1473,132 @@ internal sealed class TrayApplication : IDisposable
             ref _deepSeekAppliedTooltip,
             iconKey,
             _deepSeekTooltip);
+    }
+
+    private void UpdateDiskTrayIcon(IntPtr newIconHandle, string iconKey)
+    {
+        if (!_trayIconSettings.IsVisible(TrayIconKind.Disk))
+        {
+            if (newIconHandle != IntPtr.Zero)
+            {
+                NativeMethods.DestroyIcon(newIconHandle);
+            }
+
+            HideDiskTrayIcon();
+            return;
+        }
+
+        UpdateTrayIcon(
+            DiskTrayIconId,
+            newIconHandle,
+            ref _diskIconHandle,
+            ref _diskTrayIconAdded,
+            ref _diskIconKey,
+            ref _diskAppliedTooltip,
+            iconKey,
+            _diskTooltip);
+    }
+
+    private void HideDiskTrayIcon()
+    {
+        RemoveTrayIcon(DiskTrayIconId, ref _diskTrayIconAdded);
+        DestroyIconHandle(ref _diskIconHandle);
+        _diskIconKey = null;
+        _diskAppliedTooltip = null;
+    }
+
+    private void UpdateOpenCodeTrayIcon(IntPtr newIconHandle, string iconKey)
+    {
+        if (!_trayIconSettings.IsVisible(TrayIconKind.OpenCode))
+        {
+            SuppressTrayIcon(
+                OpenCodeTrayIconId,
+                newIconHandle,
+                ref _openCodeIconHandle,
+                ref _openCodeTrayIconAdded,
+                ref _openCodeIconKey,
+                ref _openCodeAppliedTooltip);
+            return;
+        }
+
+        UpdateTrayIcon(
+            OpenCodeTrayIconId,
+            newIconHandle,
+            ref _openCodeIconHandle,
+            ref _openCodeTrayIconAdded,
+            ref _openCodeIconKey,
+            ref _openCodeAppliedTooltip,
+            iconKey,
+            _openCodeTooltip);
+    }
+
+    private void UpdateTemperatureTrayIcon(IntPtr newIconHandle, string iconKey)
+    {
+        if (!_trayIconSettings.IsVisible(TrayIconKind.Temperature))
+        {
+            SuppressTrayIcon(
+                TemperatureTrayIconId,
+                newIconHandle,
+                ref _temperatureIconHandle,
+                ref _temperatureTrayIconAdded,
+                ref _temperatureIconKey,
+                ref _temperatureAppliedTooltip);
+            return;
+        }
+
+        UpdateTrayIcon(
+            TemperatureTrayIconId,
+            newIconHandle,
+            ref _temperatureIconHandle,
+            ref _temperatureTrayIconAdded,
+            ref _temperatureIconKey,
+            ref _temperatureAppliedTooltip,
+            iconKey,
+            _temperatureTooltip);
+    }
+
+    private void UpdateMemoryTrayIcon(IntPtr newIconHandle, string iconKey)
+    {
+        if (!_trayIconSettings.IsVisible(TrayIconKind.CpuGpuLoad))
+        {
+            SuppressTrayIcon(
+                MemoryTrayIconId,
+                newIconHandle,
+                ref _memoryIconHandle,
+                ref _memoryTrayIconAdded,
+                ref _memoryIconKey,
+                ref _memoryAppliedTooltip);
+            return;
+        }
+
+        UpdateTrayIcon(
+            MemoryTrayIconId,
+            newIconHandle,
+            ref _memoryIconHandle,
+            ref _memoryTrayIconAdded,
+            ref _memoryIconKey,
+            ref _memoryAppliedTooltip,
+            iconKey,
+            _memoryTooltip);
+    }
+
+    private void SuppressTrayIcon(
+        uint iconId,
+        IntPtr newIconHandle,
+        ref IntPtr iconHandle,
+        ref bool trayIconAdded,
+        ref string? currentIconKey,
+        ref string? currentTooltip)
+    {
+        if (newIconHandle != IntPtr.Zero)
+        {
+            NativeMethods.DestroyIcon(newIconHandle);
+        }
+
+        RemoveTrayIcon(iconId, ref trayIconAdded);
+        DestroyIconHandle(ref iconHandle);
+        currentIconKey = null;
+        currentTooltip = null;
     }
 
     private void UpdateTrayIcon(
@@ -751,6 +1703,10 @@ internal sealed class TrayApplication : IDisposable
             ClaudeTrayIconId => ClaudeTrayIconGuid,
             KimiTrayIconId => KimiTrayIconGuid,
             DeepSeekTrayIconId => DeepSeekTrayIconGuid,
+            DiskTrayIconId => DiskTrayIconGuid,
+            OpenCodeTrayIconId => OpenCodeTrayIconGuid,
+            TemperatureTrayIconId => TemperatureTrayIconGuid,
+            MemoryTrayIconId => MemoryTrayIconGuid,
             _ => CodexTrayIconGuid
         };
     }
@@ -786,22 +1742,56 @@ internal sealed class TrayApplication : IDisposable
                     return IntPtr.Zero;
                 }
 
+                if ((nuint)wParam == HardwareRefreshTimerId)
+                {
+                    RefreshHardware();
+                    return IntPtr.Zero;
+                }
+
                 break;
 
             case CodexResultMessage:
                 ApplyCodexResult();
+                PublishCounterState();
                 return IntPtr.Zero;
 
             case ClaudeResultMessage:
                 ApplyClaudeResult();
+                PublishCounterState();
                 return IntPtr.Zero;
 
             case KimiResultMessage:
                 ApplyKimiResult();
+                PublishCounterState();
                 return IntPtr.Zero;
 
             case DeepSeekResultMessage:
                 ApplyDeepSeekResult();
+                PublishCounterState();
+                return IntPtr.Zero;
+
+            case UnetResultMessage:
+                ApplyUnetResult();
+                PublishCounterState();
+                return IntPtr.Zero;
+
+            case DiskResultMessage:
+                ApplyDiskResult();
+                PublishCounterState();
+                return IntPtr.Zero;
+
+            case OpenCodeResultMessage:
+                ApplyOpenCodeResult();
+                PublishCounterState();
+                return IntPtr.Zero;
+
+            case HardwareResultMessage:
+                ApplyHardwareResult();
+                PublishCounterState();
+                return IntPtr.Zero;
+
+            case OpenDiskSettingsMessage:
+                OpenDiskSettings();
                 return IntPtr.Zero;
 
             case ShutdownMessage:
@@ -813,7 +1803,11 @@ internal sealed class TrayApplication : IDisposable
                 if (iconId is not CodexTrayIconId and
                     not ClaudeTrayIconId and
                     not KimiTrayIconId and
-                    not DeepSeekTrayIconId)
+                    not DeepSeekTrayIconId and
+                    not DiskTrayIconId and
+                    not OpenCodeTrayIconId and
+                    not TemperatureTrayIconId and
+                    not MemoryTrayIconId)
                 {
                     break;
                 }
@@ -847,20 +1841,213 @@ internal sealed class TrayApplication : IDisposable
         _claudeTrayIconAdded = false;
         _kimiTrayIconAdded = false;
         _deepSeekTrayIconAdded = false;
+        _diskTrayIconAdded = false;
+        _openCodeTrayIconAdded = false;
+        _temperatureTrayIconAdded = false;
+        _memoryTrayIconAdded = false;
         _codexIconKey = null;
         _claudeIconKey = null;
         _kimiIconKey = null;
         _deepSeekIconKey = null;
+        _diskIconKey = null;
+        _openCodeIconKey = null;
+        _temperatureIconKey = null;
+        _memoryIconKey = null;
         _codexAppliedTooltip = null;
         _claudeAppliedTooltip = null;
         _kimiAppliedTooltip = null;
         _deepSeekAppliedTooltip = null;
+        _diskAppliedTooltip = null;
+        _openCodeAppliedTooltip = null;
+        _temperatureAppliedTooltip = null;
+        _memoryAppliedTooltip = null;
 
-        UpdateCodexTrayIcon(TrayIconRenderer.CreateUnavailableIcon(), TrayIconRenderer.CodexUnavailableIconKey);
-        UpdateClaudeTrayIcon(TrayIconRenderer.CreateClaudeUnavailableIcon(), TrayIconRenderer.ClaudeUnavailableIconKey);
-        UpdateKimiTrayIcon(TrayIconRenderer.CreateKimiUnavailableIcon(), TrayIconRenderer.KimiUnavailableIconKey);
-        UpdateDeepSeekTrayIcon(TrayIconRenderer.CreateDeepSeekUnavailableIcon(), TrayIconRenderer.DeepSeekUnavailableIconKey);
+        RefreshVisibleTrayIcons();
         RefreshUsage();
+    }
+
+    private void RefreshVisibleTrayIcons()
+    {
+        if (_lastCodexSnapshot is { } codexSnapshot)
+        {
+            UpdateCodexTrayIcon(
+                TrayIconRenderer.CreateUsageIcon(codexSnapshot),
+                TrayIconRenderer.GetCodexIconKey(codexSnapshot));
+        }
+        else
+        {
+            UpdateCodexTrayIcon(
+                TrayIconRenderer.CreateUnavailableIcon(),
+                TrayIconRenderer.CodexUnavailableIconKey);
+        }
+
+        if (_lastClaudeSnapshot is { } claudeSnapshot)
+        {
+            UpdateClaudeTrayIcon(
+                TrayIconRenderer.CreateClaudeIcon(claudeSnapshot),
+                TrayIconRenderer.GetClaudeIconKey(claudeSnapshot));
+        }
+        else
+        {
+            UpdateClaudeTrayIcon(
+                TrayIconRenderer.CreateClaudeUnavailableIcon(),
+                TrayIconRenderer.ClaudeUnavailableIconKey);
+        }
+
+        if (_lastKimiSnapshot is { } kimiSnapshot)
+        {
+            UpdateKimiTrayIcon(
+                TrayIconRenderer.CreateKimiIcon(kimiSnapshot),
+                TrayIconRenderer.GetKimiIconKey(kimiSnapshot));
+        }
+        else
+        {
+            UpdateKimiTrayIcon(
+                TrayIconRenderer.CreateKimiUnavailableIcon(),
+                TrayIconRenderer.KimiUnavailableIconKey);
+        }
+
+        if (_lastDeepSeekSnapshot is { } deepSeekSnapshot)
+        {
+            UpdateDeepSeekTrayIcon(
+                TrayIconRenderer.CreateDeepSeekIcon(deepSeekSnapshot),
+                TrayIconRenderer.GetDeepSeekIconKey(deepSeekSnapshot));
+        }
+        else
+        {
+            UpdateDeepSeekTrayIcon(
+                TrayIconRenderer.CreateDeepSeekUnavailableIcon(),
+                TrayIconRenderer.DeepSeekUnavailableIconKey);
+        }
+
+        if (_lastDiskSnapshot is { } diskSnapshot &&
+            !string.IsNullOrWhiteSpace(diskSnapshot.LowDriveLetters))
+        {
+            UpdateDiskTrayIcon(
+                TrayIconRenderer.CreateDiskIcon(diskSnapshot),
+                TrayIconRenderer.GetDiskIconKey(diskSnapshot));
+        }
+        else
+        {
+            HideDiskTrayIcon();
+        }
+
+        if (_lastOpenCodeGoSnapshot is { } openCodeGoSnapshot)
+        {
+            UpdateOpenCodeTrayIcon(
+                TrayIconRenderer.CreateOpenCodeIcon(openCodeGoSnapshot),
+                TrayIconRenderer.GetOpenCodeIconKey(openCodeGoSnapshot));
+        }
+        else
+        {
+            UpdateOpenCodeTrayIcon(
+                TrayIconRenderer.CreateOpenCodeUnavailableIcon(),
+                TrayIconRenderer.OpenCodeUnavailableIconKey);
+        }
+
+        if (_lastHardwareSnapshot is { } hardwareSnapshot)
+        {
+            UpdateTemperatureTrayIcon(
+                TrayIconRenderer.CreateTemperatureIcon(hardwareSnapshot),
+                TrayIconRenderer.GetTemperatureIconKey(hardwareSnapshot));
+            UpdateMemoryTrayIcon(
+                TrayIconRenderer.CreateMemoryIcon(hardwareSnapshot),
+                TrayIconRenderer.GetMemoryIconKey(hardwareSnapshot));
+        }
+        else
+        {
+            UpdateTemperatureTrayIcon(
+                TrayIconRenderer.CreateTemperatureUnavailableIcon(),
+                TrayIconRenderer.TemperatureUnavailableIconKey);
+            UpdateMemoryTrayIcon(
+                TrayIconRenderer.CreateMemoryUnavailableIcon(),
+                TrayIconRenderer.MemoryUnavailableIconKey);
+        }
+    }
+
+    private static string GetTrayIconLabel(TrayIconKind iconKind)
+    {
+        return iconKind switch
+        {
+            TrayIconKind.Claude => "Claude",
+            TrayIconKind.Kimi => "Kimi",
+            TrayIconKind.DeepSeek => "DeepSeek",
+            TrayIconKind.Disk => "Disk low-space warning",
+            TrayIconKind.OpenCode => "OpenCode Go",
+            TrayIconKind.Temperature => "CPU/GPU temperature",
+            TrayIconKind.CpuGpuLoad => "CPU/GPU load (always on)",
+            _ => "Codex"
+        };
+    }
+
+    private void AppendTrayIconVisibilityMenu(IntPtr menuHandle)
+    {
+        IntPtr visibilityMenuHandle = NativeMethods.CreatePopupMenu();
+        if (visibilityMenuHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        bool menuAttached = false;
+        try
+        {
+            foreach (TrayIconKind iconKind in TrayIconsInVisibilityMenu)
+            {
+                uint flags = NativeMethods.MF_STRING;
+                if (_trayIconSettings.IsVisible(iconKind))
+                {
+                    flags |= NativeMethods.MF_CHECKED;
+                }
+
+                if (iconKind == TrayIconKind.CpuGpuLoad)
+                {
+                    flags |= NativeMethods.MF_GRAYED;
+                }
+
+                NativeMethods.AppendMenu(
+                    visibilityMenuHandle,
+                    flags,
+                    (nuint)(CommandToggleFirstTrayIcon + (uint)iconKind),
+                    GetTrayIconLabel(iconKind));
+            }
+
+            menuAttached = NativeMethods.AppendMenu(
+                menuHandle,
+                NativeMethods.MF_POPUP | NativeMethods.MF_STRING,
+                unchecked((nuint)visibilityMenuHandle.ToInt64()),
+                "Visible icons");
+        }
+        finally
+        {
+            if (!menuAttached)
+            {
+                NativeMethods.DestroyMenu(visibilityMenuHandle);
+            }
+        }
+    }
+
+    private void ToggleTrayIconVisibility(TrayIconKind iconKind)
+    {
+        if (iconKind == TrayIconKind.CpuGpuLoad)
+        {
+            return;
+        }
+
+        TrayIconSettings updatedSettings = _trayIconSettings.Toggle(iconKind);
+        try
+        {
+            _trayIconSettingsStore.Save(updatedSettings);
+            _trayIconSettings = updatedSettings;
+            RefreshVisibleTrayIcons();
+        }
+        catch (Exception exception)
+        {
+            NativeMethods.MessageBox(
+                _windowHandle,
+                $"Could not save tray icon settings: {exception.Message}",
+                "limits",
+                NativeMethods.MB_OK | NativeMethods.MB_ICONERROR);
+        }
     }
 
     private void ShowContextMenu(uint iconId)
@@ -907,6 +2094,42 @@ internal sealed class TrayApplication : IDisposable
                 openLabel = "Open DeepSeek billing";
                 break;
 
+            case DiskTrayIconId:
+                statusText = _diskStatusText;
+                detailText = _diskDetailText;
+                updatedText = _diskUpdatedText;
+                sourceText = _diskSourceText;
+                openCommand = CommandOpenDiskSettings;
+                openLabel = "Open disk settings";
+                break;
+
+            case OpenCodeTrayIconId:
+                statusText = _openCodeStatusText;
+                detailText = _openCodeDetailText;
+                updatedText = _openCodeUpdatedText;
+                sourceText = _openCodeSourceText;
+                openCommand = CommandOpenOpenCodeData;
+                openLabel = "Open OpenCode data";
+                break;
+
+            case TemperatureTrayIconId:
+                statusText = _temperatureStatusText;
+                detailText = _temperatureDetailText;
+                updatedText = _temperatureUpdatedText;
+                sourceText = _temperatureSourceText;
+                openCommand = CommandOpenTaskManager;
+                openLabel = "Open Task Manager";
+                break;
+
+            case MemoryTrayIconId:
+                statusText = _memoryStatusText;
+                detailText = _memoryDetailText;
+                updatedText = _memoryUpdatedText;
+                sourceText = _memorySourceText;
+                openCommand = CommandOpenTaskManager;
+                openLabel = "Open Task Manager";
+                break;
+
             default:
                 statusText = _codexStatusText;
                 detailText = _codexDetailText;
@@ -933,8 +2156,14 @@ internal sealed class TrayApplication : IDisposable
             NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING | NativeMethods.MF_GRAYED, 0, LimitMenuText(updatedText));
             NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING | NativeMethods.MF_GRAYED, 0, LimitMenuText(sourceText));
             NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_SEPARATOR, 0, null);
+            AppendTrayIconVisibilityMenu(menuHandle);
+            NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_SEPARATOR, 0, null);
             NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING, CommandRefresh, "Refresh now");
             NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING, openCommand, openLabel);
+            if (iconId != DiskTrayIconId)
+            {
+                NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING, CommandOpenDiskSettings, "Open disk settings");
+            }
             NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING, CommandExit, "Exit");
 
             NativeMethods.GetCursorPos(out NativeMethods.POINT cursor);
@@ -960,6 +2189,12 @@ internal sealed class TrayApplication : IDisposable
 
     private void HandleMenuCommand(uint command)
     {
+        if (command >= CommandToggleFirstTrayIcon && command <= CommandToggleLastTrayIcon)
+        {
+            ToggleTrayIconVisibility((TrayIconKind)(command - CommandToggleFirstTrayIcon));
+            return;
+        }
+
         switch (command)
         {
             case CommandRefresh:
@@ -980,6 +2215,18 @@ internal sealed class TrayApplication : IDisposable
 
             case CommandOpenDeepSeekBilling:
                 OpenDeepSeekBillingPage();
+                break;
+
+            case CommandOpenDiskSettings:
+                OpenDiskSettings();
+                break;
+
+            case CommandOpenOpenCodeData:
+                OpenOpenCodeDataDirectory();
+                break;
+
+            case CommandOpenTaskManager:
+                OpenTaskManager();
                 break;
 
             case CommandExit:
@@ -1032,6 +2279,81 @@ internal sealed class TrayApplication : IDisposable
         });
     }
 
+    private void OpenOpenCodeDataDirectory()
+    {
+        bool dataDirectoryExists = Directory.Exists(_openCodeUsageReader.DataDirectoryPath);
+        bool databaseExists = File.Exists(_openCodeUsageReader.DatabasePath);
+        if (!dataDirectoryExists && !databaseExists)
+        {
+            NativeMethods.MessageBox(
+                _windowHandle,
+                $"OpenCode data was not found at {_openCodeUsageReader.DatabasePath}.",
+                "OpenCode",
+                NativeMethods.MB_OK | NativeMethods.MB_ICONINFORMATION);
+            return;
+        }
+
+        string target = dataDirectoryExists
+            ? _openCodeUsageReader.DataDirectoryPath
+            : _openCodeUsageReader.DatabasePath;
+
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = target,
+            UseShellExecute = true
+        });
+    }
+
+    private static void OpenTaskManager()
+    {
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = "taskmgr.exe",
+            UseShellExecute = true
+        });
+    }
+
+    private void OpenDiskSettings()
+    {
+        if (_diskSettingsWindow is not null)
+        {
+            _diskSettingsWindow.Activate();
+            return;
+        }
+
+        DiskSettingsWindow? window = null;
+        window = new DiskSettingsWindow(
+            _diskMonitor.Settings,
+            settings =>
+            {
+                _diskMonitor.SaveSettings(settings);
+                RefreshDiskSpace();
+            },
+            () =>
+            {
+                if (ReferenceEquals(_diskSettingsWindow, window))
+                {
+                    _diskSettingsWindow = null;
+                }
+            });
+
+        _diskSettingsWindow = window;
+        try
+        {
+            window.Show(_windowHandle);
+        }
+        catch (Exception exception)
+        {
+            _diskSettingsWindow = null;
+            window.Dispose();
+            NativeMethods.MessageBox(
+                _windowHandle,
+                $"The disk settings window could not be opened: {exception.Message}",
+                "Disk settings",
+                NativeMethods.MB_OK | NativeMethods.MB_ICONERROR);
+        }
+    }
+
     private void PostQuit()
     {
         _windowHandle = IntPtr.Zero;
@@ -1045,16 +2367,30 @@ internal sealed class TrayApplication : IDisposable
         RemoveTrayIcon(ClaudeTrayIconId, ref _claudeTrayIconAdded);
         RemoveTrayIcon(KimiTrayIconId, ref _kimiTrayIconAdded);
         RemoveTrayIcon(DeepSeekTrayIconId, ref _deepSeekTrayIconAdded);
+        RemoveTrayIcon(DiskTrayIconId, ref _diskTrayIconAdded);
+        RemoveTrayIcon(OpenCodeTrayIconId, ref _openCodeTrayIconAdded);
+        RemoveTrayIcon(TemperatureTrayIconId, ref _temperatureTrayIconAdded);
+        RemoveTrayIcon(MemoryTrayIconId, ref _memoryTrayIconAdded);
+
+        _diskSettingsWindow?.Dispose();
+        _diskSettingsWindow = null;
 
         if (_windowHandle != IntPtr.Zero)
         {
             NativeMethods.KillTimer(_windowHandle, RefreshTimerId);
+            NativeMethods.KillTimer(_windowHandle, HardwareRefreshTimerId);
         }
+
+        _hardwareMonitor.Dispose();
 
         DestroyIconHandle(ref _codexIconHandle);
         DestroyIconHandle(ref _claudeIconHandle);
         DestroyIconHandle(ref _kimiIconHandle);
         DestroyIconHandle(ref _deepSeekIconHandle);
+        DestroyIconHandle(ref _diskIconHandle);
+        DestroyIconHandle(ref _openCodeIconHandle);
+        DestroyIconHandle(ref _temperatureIconHandle);
+        DestroyIconHandle(ref _memoryIconHandle);
 
         if (_windowClassRegistered)
         {
@@ -1258,6 +2594,203 @@ internal sealed class TrayApplication : IDisposable
     {
         return $"Topped up {FormatDeepSeekBalance(snapshot.ToppedUpBalance)}, " +
                $"granted {FormatDeepSeekBalance(snapshot.GrantedBalance)}";
+    }
+
+    private static string BuildOpenCodeTooltip(
+        OpenCodeUsageSnapshot snapshot,
+        OpenCodeGoUsageSnapshot? goSnapshot,
+        string? goUsageError)
+    {
+        string localText =
+            $"OpenCode: {FormatCompactTokens(snapshot.TotalTokens)} tokens in 24h, " +
+            $"{snapshot.SessionCount} {(snapshot.SessionCount == 1 ? "session" : "sessions")}";
+        if (goSnapshot is null)
+        {
+            return TruncateTooltip(FormatOpenCodeGoError(localText, goUsageError));
+        }
+
+        return TruncateTooltip(
+            $"{localText}; {BuildOpenCodeGoSummary(goSnapshot)}" +
+            (string.IsNullOrWhiteSpace(goUsageError) ? string.Empty : " (last known Go quota)"));
+    }
+
+    private static string BuildOpenCodeUnavailableTooltip(string? errorMessage)
+    {
+        if (string.IsNullOrWhiteSpace(errorMessage))
+        {
+            return "OpenCode: usage unavailable";
+        }
+
+        return TruncateTooltip($"OpenCode: usage unavailable ({errorMessage})");
+    }
+
+    private static string BuildOpenCodeHeadline(
+        OpenCodeUsageSnapshot snapshot,
+        OpenCodeGoUsageSnapshot? goSnapshot)
+    {
+        string localText = $"OpenCode: {FormatCompactTokens(snapshot.TotalTokens)} tokens in 24h | " +
+                           $"{snapshot.SessionCount} {(snapshot.SessionCount == 1 ? "session" : "sessions")}";
+        return goSnapshot is null
+            ? localText
+            : $"{localText} | Go {BuildOpenCodeGoSummary(goSnapshot)}";
+    }
+
+    private static string BuildOpenCodeDetail(
+        OpenCodeUsageSnapshot snapshot,
+        OpenCodeGoUsageSnapshot? goSnapshot,
+        string? goUsageError)
+    {
+        string localText = $"Input {FormatCompactTokens(snapshot.InputTokens)}, output {FormatCompactTokens(snapshot.OutputTokens)}, " +
+                           $"reasoning {FormatCompactTokens(snapshot.ReasoningTokens)}, cache read {FormatCompactTokens(snapshot.CacheReadTokens)}, " +
+                           $"cost {snapshot.Cost.ToString("C", CultureInfo.InvariantCulture)}";
+        return goSnapshot is null
+            ? FormatOpenCodeGoError(localText, goUsageError)
+            : $"{localText}; {BuildOpenCodeGoSummary(goSnapshot)}";
+    }
+
+    private static string BuildOpenCodeGoTooltip(OpenCodeGoUsageSnapshot snapshot, bool isStale)
+    {
+        return TruncateTooltip(
+            $"OpenCode Go: {BuildOpenCodeGoSummary(snapshot)}" +
+            (isStale ? " (last known)" : string.Empty));
+    }
+
+    private static string BuildOpenCodeGoHeadline(OpenCodeGoUsageSnapshot snapshot)
+    {
+        return $"OpenCode Go: {BuildOpenCodeGoSummary(snapshot)}";
+    }
+
+    private static string BuildOpenCodeGoDetail(OpenCodeGoUsageSnapshot snapshot)
+    {
+        return $"Rolling 5-hour limit ${OpenCodeGoLimits.RollingUsd}, " +
+               $"weekly ${OpenCodeGoLimits.WeeklyUsd}, monthly ${OpenCodeGoLimits.MonthlyUsd}; " +
+               BuildOpenCodeGoSummary(snapshot);
+    }
+
+    private static string BuildOpenCodeGoSummary(OpenCodeGoUsageSnapshot snapshot)
+    {
+        return $"5h {CodexUsageMath.GetRemainingPercent(snapshot.Rolling.UsedPercent)}% left, " +
+               $"weekly {CodexUsageMath.GetRemainingPercent(snapshot.Weekly.UsedPercent)}% left, " +
+               $"monthly {CodexUsageMath.GetRemainingPercent(snapshot.Monthly.UsedPercent)}% left";
+    }
+
+    private static string FormatOpenCodeGoError(string text, string? goUsageError)
+    {
+        return string.IsNullOrWhiteSpace(goUsageError)
+            ? text
+            : $"{text}; {goUsageError}";
+    }
+
+    private static string BuildTemperatureTooltip(HardwareSnapshot snapshot)
+    {
+        return TruncateTooltip(
+            $"Temperature: CPU {FormatTemperature(snapshot.CpuTemperatureC)}, " +
+            $"GPU {FormatTemperature(snapshot.GpuTemperatureC)}");
+    }
+
+    private static string BuildTemperatureHeadline(HardwareSnapshot snapshot)
+    {
+        return $"Temperature: CPU {FormatTemperature(snapshot.CpuTemperatureC)} | " +
+               $"GPU {FormatTemperature(snapshot.GpuTemperatureC)}";
+    }
+
+    private static string BuildTemperatureDetail(HardwareSnapshot snapshot)
+    {
+        string gpuName = string.IsNullOrWhiteSpace(snapshot.GpuName) ? "GPU" : snapshot.GpuName;
+        return $"CPU package {FormatTemperature(snapshot.CpuTemperatureC)}; " +
+               $"{gpuName} {FormatTemperature(snapshot.GpuTemperatureC)}";
+    }
+
+    private static string BuildUsageTooltip(HardwareSnapshot snapshot)
+    {
+        return TruncateTooltip(
+            $"Usage: CPU {FormatUsagePercent(snapshot.CpuUsagePercent)}, " +
+            $"GPU {FormatUsagePercent(snapshot.GpuUsagePercent)}");
+    }
+
+    private static string BuildUsageHeadline(HardwareSnapshot snapshot)
+    {
+        return $"Usage: CPU {FormatUsagePercent(snapshot.CpuUsagePercent)} | " +
+               $"GPU {FormatUsagePercent(snapshot.GpuUsagePercent)}";
+    }
+
+    private static string BuildUsageDetail(HardwareSnapshot snapshot)
+    {
+        return $"CPU {FormatUsagePercent(snapshot.CpuUsagePercent)}; " +
+               $"GPU {FormatUsagePercent(snapshot.GpuUsagePercent)}";
+    }
+
+    private static string FormatTemperature(double? temperatureC)
+    {
+        return temperatureC is null || !double.IsFinite(temperatureC.Value)
+            ? "?"
+            : $"{temperatureC.Value:0.#}°C";
+    }
+
+    private static string FormatUsagePercent(double? usagePercent)
+    {
+        if (usagePercent is null || !double.IsFinite(usagePercent.Value))
+        {
+            return "?";
+        }
+
+        return $"{Math.Clamp(usagePercent.Value, 0d, 100d):0.#}%";
+    }
+
+    private void AlertDiskLimits(DiskSpaceSnapshot snapshot)
+    {
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        foreach (DiskSpaceStatus drive in snapshot.Drives.Where(drive => drive.IsLow))
+        {
+            if (_lastDiskAlertAt.TryGetValue(drive.DriveLetter, out DateTimeOffset lastAlert) &&
+                now - lastAlert < TimeSpan.FromMinutes(1))
+            {
+                continue;
+            }
+
+            _lastDiskAlertAt[drive.DriveLetter] = now;
+            NativeMethods.MessageBeep(NativeMethods.MB_ICONWARNING);
+        }
+    }
+
+    private static string BuildDiskTooltip(DiskSpaceSnapshot snapshot)
+    {
+        if (!snapshot.HasSelectedDrives)
+        {
+            return "Disk: no disks selected";
+        }
+
+        return TruncateTooltip($"Disk: {snapshot.Summary}");
+    }
+
+    private static string BuildDiskHeadline(DiskSpaceSnapshot snapshot)
+    {
+        if (!snapshot.HasSelectedDrives)
+        {
+            return "Disk: no disks selected";
+        }
+
+        if (!string.IsNullOrWhiteSpace(snapshot.LowDriveLetters))
+        {
+            return $"Disk red limit: {snapshot.LowDriveLetters}";
+        }
+
+        if (snapshot.HasUnavailableDrives)
+        {
+            return $"Disk: unavailable {snapshot.UnavailableDriveLetters}";
+        }
+
+        return $"Disk: {snapshot.Summary}";
+    }
+
+    private static string BuildDiskDetail(DiskSpaceSnapshot snapshot)
+    {
+        if (!snapshot.HasSelectedDrives)
+        {
+            return "Choose disks and red limits from disk settings.";
+        }
+
+        return $"Red limits: {snapshot.LimitSummary}; {snapshot.Summary}";
     }
 
     private static string FormatDeepSeekBalance(decimal amount)
@@ -3223,12 +4756,1635 @@ internal sealed class DeepSeekBalanceReader
     private sealed record DeepCodeConfiguration(string ApiKey, string BaseUrl, string Source);
 }
 
+internal sealed record OpenCodeUsageSnapshot(
+    long SessionCount,
+    long InputTokens,
+    long OutputTokens,
+    long ReasoningTokens,
+    long CacheReadTokens,
+    long CacheWriteTokens,
+    decimal Cost,
+    DateTimeOffset Timestamp,
+    DateTimeOffset WindowStart,
+    DateTimeOffset? LatestActivityAt,
+    string SourceFile)
+{
+    public long TotalTokens => InputTokens + OutputTokens + ReasoningTokens + CacheReadTokens + CacheWriteTokens;
+}
+
+internal static class OpenCodeGoLimits
+{
+    public const decimal RollingUsd = 12m;
+    public const decimal WeeklyUsd = 30m;
+    public const decimal MonthlyUsd = 60m;
+}
+
+internal sealed record OpenCodeGoUsageWindow(
+    string Status,
+    double UsedPercent,
+    DateTimeOffset? ResetAt);
+
+internal sealed record OpenCodeGoUsageSnapshot(
+    DateTimeOffset Timestamp,
+    OpenCodeGoUsageWindow Rolling,
+    OpenCodeGoUsageWindow Weekly,
+    OpenCodeGoUsageWindow Monthly,
+    string Source);
+
+internal sealed record OpenCodeGoUsageReadResult(
+    OpenCodeGoUsageSnapshot? Snapshot,
+    string? ErrorMessage);
+
+internal sealed record OpenCodeUsageReadResult(
+    OpenCodeUsageSnapshot? Snapshot,
+    OpenCodeGoUsageSnapshot? GoUsage,
+    string? GoUsageError,
+    string? ErrorMessage);
+
+internal sealed record UnetAccountBalance(
+    string Username,
+    decimal? Balance,
+    string Currency,
+    bool IsAvailable,
+    string? Error);
+
+internal sealed record UnetBalanceSnapshot(
+    IReadOnlyList<UnetAccountBalance> Accounts,
+    DateTimeOffset Timestamp);
+
+internal sealed record UnetBalanceReadResult(UnetBalanceSnapshot? Snapshot, string? ErrorMessage);
+
+internal sealed record UnetCredential(string Username, string Password);
+
+internal sealed class UnetCredentialStore
+{
+    public string CredentialsPath { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "limits",
+        "unet-credentials.json");
+
+    public IReadOnlyList<UnetCredential> Load()
+    {
+        if (!File.Exists(CredentialsPath))
+        {
+            return [];
+        }
+
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(File.ReadAllText(CredentialsPath));
+            if (document.RootElement.ValueKind != JsonValueKind.Object ||
+                !document.RootElement.TryGetProperty("accounts", out JsonElement accountsElement) ||
+                accountsElement.ValueKind != JsonValueKind.Array)
+            {
+                return [];
+            }
+
+            List<UnetCredential> credentials = [];
+            foreach (JsonElement accountElement in accountsElement.EnumerateArray())
+            {
+                string? username = ReadString(accountElement, "username");
+                string? protectedPassword = ReadString(accountElement, "passwordProtected");
+                if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(protectedPassword))
+                {
+                    continue;
+                }
+
+                byte[] encryptedPassword = Convert.FromBase64String(protectedPassword);
+                try
+                {
+                    byte[] clearPassword = ProtectedData.Unprotect(
+                        encryptedPassword,
+                        optionalEntropy: null,
+                        DataProtectionScope.CurrentUser);
+                    try
+                    {
+                        string password = Encoding.UTF8.GetString(clearPassword);
+                        if (!string.IsNullOrWhiteSpace(password))
+                        {
+                            credentials.Add(new UnetCredential(username.Trim(), password));
+                        }
+                    }
+                    finally
+                    {
+                        CryptographicOperations.ZeroMemory(clearPassword);
+                    }
+                }
+                finally
+                {
+                    CryptographicOperations.ZeroMemory(encryptedPassword);
+                }
+            }
+
+            return credentials;
+        }
+        catch (Exception exception) when (exception is
+            IOException or
+            UnauthorizedAccessException or
+            JsonException or
+            FormatException or
+            CryptographicException)
+        {
+            throw new InvalidOperationException("UNET credential storage could not be read.", exception);
+        }
+    }
+
+    private static string? ReadString(JsonElement parent, string propertyName)
+    {
+        if (!parent.TryGetProperty(propertyName, out JsonElement value) ||
+            value.ValueKind != JsonValueKind.String)
+        {
+            return null;
+        }
+
+        return value.GetString();
+    }
+}
+
+internal sealed class UnetBalanceReader
+{
+    private static readonly Uri LoginUri = new("https://my.unet.by/login");
+    private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);
+    private const string Currency = "BYN";
+    private readonly UnetCredentialStore _credentialStore = new();
+
+    public string CredentialsPath => _credentialStore.CredentialsPath;
+
+    public UnetBalanceReadResult ReadLatestSnapshot()
+    {
+        try
+        {
+            IReadOnlyList<UnetCredential> credentials = _credentialStore.Load();
+            if (credentials.Count == 0)
+            {
+                throw new InvalidOperationException($"No UNET credentials were found at {CredentialsPath}.");
+            }
+
+            List<UnetAccountBalance> accounts = [];
+            foreach (UnetCredential credential in credentials)
+            {
+                try
+                {
+                    decimal balance = ReadAccountBalance(credential);
+                    accounts.Add(new UnetAccountBalance(credential.Username, balance, Currency, true, null));
+                }
+                catch (Exception exception) when (IsAccountReadFailure(exception))
+                {
+                    accounts.Add(new UnetAccountBalance(
+                        credential.Username,
+                        null,
+                        Currency,
+                        false,
+                        GetSafeErrorMessage(exception)));
+                }
+            }
+
+            return new UnetBalanceReadResult(
+                new UnetBalanceSnapshot(accounts, DateTimeOffset.UtcNow),
+                null);
+        }
+        catch (Exception exception) when (exception is
+            HttpRequestException or
+            TaskCanceledException or
+            IOException or
+            JsonException or
+            InvalidOperationException or
+            UnauthorizedAccessException or
+            FormatException or
+            CryptographicException)
+        {
+            return new UnetBalanceReadResult(null, GetSafeErrorMessage(exception));
+        }
+    }
+
+    private static decimal ReadAccountBalance(UnetCredential credential)
+    {
+        using HttpClientHandler handler = new()
+        {
+            AllowAutoRedirect = true,
+            UseCookies = true,
+            CookieContainer = new CookieContainer()
+        };
+        using HttpClient client = new(handler)
+        {
+            Timeout = RequestTimeout
+        };
+        client.DefaultRequestHeaders.Accept.ParseAdd("text/html,application/xhtml+xml");
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("limits/1.3");
+
+        using HttpRequestMessage pageRequest = new(HttpMethod.Get, LoginUri);
+        using HttpResponseMessage pageResponse = client.Send(pageRequest);
+        if (!pageResponse.IsSuccessStatusCode)
+        {
+            throw new HttpRequestException($"UNET login page returned HTTP {(int)pageResponse.StatusCode}.");
+        }
+
+        string loginHtml = pageResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        string csrfToken = ReadInputValue(loginHtml, "_csrf_token")
+            ?? throw new InvalidOperationException("UNET login form did not include a CSRF token.");
+
+        using FormUrlEncodedContent form = new(new Dictionary<string, string>
+        {
+            ["username"] = credential.Username,
+            ["password"] = credential.Password,
+            ["_csrf_token"] = csrfToken
+        });
+        using HttpRequestMessage loginRequest = new(HttpMethod.Post, LoginUri)
+        {
+            Content = form
+        };
+        loginRequest.Headers.Referrer = LoginUri;
+
+        using HttpResponseMessage accountResponse = client.Send(loginRequest);
+        if (!accountResponse.IsSuccessStatusCode)
+        {
+            throw new HttpRequestException($"UNET login returned HTTP {(int)accountResponse.StatusCode}.");
+        }
+
+        string accountHtml = accountResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        return ParseBalance(accountHtml);
+    }
+
+    private static decimal ParseBalance(string html)
+    {
+        int balanceLabelIndex = html.IndexOf("Текущий баланс", StringComparison.OrdinalIgnoreCase);
+        if (balanceLabelIndex < 0)
+        {
+            throw new InvalidOperationException("UNET login was not accepted or the balance row changed.");
+        }
+
+        int rowEnd = html.IndexOf("</tr>", balanceLabelIndex, StringComparison.OrdinalIgnoreCase);
+        int spanStart = html.IndexOf("<span", balanceLabelIndex, StringComparison.OrdinalIgnoreCase);
+        if (rowEnd < 0 || spanStart < 0 || spanStart >= rowEnd)
+        {
+            throw new InvalidOperationException("UNET balance value was not found.");
+        }
+
+        int spanEnd = html.IndexOf('>', spanStart);
+        if (spanEnd < 0 || spanEnd >= rowEnd)
+        {
+            throw new InvalidOperationException("UNET balance value was not found.");
+        }
+
+        string? balanceText = ReadAttribute(html[spanStart..(spanEnd + 1)], "title");
+        if (decimal.TryParse(balanceText, NumberStyles.Number, CultureInfo.InvariantCulture, out decimal balance))
+        {
+            return balance;
+        }
+
+        throw new InvalidOperationException("UNET balance value was invalid.");
+    }
+
+    private static string? ReadInputValue(string html, string inputName)
+    {
+        int searchIndex = 0;
+        while (searchIndex < html.Length)
+        {
+            int inputStart = html.IndexOf("<input", searchIndex, StringComparison.OrdinalIgnoreCase);
+            if (inputStart < 0)
+            {
+                return null;
+            }
+
+            int inputEnd = html.IndexOf('>', inputStart);
+            if (inputEnd < 0)
+            {
+                return null;
+            }
+
+            string inputTag = html[inputStart..(inputEnd + 1)];
+            if (string.Equals(ReadAttribute(inputTag, "name"), inputName, StringComparison.OrdinalIgnoreCase))
+            {
+                return ReadAttribute(inputTag, "value");
+            }
+
+            searchIndex = inputEnd + 1;
+        }
+
+        return null;
+    }
+
+    private static string? ReadAttribute(string tag, string attributeName)
+    {
+        int searchIndex = 0;
+        while (searchIndex < tag.Length)
+        {
+            int attributeStart = tag.IndexOf(attributeName, searchIndex, StringComparison.OrdinalIgnoreCase);
+            if (attributeStart < 0)
+            {
+                return null;
+            }
+
+            int attributeEnd = attributeStart + attributeName.Length;
+            bool validStart = attributeStart == 0 || !IsAttributeNameCharacter(tag[attributeStart - 1]);
+            bool validEnd = attributeEnd >= tag.Length || !IsAttributeNameCharacter(tag[attributeEnd]);
+            if (!validStart || !validEnd)
+            {
+                searchIndex = attributeEnd;
+                continue;
+            }
+
+            int equalsIndex = attributeEnd;
+            while (equalsIndex < tag.Length && char.IsWhiteSpace(tag[equalsIndex]))
+            {
+                equalsIndex++;
+            }
+
+            if (equalsIndex >= tag.Length || tag[equalsIndex] != '=')
+            {
+                searchIndex = attributeEnd;
+                continue;
+            }
+
+            int valueStart = equalsIndex + 1;
+            while (valueStart < tag.Length && char.IsWhiteSpace(tag[valueStart]))
+            {
+                valueStart++;
+            }
+
+            if (valueStart >= tag.Length)
+            {
+                return null;
+            }
+
+            char quote = tag[valueStart];
+            if (quote is '"' or '\'')
+            {
+                int valueEnd = tag.IndexOf(quote, valueStart + 1);
+                return valueEnd < 0
+                    ? null
+                    : WebUtility.HtmlDecode(tag[(valueStart + 1)..valueEnd]);
+            }
+
+            int unquotedEnd = valueStart;
+            while (unquotedEnd < tag.Length && !char.IsWhiteSpace(tag[unquotedEnd]) && tag[unquotedEnd] != '>')
+            {
+                unquotedEnd++;
+            }
+
+            return WebUtility.HtmlDecode(tag[valueStart..unquotedEnd]);
+        }
+
+        return null;
+    }
+
+    private static bool IsAttributeNameCharacter(char value)
+    {
+        return char.IsLetterOrDigit(value) || value is '_' or '-' or ':';
+    }
+
+    private static bool IsAccountReadFailure(Exception exception)
+    {
+        return exception is
+            HttpRequestException or
+            TaskCanceledException or
+            IOException or
+            InvalidOperationException or
+            FormatException;
+    }
+
+    private static string GetSafeErrorMessage(Exception exception)
+    {
+        return exception switch
+        {
+            TaskCanceledException => "UNET request timed out.",
+            HttpRequestException => "UNET HTTP request failed.",
+            _ => "UNET login or balance parsing failed."
+        };
+    }
+}
+
+internal sealed class OpenCodeUsageReader
+{
+    private static readonly TimeSpan QueryTimeout = TimeSpan.FromSeconds(15);
+    private static readonly HttpClient GoHttpClient = new()
+    {
+        Timeout = TimeSpan.FromSeconds(20)
+    };
+    private const string GoUsageEndpoint = "https://opencode.ai/zen/go/v1/usage";
+
+    public string DataDirectoryPath { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".local",
+        "share",
+        "opencode");
+
+    public string DatabasePath => Path.Combine(DataDirectoryPath, "opencode.db");
+    public string AuthPath => Path.Combine(DataDirectoryPath, "auth.json");
+
+    public OpenCodeUsageReadResult ReadLatestSnapshot()
+    {
+        OpenCodeGoUsageReadResult goResult = ReadGoUsage();
+        try
+        {
+            if (!File.Exists(DatabasePath))
+            {
+                throw new InvalidOperationException($"OpenCode database was not found at {DatabasePath}.");
+            }
+
+            string executablePath = ResolveOpenCodeExecutable()
+                ?? throw new InvalidOperationException("The OpenCode executable was not found on PATH.");
+            DateTimeOffset windowStart = DateTimeOffset.UtcNow.AddDays(-1);
+            string query = $"SELECT COUNT(*) AS session_count, " +
+                           "COALESCE(SUM(tokens_input), 0) AS input_tokens, " +
+                           "COALESCE(SUM(tokens_output), 0) AS output_tokens, " +
+                           "COALESCE(SUM(tokens_reasoning), 0) AS reasoning_tokens, " +
+                           "COALESCE(SUM(tokens_cache_read), 0) AS cache_read_tokens, " +
+                           "COALESCE(SUM(tokens_cache_write), 0) AS cache_write_tokens, " +
+                           "COALESCE(SUM(cost), 0) AS cost, " +
+                           "MAX(time_updated) AS latest_activity_at " +
+                           "FROM session " +
+                           $"WHERE time_updated >= {windowStart.ToUnixTimeMilliseconds()}";
+
+            string response = RunDatabaseQuery(executablePath, query);
+            OpenCodeUsageSnapshot snapshot = ParseSnapshot(response, windowStart);
+            return new OpenCodeUsageReadResult(snapshot, goResult.Snapshot, goResult.ErrorMessage, null);
+        }
+        catch (Exception exception)
+        {
+            return new OpenCodeUsageReadResult(
+                null,
+                goResult.Snapshot,
+                goResult.ErrorMessage,
+                exception.Message);
+        }
+    }
+
+    private OpenCodeGoUsageReadResult ReadGoUsage()
+    {
+        try
+        {
+            if (!File.Exists(AuthPath))
+            {
+                throw new InvalidOperationException("OpenCode Go credentials were not found.");
+            }
+
+            string apiKey = ReadGoApiKey();
+            using HttpRequestMessage request = new(HttpMethod.Get, GoUsageEndpoint);
+            request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
+            request.Headers.TryAddWithoutValidation("Accept", "application/json");
+            request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.4");
+
+            using HttpResponseMessage response = GoHttpClient.Send(request);
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new HttpRequestException(
+                    $"OpenCode Go usage request failed with HTTP {(int)response.StatusCode}.");
+            }
+
+            string responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            return new OpenCodeGoUsageReadResult(ParseGoUsageResponse(responseBody), null);
+        }
+        catch (TaskCanceledException)
+        {
+            return new OpenCodeGoUsageReadResult(null, "OpenCode Go quota request timed out.");
+        }
+        catch (HttpRequestException)
+        {
+            return new OpenCodeGoUsageReadResult(null, "OpenCode Go quota request failed.");
+        }
+        catch (JsonException)
+        {
+            return new OpenCodeGoUsageReadResult(null, "OpenCode Go quota response was invalid.");
+        }
+        catch (InvalidOperationException exception)
+        {
+            return new OpenCodeGoUsageReadResult(null, exception.Message);
+        }
+        catch (IOException)
+        {
+            return new OpenCodeGoUsageReadResult(null, "OpenCode Go credentials could not be read.");
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return new OpenCodeGoUsageReadResult(null, "OpenCode Go credentials could not be read.");
+        }
+        catch (FormatException)
+        {
+            return new OpenCodeGoUsageReadResult(null, "OpenCode Go quota response was invalid.");
+        }
+        catch (Exception)
+        {
+            return new OpenCodeGoUsageReadResult(null, "OpenCode Go quota is unavailable.");
+        }
+    }
+
+    private string ReadGoApiKey()
+    {
+        using FileStream stream = new(
+            AuthPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        using JsonDocument document = JsonDocument.Parse(stream);
+        JsonElement root = document.RootElement;
+        if (!root.TryGetProperty("opencode-go", out JsonElement provider) ||
+            provider.ValueKind != JsonValueKind.Object ||
+            !provider.TryGetProperty("key", out JsonElement keyElement) ||
+            keyElement.ValueKind != JsonValueKind.String ||
+            string.IsNullOrWhiteSpace(keyElement.GetString()))
+        {
+            throw new InvalidOperationException("OpenCode Go API key was not found.");
+        }
+
+        return keyElement.GetString()!;
+    }
+
+    private static OpenCodeGoUsageSnapshot ParseGoUsageResponse(string responseBody)
+    {
+        using JsonDocument document = JsonDocument.Parse(responseBody);
+        JsonElement root = document.RootElement;
+        if (!root.TryGetProperty("usage", out JsonElement usage) ||
+            usage.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException("OpenCode Go quota response did not include usage.");
+        }
+
+        return new OpenCodeGoUsageSnapshot(
+            DateTimeOffset.UtcNow,
+            ParseGoUsageWindow(usage, "rolling"),
+            ParseGoUsageWindow(usage, "weekly"),
+            ParseGoUsageWindow(usage, "monthly"),
+            GoUsageEndpoint);
+    }
+
+    private static OpenCodeGoUsageWindow ParseGoUsageWindow(JsonElement usage, string windowName)
+    {
+        if (!usage.TryGetProperty(windowName, out JsonElement window) ||
+            window.ValueKind != JsonValueKind.Object ||
+            !window.TryGetProperty("percent", out JsonElement percentElement) ||
+            !percentElement.TryGetDouble(out double usedPercent) ||
+            !double.IsFinite(usedPercent))
+        {
+            throw new InvalidOperationException($"OpenCode Go quota did not include {windowName} usage.");
+        }
+
+        string status = window.TryGetProperty("status", out JsonElement statusElement) &&
+                        statusElement.ValueKind == JsonValueKind.String &&
+                        !string.IsNullOrWhiteSpace(statusElement.GetString())
+            ? statusElement.GetString()!
+            : "unknown";
+        DateTimeOffset? resetAt = null;
+        if (window.TryGetProperty("resetsAt", out JsonElement resetAtElement) &&
+            resetAtElement.ValueKind == JsonValueKind.String &&
+            DateTimeOffset.TryParse(
+                resetAtElement.GetString(),
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.RoundtripKind,
+                out DateTimeOffset parsedResetAt))
+        {
+            resetAt = parsedResetAt;
+        }
+
+        return new OpenCodeGoUsageWindow(
+            status,
+            Math.Clamp(usedPercent, 0d, 100d),
+            resetAt);
+    }
+
+    private static string? ResolveOpenCodeExecutable()
+    {
+        List<string> candidates = [];
+
+        string? configuredPath = Environment.GetEnvironmentVariable("OPENCODE_BIN");
+        if (!string.IsNullOrWhiteSpace(configuredPath))
+        {
+            candidates.Add(configuredPath.Trim().Trim('"'));
+        }
+
+        string? pathValue = Environment.GetEnvironmentVariable("PATH");
+        if (!string.IsNullOrWhiteSpace(pathValue))
+        {
+            foreach (string pathEntry in pathValue.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string directory = pathEntry.Trim().Trim('"');
+                if (directory.Length == 0)
+                {
+                    continue;
+                }
+
+                candidates.Add(Path.Combine(directory, "opencode.exe"));
+                candidates.Add(Path.Combine(directory, "node_modules", "opencode-ai", "bin", "opencode.exe"));
+            }
+        }
+
+        candidates.Add(Path.Combine(
+            "C:\\Programs",
+            "nodejs",
+            "node_modules",
+            "opencode-ai",
+            "bin",
+            "opencode.exe"));
+
+        return candidates
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault(File.Exists);
+    }
+
+    private static string RunDatabaseQuery(string executablePath, string query)
+    {
+        using Process process = new();
+        process.StartInfo = new ProcessStartInfo
+        {
+            FileName = executablePath,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+        };
+        process.StartInfo.ArgumentList.Add("db");
+        process.StartInfo.ArgumentList.Add("--format");
+        process.StartInfo.ArgumentList.Add("json");
+        process.StartInfo.ArgumentList.Add(query);
+
+        if (!process.Start())
+        {
+            throw new InvalidOperationException("OpenCode database query could not be started.");
+        }
+
+        Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
+        Task<string> errorTask = process.StandardError.ReadToEndAsync();
+        if (!process.WaitForExit((int)QueryTimeout.TotalMilliseconds))
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch (InvalidOperationException)
+            {
+            }
+
+            throw new InvalidOperationException("OpenCode database query timed out.");
+        }
+
+        string output = outputTask.GetAwaiter().GetResult().Trim();
+        string error = errorTask.GetAwaiter().GetResult().Trim();
+        if (process.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                string.IsNullOrWhiteSpace(error)
+                    ? $"OpenCode database query failed with exit code {process.ExitCode}."
+                    : error);
+        }
+
+        if (output.Length == 0)
+        {
+            throw new InvalidOperationException("OpenCode database query returned no data.");
+        }
+
+        return output;
+    }
+
+    private static OpenCodeUsageSnapshot ParseSnapshot(string response, DateTimeOffset windowStart)
+    {
+        using JsonDocument document = JsonDocument.Parse(response);
+        JsonElement root = document.RootElement;
+        if (root.ValueKind != JsonValueKind.Array || root.GetArrayLength() == 0)
+        {
+            throw new InvalidOperationException("OpenCode database query returned an invalid result.");
+        }
+
+        JsonElement row = root[0];
+        long? latestActivityMilliseconds = ReadNullableInt64(row, "latest_activity_at");
+        DateTimeOffset? latestActivityAt = latestActivityMilliseconds is null
+            ? null
+            : DateTimeOffset.FromUnixTimeMilliseconds(latestActivityMilliseconds.Value).ToLocalTime();
+
+        return new OpenCodeUsageSnapshot(
+            ReadInt64(row, "session_count"),
+            ReadInt64(row, "input_tokens"),
+            ReadInt64(row, "output_tokens"),
+            ReadInt64(row, "reasoning_tokens"),
+            ReadInt64(row, "cache_read_tokens"),
+            ReadInt64(row, "cache_write_tokens"),
+            ReadDecimal(row, "cost"),
+            DateTimeOffset.UtcNow,
+            windowStart,
+            latestActivityAt,
+            Path.Combine(DataDirectoryPathForSource(), "opencode.db"));
+    }
+
+    private static string DataDirectoryPathForSource()
+    {
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".local",
+            "share",
+            "opencode");
+    }
+
+    private static long ReadInt64(JsonElement parent, string propertyName)
+    {
+        long? value = ReadNullableInt64(parent, propertyName);
+        return value ?? throw new InvalidOperationException($"OpenCode result did not include {propertyName}.");
+    }
+
+    private static long? ReadNullableInt64(JsonElement parent, string propertyName)
+    {
+        if (!parent.TryGetProperty(propertyName, out JsonElement element) ||
+            element.ValueKind == JsonValueKind.Null)
+        {
+            return null;
+        }
+
+        if (element.ValueKind == JsonValueKind.Number && element.TryGetInt64(out long numericValue))
+        {
+            return numericValue;
+        }
+
+        if (element.ValueKind == JsonValueKind.String &&
+            long.TryParse(element.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out long stringValue))
+        {
+            return stringValue;
+        }
+
+        throw new InvalidOperationException($"OpenCode result has an invalid {propertyName}.");
+    }
+
+    private static decimal ReadDecimal(JsonElement parent, string propertyName)
+    {
+        if (!parent.TryGetProperty(propertyName, out JsonElement element))
+        {
+            throw new InvalidOperationException($"OpenCode result did not include {propertyName}.");
+        }
+
+        if (element.ValueKind == JsonValueKind.Number && element.TryGetDecimal(out decimal numericValue))
+        {
+            return numericValue;
+        }
+
+        if (element.ValueKind == JsonValueKind.String &&
+            decimal.TryParse(element.GetString(), NumberStyles.Number, CultureInfo.InvariantCulture, out decimal stringValue))
+        {
+            return stringValue;
+        }
+
+        throw new InvalidOperationException($"OpenCode result has an invalid {propertyName}.");
+    }
+}
+
+internal sealed record HardwareSnapshot(
+    double? CpuTemperatureC,
+    double? GpuTemperatureC,
+    double? CpuUsagePercent,
+    double? GpuUsagePercent,
+    string? GpuName,
+    DateTimeOffset Timestamp,
+    string SourceDescription);
+
+internal sealed record HardwareReadResult(HardwareSnapshot? Snapshot, string? ErrorMessage);
+
+internal sealed class HardwareMonitor
+{
+    private static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(10);
+    private readonly AmdPackageTemperatureReader _amdPackageTemperatureReader = new();
+    private CpuTimeSample? _lastCpuTimeSample;
+
+    public string SourceDescription =>
+        "GetSystemTimes + AMD Ryzen Master package sensor + nvidia-smi";
+
+    public HardwareReadResult ReadSnapshot()
+    {
+        try
+        {
+            NvidiaSnapshot gpu = ReadNvidiaSnapshot();
+            return new HardwareReadResult(
+                new HardwareSnapshot(
+                    ReadCpuTemperature(),
+                    gpu.TemperatureC,
+                    ReadCpuUsagePercent(),
+                    gpu.UtilizationPercent,
+                    gpu.Name,
+                    DateTimeOffset.UtcNow,
+                    SourceDescription),
+                null);
+        }
+        catch (Exception exception)
+        {
+            return new HardwareReadResult(null, exception.Message);
+        }
+    }
+
+    public void Dispose()
+    {
+        _amdPackageTemperatureReader.Dispose();
+    }
+
+    private double? ReadCpuTemperature()
+    {
+        return _amdPackageTemperatureReader.ReadTemperature();
+    }
+
+    private double? ReadCpuUsagePercent()
+    {
+        if (!NativeMethods.GetSystemTimes(
+                out NativeMethods.SYSTEM_FILETIME idleTime,
+                out NativeMethods.SYSTEM_FILETIME kernelTime,
+                out NativeMethods.SYSTEM_FILETIME userTime))
+        {
+            return null;
+        }
+
+        CpuTimeSample current = new(
+            idleTime.ToInt64(),
+            kernelTime.ToInt64(),
+            userTime.ToInt64());
+        CpuTimeSample? previous = _lastCpuTimeSample;
+        _lastCpuTimeSample = current;
+        if (previous is null)
+        {
+            return null;
+        }
+
+        long idleDelta = current.IdleTicks - previous.Value.IdleTicks;
+        long kernelDelta = current.KernelTicks - previous.Value.KernelTicks;
+        long userDelta = current.UserTicks - previous.Value.UserTicks;
+        long totalDelta = kernelDelta + userDelta;
+        if (idleDelta < 0 || totalDelta <= 0)
+        {
+            return null;
+        }
+
+        long busyDelta = Math.Max(0, totalDelta - idleDelta);
+        return Math.Clamp(busyDelta * 100d / totalDelta, 0d, 100d);
+    }
+
+    private static NvidiaSnapshot ReadNvidiaSnapshot()
+    {
+        string? nvidiaSmiPath = ResolveToolPath("nvidia-smi.exe");
+        if (nvidiaSmiPath is null)
+        {
+            return NvidiaSnapshot.Empty;
+        }
+
+        try
+        {
+            string output = RunProcess(
+                nvidiaSmiPath,
+                [
+                    "--query-gpu=name,temperature.gpu,utilization.gpu,memory.total,memory.free",
+                    "--format=csv,noheader,nounits"
+                ]);
+            List<NvidiaGpu> gpus = [];
+            foreach (string line in output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
+            {
+                string[] fields = line.Split(',');
+                if (fields.Length < 5)
+                {
+                    continue;
+                }
+
+                int temperatureIndex = fields.Length - 4;
+                double? gpuTemperature = TryParseDouble(fields[temperatureIndex]);
+                double? gpuUtilization = TryParseDouble(fields[temperatureIndex + 1]);
+                long? totalBytes = TryParseMebibytes(fields[temperatureIndex + 2]);
+                long? availableBytes = TryParseMebibytes(fields[temperatureIndex + 3]);
+                if (gpuTemperature is null && gpuUtilization is null &&
+                    totalBytes is null && availableBytes is null)
+                {
+                    continue;
+                }
+
+                string gpuName = string.Join(",", fields[..temperatureIndex]).Trim();
+                gpus.Add(new NvidiaGpu(
+                    gpuName,
+                    gpuTemperature,
+                    gpuUtilization,
+                    totalBytes,
+                    availableBytes));
+            }
+
+            if (gpus.Count == 0)
+            {
+                return NvidiaSnapshot.Empty;
+            }
+
+            long? total = SumNullable(gpus.Select(gpu => gpu.TotalBytes));
+            long? available = SumNullable(gpus.Select(gpu => gpu.AvailableBytes));
+            double? maxTemperature = gpus
+                .Where(gpu => gpu.TemperatureC is not null)
+                .Select(gpu => gpu.TemperatureC!.Value)
+                .Select(value => (double?)value)
+                .DefaultIfEmpty()
+                .Max();
+            double? maxUtilization = gpus
+                .Where(gpu => gpu.UtilizationPercent is not null)
+                .Select(gpu => gpu.UtilizationPercent!.Value)
+                .Select(value => (double?)value)
+                .DefaultIfEmpty()
+                .Max();
+            string gpuDisplayName = gpus.Count == 1
+                ? gpus[0].Name
+                : $"NVIDIA GPUs ({gpus.Count})";
+            return new NvidiaSnapshot(
+                string.IsNullOrWhiteSpace(gpuDisplayName) ? "NVIDIA GPU" : gpuDisplayName,
+                maxTemperature,
+                maxUtilization,
+                total,
+                available);
+        }
+        catch (Exception)
+        {
+            return NvidiaSnapshot.Empty;
+        }
+    }
+
+    private static string? ResolveToolPath(string fileName)
+    {
+        List<string> candidates = [];
+        string? systemRoot = Environment.GetEnvironmentVariable("SystemRoot");
+        if (!string.IsNullOrWhiteSpace(systemRoot))
+        {
+            candidates.Add(Path.Combine(systemRoot, "System32", fileName));
+        }
+
+        string? pathValue = Environment.GetEnvironmentVariable("PATH");
+        if (!string.IsNullOrWhiteSpace(pathValue))
+        {
+            foreach (string pathEntry in pathValue.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string directory = pathEntry.Trim().Trim('"');
+                if (directory.Length > 0)
+                {
+                    candidates.Add(Path.Combine(directory, fileName));
+                }
+            }
+        }
+
+        candidates.Add(Path.Combine("C:\\Windows", "System32", fileName));
+        return candidates
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault(File.Exists);
+    }
+
+    private static string RunProcess(string fileName, IReadOnlyList<string> arguments)
+    {
+        using Process process = new();
+        process.StartInfo = new ProcessStartInfo
+        {
+            FileName = fileName,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+        };
+        foreach (string argument in arguments)
+        {
+            process.StartInfo.ArgumentList.Add(argument);
+        }
+
+        if (!process.Start())
+        {
+            throw new InvalidOperationException($"Could not start {fileName}.");
+        }
+
+        Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
+        Task<string> errorTask = process.StandardError.ReadToEndAsync();
+        if (!process.WaitForExit((int)CommandTimeout.TotalMilliseconds))
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch (InvalidOperationException)
+            {
+            }
+
+            throw new InvalidOperationException($"{Path.GetFileName(fileName)} timed out.");
+        }
+
+        string output = outputTask.GetAwaiter().GetResult();
+        string error = errorTask.GetAwaiter().GetResult().Trim();
+        if (process.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                string.IsNullOrWhiteSpace(error)
+                    ? $"{Path.GetFileName(fileName)} failed with exit code {process.ExitCode}."
+                    : error);
+        }
+
+        return output;
+    }
+
+    private static double? TryParseDouble(string value)
+    {
+        return double.TryParse(
+            value.Trim(),
+            NumberStyles.Float,
+            CultureInfo.InvariantCulture,
+            out double result)
+            ? result
+            : null;
+    }
+
+    private static long? TryParseMebibytes(string value)
+    {
+        double? mebibytes = TryParseDouble(value);
+        if (mebibytes is null || !double.IsFinite(mebibytes.Value) || mebibytes < 0)
+        {
+            return null;
+        }
+
+        double bytes = mebibytes.Value * 1024d * 1024d;
+        return bytes > long.MaxValue ? null : (long)Math.Round(bytes);
+    }
+
+    private static long? SumNullable(IEnumerable<long?> values)
+    {
+        long total = 0;
+        bool hasValue = false;
+        foreach (long? value in values)
+        {
+            if (value is null)
+            {
+                continue;
+            }
+
+            hasValue = true;
+            total = checked(total + value.Value);
+        }
+
+        return hasValue ? total : null;
+    }
+
+    private sealed record NvidiaGpu(
+        string Name,
+        double? TemperatureC,
+        double? UtilizationPercent,
+        long? TotalBytes,
+        long? AvailableBytes);
+
+    private sealed record NvidiaSnapshot(
+        string? Name,
+        double? TemperatureC,
+        double? UtilizationPercent,
+        long? TotalBytes,
+        long? AvailableBytes)
+    {
+        public static NvidiaSnapshot Empty => new(null, null, null, null, null);
+    }
+
+    private readonly record struct CpuTimeSample(
+        long IdleTicks,
+        long KernelTicks,
+        long UserTicks);
+}
+
+internal sealed class AmdPackageTemperatureReader : IDisposable
+{
+    private const int ParameterBufferSize = 0x400;
+    private const int TemperatureOffset = 0x78;
+    private readonly object _sync = new();
+    private IntPtr _module;
+    private IntPtr _platform;
+    private AmdGetRmCpuParametersDelegate? _getRmCpuParameters;
+    private bool _initializationAttempted;
+    private bool _initialized;
+
+    public double? ReadTemperature()
+    {
+        lock (_sync)
+        {
+            try
+            {
+                if (!EnsureInitialized())
+                {
+                    return null;
+                }
+
+                IntPtr buffer = Marshal.AllocHGlobal(ParameterBufferSize);
+                try
+                {
+                    byte[] zeroes = new byte[ParameterBufferSize];
+                    Marshal.Copy(zeroes, 0, buffer, zeroes.Length);
+                    if (_getRmCpuParameters!(buffer) != 0)
+                    {
+                        return null;
+                    }
+
+                    byte[] result = new byte[ParameterBufferSize];
+                    Marshal.Copy(buffer, result, 0, result.Length);
+                    double temperature = BitConverter.ToDouble(result, TemperatureOffset);
+                    return double.IsFinite(temperature) && temperature > 1d && temperature <= 150d
+                        ? temperature
+                        : null;
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(buffer);
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_sync)
+        {
+            if (_module != IntPtr.Zero)
+            {
+                NativeLibrary.Free(_module);
+                _module = IntPtr.Zero;
+            }
+
+            _platform = IntPtr.Zero;
+            _getRmCpuParameters = null;
+            _initialized = false;
+        }
+    }
+
+    private bool EnsureInitialized()
+    {
+        if (_initialized)
+        {
+            return true;
+        }
+
+        if (_initializationAttempted)
+        {
+            return false;
+        }
+
+        _initializationAttempted = true;
+        foreach (string path in GetPlatformPaths())
+        {
+            if (!File.Exists(path))
+            {
+                continue;
+            }
+
+            try
+            {
+                _module = NativeLibrary.Load(path);
+                IntPtr getPlatformAddress = NativeLibrary.GetExport(_module, "GetPlatform");
+                IntPtr getParametersAddress = NativeLibrary.GetExport(_module, "GetRmCpuParameters");
+                AmdGetPlatformDelegate getPlatform =
+                    Marshal.GetDelegateForFunctionPointer<AmdGetPlatformDelegate>(getPlatformAddress);
+                _getRmCpuParameters =
+                    Marshal.GetDelegateForFunctionPointer<AmdGetRmCpuParametersDelegate>(getParametersAddress);
+                _platform = getPlatform();
+                if (_platform == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException("AMD platform initialization returned no platform.");
+                }
+
+                IntPtr vtable = Marshal.ReadIntPtr(_platform);
+                if (vtable == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException("AMD platform vtable was unavailable.");
+                }
+
+                AmdPlatformInitDelegate init = Marshal.GetDelegateForFunctionPointer<AmdPlatformInitDelegate>(
+                    Marshal.ReadIntPtr(vtable, IntPtr.Size));
+                if (init(_platform) == 0)
+                {
+                    throw new InvalidOperationException("AMD platform initialization failed.");
+                }
+
+                _initialized = true;
+                return true;
+            }
+            catch
+            {
+                if (_module != IntPtr.Zero)
+                {
+                    NativeLibrary.Free(_module);
+                    _module = IntPtr.Zero;
+                }
+
+                _platform = IntPtr.Zero;
+                _getRmCpuParameters = null;
+            }
+        }
+
+        return false;
+    }
+
+    private static IEnumerable<string> GetPlatformPaths()
+    {
+        HashSet<string> paths = new(StringComparer.OrdinalIgnoreCase);
+        string[] programFiles =
+        [
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86)
+        ];
+
+        foreach (string root in programFiles)
+        {
+            if (!string.IsNullOrWhiteSpace(root))
+            {
+                paths.Add(Path.Combine(root, "AMD", "RyzenMaster", "bin", "Platform.dll"));
+            }
+        }
+
+        foreach (string path in paths)
+        {
+            yield return path;
+        }
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate IntPtr AmdGetPlatformDelegate();
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int AmdGetRmCpuParametersDelegate(IntPtr output);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate byte AmdPlatformInitDelegate(IntPtr self);
+}
+
+internal sealed record TrayIconSettings(
+    bool Codex,
+    bool Claude,
+    bool Kimi,
+    bool DeepSeek,
+    bool Disk,
+    bool OpenCode,
+    bool Temperature,
+    bool CpuGpuLoad)
+{
+    public static TrayIconSettings Default => new(
+        Codex: false,
+        Claude: false,
+        Kimi: false,
+        DeepSeek: false,
+        Disk: true,
+        OpenCode: true,
+        Temperature: false,
+        CpuGpuLoad: true);
+
+    public bool IsVisible(TrayIconKind iconKind)
+    {
+        return iconKind switch
+        {
+            TrayIconKind.Claude => Claude,
+            TrayIconKind.Kimi => Kimi,
+            TrayIconKind.DeepSeek => DeepSeek,
+            TrayIconKind.Disk => Disk,
+            TrayIconKind.OpenCode => OpenCode,
+            TrayIconKind.Temperature => Temperature,
+            TrayIconKind.CpuGpuLoad => true,
+            _ => Codex
+        };
+    }
+
+    public TrayIconSettings Toggle(TrayIconKind iconKind)
+    {
+        return iconKind switch
+        {
+            TrayIconKind.Claude => this with { Claude = !Claude },
+            TrayIconKind.Kimi => this with { Kimi = !Kimi },
+            TrayIconKind.DeepSeek => this with { DeepSeek = !DeepSeek },
+            TrayIconKind.Disk => this with { Disk = !Disk },
+            TrayIconKind.OpenCode => this with { OpenCode = !OpenCode },
+            TrayIconKind.Temperature => this with { Temperature = !Temperature },
+            TrayIconKind.CpuGpuLoad => this with { CpuGpuLoad = true },
+            _ => this with { Codex = !Codex }
+        };
+    }
+}
+
+internal sealed class TrayIconSettingsStore
+{
+    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+
+    public string SettingsPath { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "limits",
+        "icon-settings.json");
+
+    public TrayIconSettings Load()
+    {
+        if (!File.Exists(SettingsPath))
+        {
+            return TrayIconSettings.Default;
+        }
+
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(File.ReadAllText(SettingsPath));
+            JsonElement root = document.RootElement;
+            TrayIconSettings defaults = TrayIconSettings.Default;
+            return new TrayIconSettings(
+                Codex: ReadBoolean(root, "codex", defaults.Codex),
+                Claude: ReadBoolean(root, "claude", defaults.Claude),
+                Kimi: ReadBoolean(root, "kimi", defaults.Kimi),
+                DeepSeek: ReadBoolean(root, "deepSeek", defaults.DeepSeek),
+                Disk: ReadBoolean(root, "disk", defaults.Disk),
+                OpenCode: ReadBoolean(root, "openCode", defaults.OpenCode),
+                Temperature: ReadBoolean(root, "temperature", defaults.Temperature),
+                CpuGpuLoad: true);
+        }
+        catch (Exception)
+        {
+            return TrayIconSettings.Default;
+        }
+    }
+
+    public void Save(TrayIconSettings settings)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
+        JsonObject root = new()
+        {
+            ["codex"] = settings.Codex,
+            ["claude"] = settings.Claude,
+            ["kimi"] = settings.Kimi,
+            ["deepSeek"] = settings.DeepSeek,
+            ["disk"] = settings.Disk,
+            ["openCode"] = settings.OpenCode,
+            ["temperature"] = settings.Temperature,
+            ["cpuGpuLoad"] = true
+        };
+        File.WriteAllText(SettingsPath, root.ToJsonString(JsonOptions) + Environment.NewLine);
+    }
+
+    private static bool ReadBoolean(JsonElement root, string propertyName, bool fallback)
+    {
+        return root.TryGetProperty(propertyName, out JsonElement value) &&
+               (value.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            ? value.GetBoolean()
+            : fallback;
+    }
+}
+
+internal sealed record DiskDriveSetting(string DriveLetter, double RedLimitGb)
+{
+    public long RedLimitBytes => DiskMonitor.GigabytesToBytes(RedLimitGb);
+}
+
+internal sealed record DiskMonitorSettings(IReadOnlyList<DiskDriveSetting> Drives)
+{
+    public static DiskMonitorSettings Default => new(
+    [
+        new DiskDriveSetting("C", 5),
+        new DiskDriveSetting("D", 5)
+    ]);
+
+    public static DiskMonitorSettings Normalize(IEnumerable<DiskDriveSetting> drives)
+    {
+        Dictionary<string, DiskDriveSetting> normalized = new(StringComparer.OrdinalIgnoreCase);
+        foreach (DiskDriveSetting drive in drives)
+        {
+            string driveLetter = drive.DriveLetter.Trim().TrimEnd(':').ToUpperInvariant();
+            if (driveLetter.Length != 1 || driveLetter[0] is < 'A' or > 'Z')
+            {
+                continue;
+            }
+
+            double redLimitGb = double.IsFinite(drive.RedLimitGb)
+                ? Math.Clamp(drive.RedLimitGb, 0, 1_000_000)
+                : 5;
+            normalized[driveLetter] = new DiskDriveSetting(driveLetter, redLimitGb);
+        }
+
+        return new DiskMonitorSettings(normalized.Values.OrderBy(drive => drive.DriveLetter).ToArray());
+    }
+}
+
+internal sealed class DiskMonitorSettingsStore
+{
+    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+
+    public string SettingsPath { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "limits",
+        "settings.json");
+
+    public DiskMonitorSettings Load()
+    {
+        if (!File.Exists(SettingsPath))
+        {
+            return DiskMonitorSettings.Default;
+        }
+
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(File.ReadAllText(SettingsPath));
+            JsonElement root = document.RootElement;
+            if (!root.TryGetProperty("drives", out JsonElement drives) ||
+                drives.ValueKind != JsonValueKind.Array)
+            {
+                return DiskMonitorSettings.Default;
+            }
+
+            List<DiskDriveSetting> settings = [];
+            foreach (JsonElement drive in drives.EnumerateArray())
+            {
+                if (drive.ValueKind != JsonValueKind.Object ||
+                    !drive.TryGetProperty("drive", out JsonElement driveElement) ||
+                    driveElement.ValueKind != JsonValueKind.String)
+                {
+                    continue;
+                }
+
+                string? driveLetter = driveElement.GetString();
+                if (string.IsNullOrWhiteSpace(driveLetter))
+                {
+                    continue;
+                }
+
+                double? redLimitGb = null;
+                if (drive.TryGetProperty("redLimitGb", out JsonElement limitElement))
+                {
+                    if (limitElement.ValueKind == JsonValueKind.Number && limitElement.TryGetDouble(out double numericLimit))
+                    {
+                        redLimitGb = numericLimit;
+                    }
+                    else if (limitElement.ValueKind == JsonValueKind.String &&
+                             double.TryParse(
+                                 limitElement.GetString(),
+                                 NumberStyles.Float,
+                                 CultureInfo.InvariantCulture,
+                                 out double stringLimit))
+                    {
+                        redLimitGb = stringLimit;
+                    }
+                }
+
+                settings.Add(new DiskDriveSetting(driveLetter.Trim(), redLimitGb ?? 5));
+            }
+
+            return DiskMonitorSettings.Normalize(settings);
+        }
+        catch (Exception)
+        {
+            return DiskMonitorSettings.Default;
+        }
+    }
+
+    public void Save(DiskMonitorSettings settings)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
+        JsonArray drives = new();
+        foreach (DiskDriveSetting drive in settings.Drives)
+        {
+            drives.Add((JsonNode)new JsonObject
+            {
+                ["drive"] = drive.DriveLetter,
+                ["redLimitGb"] = drive.RedLimitGb
+            });
+        }
+
+        JsonObject root = new() { ["drives"] = drives };
+        File.WriteAllText(SettingsPath, root.ToJsonString(JsonOptions) + Environment.NewLine);
+    }
+}
+
+internal sealed class DiskMonitor
+{
+    private readonly DiskMonitorSettingsStore _settingsStore = new();
+    private DiskMonitorSettings _settings;
+
+    public DiskMonitor()
+    {
+        _settings = _settingsStore.Load();
+    }
+
+    public string SettingsPath => _settingsStore.SettingsPath;
+
+    public DiskMonitorSettings Settings => Volatile.Read(ref _settings);
+
+    public void SaveSettings(DiskMonitorSettings settings)
+    {
+        DiskMonitorSettings normalized = DiskMonitorSettings.Normalize(settings.Drives);
+        _settingsStore.Save(normalized);
+        Volatile.Write(ref _settings, normalized);
+    }
+
+    public DiskSpaceSnapshot ReadSnapshot()
+    {
+        DiskMonitorSettings settings = Settings;
+        List<DiskSpaceStatus> drives = [];
+        foreach (DiskDriveSetting configuredDrive in settings.Drives)
+        {
+            try
+            {
+                DriveInfo drive = new($@"{configuredDrive.DriveLetter}:\");
+                if (!drive.IsReady)
+                {
+                    drives.Add(new DiskSpaceStatus(configuredDrive.DriveLetter, null, configuredDrive.RedLimitGb, "not ready"));
+                    continue;
+                }
+
+                drives.Add(new DiskSpaceStatus(
+                    configuredDrive.DriveLetter,
+                    drive.AvailableFreeSpace,
+                    configuredDrive.RedLimitGb,
+                    null));
+            }
+            catch (Exception exception)
+            {
+                drives.Add(new DiskSpaceStatus(
+                    configuredDrive.DriveLetter,
+                    null,
+                    configuredDrive.RedLimitGb,
+                    exception.Message));
+            }
+        }
+
+        return new DiskSpaceSnapshot(drives, DateTimeOffset.UtcNow);
+    }
+
+    public DiskSpaceSnapshot CreateErrorSnapshot(string error)
+    {
+        DiskMonitorSettings settings = Settings;
+        return new DiskSpaceSnapshot(
+            settings.Drives.Select(drive =>
+                new DiskSpaceStatus(drive.DriveLetter, null, drive.RedLimitGb, error)).ToArray(),
+            DateTimeOffset.UtcNow);
+    }
+
+    public static long GigabytesToBytes(double gigabytes)
+    {
+        double bytes = Math.Max(0, gigabytes) * 1024d * 1024d * 1024d;
+        return bytes >= long.MaxValue ? long.MaxValue : (long)Math.Round(bytes);
+    }
+
+    public static string FormatBytes(long bytes)
+    {
+        double gib = bytes / 1024d / 1024d / 1024d;
+        return $"{gib:0.##} GB";
+    }
+
+    public static string FormatGigabytes(double gigabytes)
+    {
+        return $"{gigabytes:0.##} GB";
+    }
+}
+
+internal sealed record DiskSpaceStatus(
+    string DriveLetter,
+    long? FreeBytes,
+    double RedLimitGb,
+    string? Error)
+{
+    public long RedLimitBytes => DiskMonitor.GigabytesToBytes(RedLimitGb);
+    public bool IsUnavailable => FreeBytes is null;
+    public bool IsLow => FreeBytes is { } freeBytes && freeBytes <= RedLimitBytes;
+    public bool IsLimitFailure => IsUnavailable || IsLow;
+}
+
+internal sealed record DiskSpaceSnapshot(IReadOnlyList<DiskSpaceStatus> Drives, DateTimeOffset CheckedAt)
+{
+    public bool HasSelectedDrives => Drives.Count > 0;
+    public bool HasLowDisk => Drives.Any(drive => drive.IsLimitFailure);
+    public bool HasUnavailableDrives => Drives.Any(drive => drive.IsUnavailable);
+    public bool IsHealthy => HasSelectedDrives && !HasUnavailableDrives && !HasLowDisk;
+    public string LowDriveLetters => string.Concat(Drives.Where(drive => drive.IsLow).Select(drive => drive.DriveLetter));
+    public string UnavailableDriveLetters => string.Concat(Drives.Where(drive => drive.IsUnavailable).Select(drive => drive.DriveLetter));
+    public string IconText => BuildIconText();
+
+    public string Summary => !HasSelectedDrives
+        ? "no disks selected"
+        : string.Join(", ", Drives.Select(drive => drive.FreeBytes is null
+            ? $"{drive.DriveLetter}: unavailable ({drive.Error ?? "unknown"})"
+            : $"{drive.DriveLetter}: {DiskMonitor.FormatBytes(drive.FreeBytes.Value)} free"));
+
+    public string LimitSummary => !HasSelectedDrives
+        ? "none"
+        : string.Join(", ", Drives.Select(drive =>
+            $"{drive.DriveLetter} <= {DiskMonitor.FormatGigabytes(drive.RedLimitGb)}"));
+
+    private string BuildIconText()
+    {
+        if (!HasSelectedDrives)
+        {
+            return "?";
+        }
+
+        if (!string.IsNullOrWhiteSpace(LowDriveLetters))
+        {
+            return FormatLetters(LowDriveLetters);
+        }
+
+        if (HasUnavailableDrives)
+        {
+            return "?";
+        }
+
+        return FormatLetters(string.Concat(Drives.Select(drive => drive.DriveLetter)));
+    }
+
+    private static string FormatLetters(string letters)
+    {
+        if (letters.Length <= 3)
+        {
+            return letters;
+        }
+
+        return $"{letters[..2]}+";
+    }
+}
+
 internal sealed class LimitWatchdog
 {
     private const double ThresholdRemainingPercent = 5.0d;
-    private const long MinimumFreeDiskBytes = 5L * 1024L * 1024L * 1024L;
-
-    private static readonly string[] DrivesToMonitor = ["C", "D"];
 
     private static readonly string PauseBatchPath =
         @"C:\Users\flcl\Desktop\Pause Strategy Hunt.bat";
@@ -3241,7 +6397,13 @@ internal sealed class LimitWatchdog
         "limits");
 
     private static readonly string LogPath = Path.Combine(AppDataPath, "limits.log");
+    private readonly DiskMonitor _diskMonitor;
     private string _state = "unknown";
+
+    public LimitWatchdog(DiskMonitor diskMonitor)
+    {
+        _diskMonitor = diskMonitor;
+    }
 
     public void Check(ClaudeUsageSnapshot? snapshot)
     {
@@ -3249,7 +6411,7 @@ internal sealed class LimitWatchdog
 
         string state = _state;
         LimitUsage? usage = snapshot is null ? null : LimitUsage.FromSnapshot(snapshot);
-        DiskSnapshot disk = ReadDiskSnapshot();
+        DiskSpaceSnapshot disk = _diskMonitor.ReadSnapshot();
 
         if (usage is null && !disk.HasLowDisk)
         {
@@ -3293,31 +6455,6 @@ internal sealed class LimitWatchdog
         }
 
         Log($"No action: state={state}, {FormatUsage(usage)}, disk {disk.Summary}.");
-    }
-
-    private static DiskSnapshot ReadDiskSnapshot()
-    {
-        List<DriveFreeSpace> drives = [];
-        foreach (string driveName in DrivesToMonitor)
-        {
-            try
-            {
-                DriveInfo drive = new($@"{driveName}:\");
-                if (!drive.IsReady)
-                {
-                    drives.Add(new DriveFreeSpace(driveName, null, "not ready"));
-                    continue;
-                }
-
-                drives.Add(new DriveFreeSpace(driveName, drive.AvailableFreeSpace, null));
-            }
-            catch (Exception exception)
-            {
-                drives.Add(new DriveFreeSpace(driveName, null, exception.Message));
-            }
-        }
-
-        return new DiskSnapshot(drives);
     }
 
     private static void StartBatch(string batchPath)
@@ -3364,12 +6501,6 @@ internal sealed class LimitWatchdog
             : $"5h left {usage.FiveHourRemainingPercent:0.##}%, weekly left {usage.WeeklyRemainingPercent:0.##}%";
     }
 
-    private static string FormatBytes(long bytes)
-    {
-        double gib = bytes / 1024d / 1024d / 1024d;
-        return $"{gib:0.##} GB";
-    }
-
     private sealed record LimitUsage(
         double FiveHourRemainingPercent,
         double WeeklyRemainingPercent,
@@ -3386,18 +6517,305 @@ internal sealed class LimitWatchdog
         }
     }
 
-    private sealed record DiskSnapshot(IReadOnlyList<DriveFreeSpace> Drives)
-    {
-        public bool HasLowDisk => Drives.Any(drive =>
-            drive.FreeBytes is null || drive.FreeBytes.Value < MinimumFreeDiskBytes);
+}
 
-        public string Summary => string.Join(", ", Drives.Select(drive =>
-            drive.FreeBytes is null
-                ? $"{drive.Name}: unavailable ({drive.Error ?? "unknown"})"
-                : $"{drive.Name}: {FormatBytes(drive.FreeBytes.Value)} free"));
+internal sealed class CounterWebSocketServer : IDisposable
+{
+    private const int Port = 31001;
+    private const string WebSocketPath = "/ws";
+    private const string WebSocketUrl = "ws://127.0.0.1:31001/ws";
+
+    private readonly HttpListener _listener = new();
+    private readonly CancellationTokenSource _cancellation = new();
+    private readonly object _sync = new();
+    private readonly List<ClientConnection> _clients = [];
+    private Task? _acceptTask;
+    private string _latestJson = "{}";
+    private bool _started;
+    private bool _disposed;
+
+    public void Start(string initialJson)
+    {
+        lock (_sync)
+        {
+            if (_started)
+            {
+                return;
+            }
+
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(CounterWebSocketServer));
+            }
+
+            _latestJson = initialJson;
+            _listener.Prefixes.Add($"http://127.0.0.1:{Port}/");
+            _listener.Prefixes.Add($"http://localhost:{Port}/");
+            _listener.Start();
+            _started = true;
+            _acceptTask = Task.Run(AcceptLoopAsync);
+        }
     }
 
-    private sealed record DriveFreeSpace(string Name, long? FreeBytes, string? Error);
+    public void Publish(string json)
+    {
+        ClientConnection[] clients;
+        lock (_sync)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _latestJson = json;
+            clients = _clients.ToArray();
+        }
+
+        if (clients.Length > 0)
+        {
+            _ = BroadcastAsync(json, clients);
+        }
+    }
+
+    public void Dispose()
+    {
+        ClientConnection[] clients;
+        lock (_sync)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            clients = _clients.ToArray();
+            _clients.Clear();
+        }
+
+        _cancellation.Cancel();
+        try
+        {
+            _listener.Stop();
+            _listener.Close();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+
+        foreach (ClientConnection client in clients)
+        {
+            client.Abort();
+        }
+    }
+
+    private async Task AcceptLoopAsync()
+    {
+        while (!_cancellation.IsCancellationRequested)
+        {
+            HttpListenerContext context;
+            try
+            {
+                context = await _listener.GetContextAsync().WaitAsync(_cancellation.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (HttpListenerException)
+            {
+                break;
+            }
+            catch (ObjectDisposedException)
+            {
+                break;
+            }
+
+            _ = HandleContextAsync(context);
+        }
+    }
+
+    private async Task HandleContextAsync(HttpListenerContext context)
+    {
+        if (context.Request.IsWebSocketRequest &&
+            string.Equals(context.Request.Url?.AbsolutePath, WebSocketPath, StringComparison.Ordinal))
+        {
+            await HandleWebSocketAsync(context);
+            return;
+        }
+
+        if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(context.Request.Url?.AbsolutePath, "/", StringComparison.Ordinal))
+        {
+            await WriteJsonResponseAsync(
+                context,
+                200,
+                "{\"websocket\":\"" + WebSocketUrl + "\",\"path\":\"/ws\"}");
+            return;
+        }
+
+        await WriteJsonResponseAsync(context, 404, "{\"error\":\"not found\"}");
+    }
+
+    private async Task HandleWebSocketAsync(HttpListenerContext context)
+    {
+        ClientConnection? client = null;
+        try
+        {
+            WebSocketContext webSocketContext = await context.AcceptWebSocketAsync(null);
+            client = new ClientConnection(webSocketContext.WebSocket);
+            string initialJson;
+            lock (_sync)
+            {
+                if (_disposed)
+                {
+                    client.Abort();
+                    return;
+                }
+
+                _clients.Add(client);
+                initialJson = _latestJson;
+            }
+
+            await SendAsync(client, initialJson);
+            await ReceiveUntilClosedAsync(client);
+        }
+        catch (HttpListenerException)
+        {
+        }
+        catch (WebSocketException)
+        {
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        finally
+        {
+            if (client is not null)
+            {
+                RemoveClient(client);
+                client.Abort();
+            }
+            else
+            {
+                try
+                {
+                    context.Response.StatusCode = 500;
+                    context.Response.Close();
+                }
+                catch
+                {
+                }
+            }
+        }
+    }
+
+    private async Task ReceiveUntilClosedAsync(ClientConnection client)
+    {
+        byte[] buffer = new byte[1024];
+        while (!_cancellation.IsCancellationRequested &&
+               client.Socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
+        {
+            WebSocketReceiveResult result = await client.Socket.ReceiveAsync(
+                new ArraySegment<byte>(buffer),
+                _cancellation.Token);
+            if (result.MessageType == WebSocketMessageType.Close)
+            {
+                return;
+            }
+        }
+    }
+
+    private async Task BroadcastAsync(string json, IReadOnlyList<ClientConnection> clients)
+    {
+        foreach (ClientConnection client in clients)
+        {
+            try
+            {
+                await SendAsync(client, json);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (WebSocketException)
+            {
+                RemoveClient(client);
+                client.Abort();
+            }
+            catch (ObjectDisposedException)
+            {
+                RemoveClient(client);
+            }
+        }
+    }
+
+    private async Task SendAsync(ClientConnection client, string json)
+    {
+        byte[] payload = Encoding.UTF8.GetBytes(json);
+        await client.SendLock.WaitAsync(_cancellation.Token);
+        try
+        {
+            if (client.Socket.State == WebSocketState.Open)
+            {
+                await client.Socket.SendAsync(
+                    payload,
+                    WebSocketMessageType.Text,
+                    endOfMessage: true,
+                    _cancellation.Token);
+            }
+        }
+        finally
+        {
+            client.SendLock.Release();
+        }
+    }
+
+    private void RemoveClient(ClientConnection client)
+    {
+        lock (_sync)
+        {
+            _clients.Remove(client);
+        }
+    }
+
+    private static async Task WriteJsonResponseAsync(
+        HttpListenerContext context,
+        int statusCode,
+        string json)
+    {
+        byte[] payload = Encoding.UTF8.GetBytes(json);
+        context.Response.StatusCode = statusCode;
+        context.Response.ContentType = "application/json; charset=utf-8";
+        context.Response.ContentLength64 = payload.Length;
+        context.Response.Headers["Access-Control-Allow-Origin"] = "*";
+        await context.Response.OutputStream.WriteAsync(payload);
+        context.Response.Close();
+    }
+
+    private sealed class ClientConnection
+    {
+        public ClientConnection(WebSocket socket)
+        {
+            Socket = socket;
+        }
+
+        public WebSocket Socket { get; }
+        public SemaphoreSlim SendLock { get; } = new(1, 1);
+
+        public void Abort()
+        {
+            try
+            {
+                Socket.Abort();
+            }
+            catch
+            {
+            }
+
+            Socket.Dispose();
+            SendLock.Dispose();
+        }
+    }
 }
 
 internal static class TrayIconRenderer
@@ -3411,12 +6829,22 @@ internal static class TrayIconRenderer
     public const string ClaudeUnavailableIconKey = "claude:?:?";
     public const string KimiUnavailableIconKey = "kimi:?";
     public const string DeepSeekUnavailableIconKey = "deepseek:?";
+    public const string DiskUnavailableIconKey = "disk:?";
+    public const string OpenCodeUnavailableIconKey = "opencode:?";
+    public const string TemperatureUnavailableIconKey = "temperature:?";
+    public const string MemoryUnavailableIconKey = "memory:?";
 
     // Brand marker colors are fixed, not theme-dependent.
     private const uint OpenAiBrandColor = 0xFF10A37F;
     private const uint ClaudeBrandColor = 0xFFD97757;
     private const uint KimiBrandColor = 0xFF23B7F0;
     private const uint DeepSeekBrandColor = 0xFF4D6BFE;
+    private const uint DiskBrandColor = 0xFF4A90E2;
+    private const uint OpenCodeBrandColor = 0xFF7B61FF;
+    private const uint TemperatureBrandColor = 0xFFE76F51;
+    private const uint MemoryBrandColor = 0xFF5B8DEF;
+    private const uint CpuBarColor = 0xFF39A96B;
+    private const uint GpuBarColor = 0xFF9B6BFF;
 
     private static readonly IconPalette LightThemePalette = new(
         UnknownColor: 0xFF444444,
@@ -3441,7 +6869,34 @@ internal static class TrayIconRenderer
         ['7'] = ["1111", "0001", "0001", "0010", "0010", "0100", "0100"],
         ['8'] = ["0110", "1001", "1001", "0110", "1001", "1001", "0110"],
         ['9'] = ["0110", "1001", "1001", "0111", "0001", "0001", "1110"],
-        ['?'] = ["1110", "0001", "0010", "0010", "0000", "0010", "0000"]
+        ['?'] = ["1110", "0001", "0010", "0010", "0000", "0010", "0000"],
+        ['A'] = ["0110", "1001", "1001", "1111", "1001", "1001", "1001"],
+        ['B'] = ["1110", "1001", "1001", "1110", "1001", "1001", "1110"],
+        ['C'] = ["0111", "1000", "1000", "1000", "1000", "1000", "0111"],
+        ['D'] = ["1110", "1001", "1001", "1001", "1001", "1001", "1110"],
+        ['E'] = ["1111", "1000", "1000", "1110", "1000", "1000", "1111"],
+        ['F'] = ["1111", "1000", "1000", "1110", "1000", "1000", "1000"],
+        ['G'] = ["0111", "1000", "1000", "1011", "1001", "1001", "0111"],
+        ['H'] = ["1001", "1001", "1001", "1111", "1001", "1001", "1001"],
+        ['I'] = ["1111", "0010", "0010", "0010", "0010", "0010", "1111"],
+        ['J'] = ["0011", "0001", "0001", "0001", "0001", "1001", "0110"],
+        ['K'] = ["1001", "1010", "1100", "1100", "1010", "1001", "1001"],
+        ['L'] = ["1000", "1000", "1000", "1000", "1000", "1000", "1111"],
+        ['M'] = ["1001", "1111", "1111", "1001", "1001", "1001", "1001"],
+        ['N'] = ["1001", "1101", "1101", "1011", "1011", "1001", "1001"],
+        ['O'] = ["0110", "1001", "1001", "1001", "1001", "1001", "0110"],
+        ['P'] = ["1110", "1001", "1001", "1110", "1000", "1000", "1000"],
+        ['Q'] = ["0110", "1001", "1001", "1001", "1011", "0110", "0001"],
+        ['R'] = ["1110", "1001", "1001", "1110", "1010", "1001", "1001"],
+        ['S'] = ["0111", "1000", "1000", "0110", "0001", "0001", "1110"],
+        ['T'] = ["1111", "0010", "0010", "0010", "0010", "0010", "0010"],
+        ['U'] = ["1001", "1001", "1001", "1001", "1001", "1001", "0110"],
+        ['V'] = ["1001", "1001", "1001", "1001", "1001", "0110", "0110"],
+        ['W'] = ["1001", "1001", "1001", "1111", "1111", "1111", "1001"],
+        ['X'] = ["1001", "1001", "0110", "0110", "0110", "1001", "1001"],
+        ['Y'] = ["1001", "1001", "0110", "0010", "0010", "0010", "0010"],
+        ['Z'] = ["1111", "0001", "0010", "0100", "1000", "1000", "1111"],
+        ['+'] = ["0010", "0010", "1111", "0010", "0010", "0000", "0000"]
     };
 
     public static IntPtr CreateUsageIcon(CodexUsageSnapshot snapshot)
@@ -3555,16 +7010,136 @@ internal static class TrayIconRenderer
         return CreateCenteredIcon("?", palette.UnknownColor, DeepSeekBrandColor);
     }
 
+    public static IntPtr CreateDiskIcon(DiskSpaceSnapshot snapshot)
+    {
+        IconPalette palette = GetPalette();
+        uint color = !snapshot.HasSelectedDrives
+            ? palette.UnknownColor
+            : !string.IsNullOrWhiteSpace(snapshot.LowDriveLetters)
+                ? palette.DangerColor
+                : snapshot.HasUnavailableDrives
+                    ? palette.UnknownColor
+                    : palette.SafeColor;
+        return CreateCenteredIcon(snapshot.IconText, color, DiskBrandColor);
+    }
+
+    public static string GetDiskIconKey(DiskSpaceSnapshot snapshot)
+    {
+        return $"disk:{snapshot.IconText}:{snapshot.LowDriveLetters}:{snapshot.UnavailableDriveLetters}";
+    }
+
+    public static IntPtr CreateDiskUnavailableIcon()
+    {
+        IconPalette palette = GetPalette();
+        return CreateCenteredIcon("?", palette.UnknownColor, DiskBrandColor);
+    }
+
+    public static IntPtr CreateOpenCodeIcon(OpenCodeGoUsageSnapshot snapshot)
+    {
+        IconPalette palette = GetPalette();
+        int rollingRemaining = CodexUsageMath.GetRemainingPercent(snapshot.Rolling.UsedPercent);
+        int weeklyRemaining = CodexUsageMath.GetRemainingPercent(snapshot.Weekly.UsedPercent);
+        return CreateIcon(
+            rollingRemaining.ToString(CultureInfo.InvariantCulture),
+            ColorForRemaining(rollingRemaining, palette),
+            weeklyRemaining.ToString(CultureInfo.InvariantCulture),
+            ColorForRemaining(weeklyRemaining, palette),
+            OpenCodeBrandColor,
+            snapshot.Weekly.ResetAt);
+    }
+
+    public static string GetOpenCodeIconKey(OpenCodeGoUsageSnapshot snapshot)
+    {
+        int rollingRemaining = CodexUsageMath.GetRemainingPercent(snapshot.Rolling.UsedPercent);
+        int weeklyRemaining = CodexUsageMath.GetRemainingPercent(snapshot.Weekly.UsedPercent);
+        int resetDays = GetResetDayDotCount(snapshot.Weekly.ResetAt);
+        return $"opencode:{rollingRemaining}:{weeklyRemaining}:{resetDays}";
+    }
+
+    public static IntPtr CreateOpenCodeUnavailableIcon()
+    {
+        IconPalette palette = GetPalette();
+        return CreateCenteredIcon("?", palette.UnknownColor, OpenCodeBrandColor);
+    }
+
+    public static IntPtr CreateTemperatureIcon(HardwareSnapshot snapshot)
+    {
+        IconPalette palette = GetPalette();
+        return CreateIcon(
+            FormatTemperatureIconText(snapshot.CpuTemperatureC),
+            ColorForTemperature(snapshot.CpuTemperatureC, palette),
+            FormatTemperatureIconText(snapshot.GpuTemperatureC),
+            ColorForTemperature(snapshot.GpuTemperatureC, palette),
+            TemperatureBrandColor,
+            drawBrandMarker: false);
+    }
+
+    public static string GetTemperatureIconKey(HardwareSnapshot snapshot)
+    {
+        return $"temperature:{FormatTemperatureIconText(snapshot.CpuTemperatureC)}:" +
+               $"{FormatTemperatureIconText(snapshot.GpuTemperatureC)}";
+    }
+
+    public static IntPtr CreateTemperatureUnavailableIcon()
+    {
+        IconPalette palette = GetPalette();
+        return CreateIcon(
+            "?",
+            palette.UnknownColor,
+            "?",
+            palette.UnknownColor,
+            TemperatureBrandColor,
+            drawBrandMarker: false);
+    }
+
+    public static IntPtr CreateMemoryIcon(HardwareSnapshot snapshot)
+    {
+        IconPalette palette = GetPalette();
+        uint[] pixels = new uint[IconSize * IconSize];
+        DrawUsageBar(
+            pixels,
+            2,
+            GetUsageRatio(snapshot.CpuUsagePercent),
+            ColorForUsage(snapshot.CpuUsagePercent, palette, CpuBarColor));
+        DrawUsageBar(
+            pixels,
+            10,
+            GetUsageRatio(snapshot.GpuUsagePercent),
+            ColorForUsage(snapshot.GpuUsagePercent, palette, GpuBarColor));
+        return CreateNativeIcon(pixels);
+    }
+
+    public static string GetMemoryIconKey(HardwareSnapshot snapshot)
+    {
+        return $"usage:{GetUsageBarCount(snapshot.CpuUsagePercent)}:" +
+               $"{GetUsageBarCount(snapshot.GpuUsagePercent)}";
+    }
+
+    public static IntPtr CreateMemoryUnavailableIcon()
+    {
+        IconPalette palette = GetPalette();
+        return CreateCenteredIcon(
+            "?",
+            palette.UnknownColor,
+            MemoryBrandColor,
+            drawBrandMarker: false);
+    }
+
     private static IntPtr CreateIcon(
         string topText,
         uint topColor,
         string bottomText,
         uint bottomColor,
         uint brandMarkerColor,
-        DateTimeOffset? weeklyResetAt = null)
+        DateTimeOffset? weeklyResetAt = null,
+        bool drawBrandMarker = true)
     {
         uint[] pixels = new uint[IconSize * IconSize];
-        DrawBrandTriangle(pixels, brandMarkerColor);
+        if (drawBrandMarker)
+        {
+            DrawBrandTriangle(pixels, brandMarkerColor);
+        }
+
         DrawText(pixels, topText, 0, topColor);
         DrawText(pixels, bottomText, 8, bottomColor);
         DrawResetDayDots(pixels, GetResetDayDotCount(weeklyResetAt), bottomColor);
@@ -3575,10 +7150,15 @@ internal static class TrayIconRenderer
         string text,
         uint textColor,
         uint brandMarkerColor,
-        DateTimeOffset? weeklyResetAt = null)
+        DateTimeOffset? weeklyResetAt = null,
+        bool drawBrandMarker = true)
     {
         uint[] pixels = new uint[IconSize * IconSize];
-        DrawBrandTriangle(pixels, brandMarkerColor);
+        if (drawBrandMarker)
+        {
+            DrawBrandTriangle(pixels, brandMarkerColor);
+        }
+
         DrawText(pixels, text, (IconSize - GlyphHeight) / 2, textColor);
         DrawResetDayDots(pixels, GetResetDayDotCount(weeklyResetAt), textColor);
         return CreateNativeIcon(pixels);
@@ -3660,6 +7240,36 @@ internal static class TrayIconRenderer
         }
     }
 
+    private static void DrawUsageBar(uint[] pixels, int y, double? ratio, uint fillColor)
+    {
+        const int segmentCount = 5;
+        const int segmentWidth = 2;
+        const int segmentGap = 1;
+        const int startX = 1;
+        const int height = 3;
+        const uint EmptyBarColor = 0xFF555555;
+        int filledSegments = ratio is null
+            ? 0
+            : Math.Clamp((int)Math.Round(ratio.Value * segmentCount, MidpointRounding.AwayFromZero), 0, segmentCount);
+
+        for (int segment = 0; segment < segmentCount; segment++)
+        {
+            uint color = ratio is null
+                ? EmptyBarColor
+                : segment < filledSegments
+                    ? fillColor
+                    : EmptyBarColor;
+            int x = startX + (segment * (segmentWidth + segmentGap));
+            for (int row = y; row < y + height; row++)
+            {
+                for (int column = x; column < x + segmentWidth; column++)
+                {
+                    pixels[(row * IconSize) + column] = color;
+                }
+            }
+        }
+    }
+
     private static void DrawInfinity(uint[] pixels, uint color)
     {
         string[] rows =
@@ -3694,6 +7304,69 @@ internal static class TrayIconRenderer
         }
 
         return wholeDollars.ToString("0", CultureInfo.InvariantCulture);
+    }
+
+    private static string FormatTemperatureIconText(double? temperatureC)
+    {
+        if (temperatureC is null || !double.IsFinite(temperatureC.Value) || temperatureC.Value < 0)
+        {
+            return "?";
+        }
+
+        return Math.Clamp(
+                (int)Math.Round(temperatureC.Value, MidpointRounding.AwayFromZero),
+                0,
+                999)
+            .ToString(CultureInfo.InvariantCulture);
+    }
+
+    private static uint ColorForTemperature(double? temperatureC, IconPalette palette)
+    {
+        if (temperatureC is null || !double.IsFinite(temperatureC.Value))
+        {
+            return palette.UnknownColor;
+        }
+
+        return temperatureC.Value >= 85d
+            ? palette.DangerColor
+            : temperatureC.Value >= 70d
+                ? palette.WarningColor
+                : palette.SafeColor;
+    }
+
+    private static double? GetUsageRatio(double? usagePercent)
+    {
+        if (usagePercent is null || !double.IsFinite(usagePercent.Value))
+        {
+            return null;
+        }
+
+        return Math.Clamp(usagePercent.Value / 100d, 0d, 1d);
+    }
+
+    private static int GetUsageBarCount(double? usagePercent)
+    {
+        double? ratio = GetUsageRatio(usagePercent);
+        return ratio is null
+            ? -1
+            : Math.Clamp((int)Math.Round(ratio.Value * 5d, MidpointRounding.AwayFromZero), 0, 5);
+    }
+
+    private static uint ColorForUsage(
+        double? usagePercent,
+        IconPalette palette,
+        uint normalColor)
+    {
+        if (usagePercent is null || !double.IsFinite(usagePercent.Value))
+        {
+            return palette.UnknownColor;
+        }
+
+        return usagePercent.Value >= 90d
+            ? palette.DangerColor
+            : usagePercent.Value >= 70d
+                ? palette.WarningColor
+                : normalColor;
     }
 
     private static IntPtr CreateNativeIcon(uint[] pixels)
@@ -3819,11 +7492,458 @@ internal static class TrayIconRenderer
     private sealed record IconPalette(uint UnknownColor, uint DangerColor, uint WarningColor, uint SafeColor);
 }
 
+internal sealed class DiskSettingsWindow : IDisposable
+{
+    private const string WindowClassName = "limits.disk-settings";
+    private const uint SaveButtonId = 1;
+    private const uint CancelButtonId = 2;
+    private const uint FirstRowControlId = 100;
+
+    private static readonly NativeMethods.WndProcDelegate WindowProcedure = HandleWindowMessage;
+    private static DiskSettingsWindow? Current;
+
+    private readonly DiskMonitorSettings _initialSettings;
+    private readonly Action<DiskMonitorSettings> _onSaved;
+    private readonly Action _onClosed;
+    private readonly List<DiskSettingsRow> _rows;
+    private IntPtr _windowHandle;
+    private bool _classRegistered;
+    private bool _closed;
+
+    public DiskSettingsWindow(
+        DiskMonitorSettings initialSettings,
+        Action<DiskMonitorSettings> onSaved,
+        Action onClosed)
+    {
+        _initialSettings = DiskMonitorSettings.Normalize(initialSettings.Drives);
+        _onSaved = onSaved;
+        _onClosed = onClosed;
+        _rows = BuildRows(_initialSettings);
+    }
+
+    public void Show(IntPtr owner)
+    {
+        if (Current is not null)
+        {
+            throw new InvalidOperationException("Disk settings are already open.");
+        }
+
+        Current = this;
+        RegisterWindowClass();
+
+        int width = 560;
+        int height = 130 + (_rows.Count * 34);
+        int x = Math.Max(0, (NativeMethods.GetSystemMetrics(NativeMethods.SM_CXSCREEN) - width) / 2);
+        int y = Math.Max(0, (NativeMethods.GetSystemMetrics(NativeMethods.SM_CYSCREEN) - height) / 2);
+        _windowHandle = NativeMethods.CreateWindowEx(
+            NativeMethods.WS_EX_DLGMODALFRAME,
+            WindowClassName,
+            "limits disk space settings",
+            NativeMethods.WS_OVERLAPPED | NativeMethods.WS_CAPTION | NativeMethods.WS_SYSMENU | NativeMethods.WS_MINIMIZEBOX,
+            x,
+            y,
+            width,
+            height,
+            owner,
+            IntPtr.Zero,
+            NativeMethods.GetModuleHandle(null),
+            IntPtr.Zero);
+
+        if (_windowHandle == IntPtr.Zero)
+        {
+            CompleteClose();
+            throw new InvalidOperationException($"CreateWindowEx failed: {Marshal.GetLastWin32Error()}");
+        }
+
+        CreateControls();
+        NativeMethods.ShowWindow(_windowHandle, NativeMethods.SW_SHOW);
+        NativeMethods.UpdateWindow(_windowHandle);
+        NativeMethods.SetForegroundWindow(_windowHandle);
+        NativeMethods.SetFocus(_rows.FirstOrDefault()?.LimitEdit ?? _windowHandle);
+    }
+
+    public void Activate()
+    {
+        if (_windowHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        NativeMethods.ShowWindow(_windowHandle, NativeMethods.SW_SHOW);
+        NativeMethods.SetForegroundWindow(_windowHandle);
+    }
+
+    public void Dispose()
+    {
+        if (_windowHandle != IntPtr.Zero)
+        {
+            NativeMethods.DestroyWindow(_windowHandle);
+        }
+
+        CompleteClose();
+        UnregisterWindowClass();
+
+        GC.SuppressFinalize(this);
+    }
+
+    private static List<DiskSettingsRow> BuildRows(DiskMonitorSettings settings)
+    {
+        Dictionary<string, DiskDriveSetting> configured = settings.Drives.ToDictionary(
+            drive => drive.DriveLetter,
+            StringComparer.OrdinalIgnoreCase);
+        HashSet<string> driveLetters = new(configured.Keys, StringComparer.OrdinalIgnoreCase);
+
+        try
+        {
+            foreach (DriveInfo drive in DriveInfo.GetDrives())
+            {
+                string? driveLetter = TryGetDriveLetter(drive.Name);
+                if (driveLetter is null || drive.DriveType == DriveType.CDRom)
+                {
+                    continue;
+                }
+
+                driveLetters.Add(driveLetter);
+            }
+        }
+        catch
+        {
+            // Keep configured drives available even if drive enumeration fails.
+        }
+
+        return driveLetters
+            .OrderBy(letter => letter, StringComparer.OrdinalIgnoreCase)
+            .Select(letter =>
+            {
+                configured.TryGetValue(letter, out DiskDriveSetting? setting);
+                return new DiskSettingsRow(
+                    letter,
+                    setting?.RedLimitGb ?? 5,
+                    setting is not null);
+            })
+            .Select((row, index) =>
+            {
+                row.RowIndex = index;
+                return row;
+            })
+            .ToList();
+    }
+
+    private static string? TryGetDriveLetter(string? root)
+    {
+        if (string.IsNullOrWhiteSpace(root) || root.Length < 2 || root[1] != ':')
+        {
+            return null;
+        }
+
+        char letter = char.ToUpperInvariant(root[0]);
+        return letter is >= 'A' and <= 'Z' ? letter.ToString() : null;
+    }
+
+    private void RegisterWindowClass()
+    {
+        NativeMethods.WNDCLASSEX windowClass = new()
+        {
+            cbSize = (uint)Marshal.SizeOf<NativeMethods.WNDCLASSEX>(),
+            lpfnWndProc = Marshal.GetFunctionPointerForDelegate(WindowProcedure),
+            hInstance = NativeMethods.GetModuleHandle(null),
+            hbrBackground = NativeMethods.GetSysColorBrush(NativeMethods.COLOR_WINDOW),
+            lpszClassName = WindowClassName
+        };
+
+        if (NativeMethods.RegisterClassEx(ref windowClass) == 0)
+        {
+            throw new InvalidOperationException($"RegisterClassEx failed: {Marshal.GetLastWin32Error()}");
+        }
+
+        _classRegistered = true;
+    }
+
+    private void CreateControls()
+    {
+        int y = 14;
+        CreateControl(
+            "STATIC",
+            "Select disks to monitor. Alert when free space is at or below the red limit (GB).",
+            NativeMethods.WS_CHILD | NativeMethods.WS_VISIBLE,
+            16,
+            y,
+            525,
+            22,
+            10);
+        y += 30;
+
+        CreateControl("STATIC", "Disk", NativeMethods.WS_CHILD | NativeMethods.WS_VISIBLE, 20, y, 50, 22, 11);
+        CreateControl("STATIC", "Monitor", NativeMethods.WS_CHILD | NativeMethods.WS_VISIBLE, 82, y, 90, 22, 12);
+        CreateControl("STATIC", "Red limit", NativeMethods.WS_CHILD | NativeMethods.WS_VISIBLE, 230, y, 100, 22, 13);
+        CreateControl("STATIC", "GB free", NativeMethods.WS_CHILD | NativeMethods.WS_VISIBLE, 340, y, 80, 22, 14);
+        y += 24;
+
+        foreach (DiskSettingsRow row in _rows)
+        {
+            row.Checkbox = CreateControl(
+                "BUTTON",
+                "Monitor",
+                NativeMethods.WS_CHILD | NativeMethods.WS_VISIBLE | NativeMethods.WS_TABSTOP | NativeMethods.BS_AUTOCHECKBOX,
+                78,
+                y,
+                100,
+                24,
+                row.CheckboxId);
+            NativeMethods.SendMessage(
+                row.Checkbox,
+                NativeMethods.BM_SETCHECK,
+                new IntPtr(row.IsSelected ? (int)NativeMethods.BST_CHECKED : (int)NativeMethods.BST_UNCHECKED),
+                IntPtr.Zero);
+
+            CreateControl("STATIC", $"{row.DriveLetter}:", NativeMethods.WS_CHILD | NativeMethods.WS_VISIBLE, 20, y, 45, 24, row.DriveLabelId);
+            row.LimitEdit = CreateControl(
+                "EDIT",
+                row.RedLimitGb.ToString("0.##", CultureInfo.InvariantCulture),
+                NativeMethods.WS_CHILD | NativeMethods.WS_VISIBLE | NativeMethods.WS_TABSTOP | NativeMethods.WS_BORDER | NativeMethods.ES_AUTOHSCROLL,
+                230,
+                y,
+                95,
+                24,
+                row.LimitEditId,
+                NativeMethods.WS_EX_CLIENTEDGE);
+            CreateControl("STATIC", "GB", NativeMethods.WS_CHILD | NativeMethods.WS_VISIBLE, 340, y, 50, 24, row.LimitLabelId);
+            y += 34;
+        }
+
+        CreateControl(
+            "BUTTON",
+            "Save",
+            NativeMethods.WS_CHILD | NativeMethods.WS_VISIBLE | NativeMethods.WS_TABSTOP | NativeMethods.BS_DEFPUSHBUTTON,
+            350,
+            y + 8,
+            85,
+            28,
+            SaveButtonId);
+        CreateControl(
+            "BUTTON",
+            "Cancel",
+            NativeMethods.WS_CHILD | NativeMethods.WS_VISIBLE | NativeMethods.WS_TABSTOP,
+            445,
+            y + 8,
+            85,
+            28,
+            CancelButtonId);
+    }
+
+    private IntPtr CreateControl(
+        string className,
+        string text,
+        uint style,
+        int x,
+        int y,
+        int width,
+        int height,
+        uint controlId,
+        uint extendedStyle = 0)
+    {
+        IntPtr control = NativeMethods.CreateWindowEx(
+            extendedStyle,
+            className,
+            text,
+            style,
+            x,
+            y,
+            width,
+            height,
+            _windowHandle,
+            (IntPtr)controlId,
+            NativeMethods.GetModuleHandle(null),
+            IntPtr.Zero);
+
+        if (control == IntPtr.Zero)
+        {
+            throw new InvalidOperationException($"CreateWindowEx failed for {className}: {Marshal.GetLastWin32Error()}");
+        }
+
+        NativeMethods.SendMessage(
+            control,
+            NativeMethods.WM_SETFONT,
+            NativeMethods.GetStockObject(NativeMethods.DEFAULT_GUI_FONT),
+            new IntPtr(1));
+        return control;
+    }
+
+    private void Save()
+    {
+        List<DiskDriveSetting> selected = [];
+        foreach (DiskSettingsRow row in _rows)
+        {
+            bool isSelected = NativeMethods.SendMessage(
+                row.Checkbox,
+                NativeMethods.BM_GETCHECK,
+                IntPtr.Zero,
+                IntPtr.Zero) == (IntPtr)NativeMethods.BST_CHECKED;
+            if (!isSelected)
+            {
+                continue;
+            }
+
+            string text = ReadText(row.LimitEdit).Trim();
+            if (!TryParseLimit(text, out double redLimitGb) || redLimitGb < 0 || redLimitGb > 1_000_000)
+            {
+                NativeMethods.MessageBox(
+                    _windowHandle,
+                    $"Enter a red limit from 0 to 1,000,000 GB for drive {row.DriveLetter}.",
+                    "Invalid disk limit",
+                    NativeMethods.MB_OK | NativeMethods.MB_ICONERROR);
+                NativeMethods.SetFocus(row.LimitEdit);
+                return;
+            }
+
+            selected.Add(new DiskDriveSetting(row.DriveLetter, redLimitGb));
+        }
+
+        try
+        {
+            _onSaved(DiskMonitorSettings.Normalize(selected));
+            CloseWindow();
+        }
+        catch (Exception exception)
+        {
+            NativeMethods.MessageBox(
+                _windowHandle,
+                $"Could not save disk settings: {exception.Message}",
+                "Disk settings",
+                NativeMethods.MB_OK | NativeMethods.MB_ICONERROR);
+        }
+    }
+
+    private static bool TryParseLimit(string text, out double value)
+    {
+        if (double.TryParse(text, NumberStyles.Float, CultureInfo.CurrentCulture, out value) &&
+            double.IsFinite(value))
+        {
+            return true;
+        }
+
+        if (double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value) &&
+            double.IsFinite(value))
+        {
+            return true;
+        }
+
+        value = 0;
+        return false;
+    }
+
+    private static string ReadText(IntPtr control)
+    {
+        int length = NativeMethods.GetWindowTextLength(control);
+        StringBuilder text = new(length + 1);
+        NativeMethods.GetWindowText(control, text, text.Capacity);
+        return text.ToString();
+    }
+
+    private static IntPtr HandleWindowMessage(IntPtr windowHandle, uint message, IntPtr wParam, IntPtr lParam)
+    {
+        return Current?.WndProc(windowHandle, message, wParam, lParam) ??
+               NativeMethods.DefWindowProc(windowHandle, message, wParam, lParam);
+    }
+
+    private IntPtr WndProc(IntPtr windowHandle, uint message, IntPtr wParam, IntPtr lParam)
+    {
+        switch (message)
+        {
+            case NativeMethods.WM_COMMAND:
+                uint commandId = (uint)(wParam.ToInt64() & 0xffff);
+                uint notification = (uint)((wParam.ToInt64() >> 16) & 0xffff);
+                if (notification == NativeMethods.BN_CLICKED && commandId == SaveButtonId)
+                {
+                    Save();
+                    return IntPtr.Zero;
+                }
+
+                if (notification == NativeMethods.BN_CLICKED && commandId == CancelButtonId)
+                {
+                    CloseWindow();
+                    return IntPtr.Zero;
+                }
+
+                break;
+
+            case NativeMethods.WM_CLOSE:
+                CloseWindow();
+                return IntPtr.Zero;
+
+            case NativeMethods.WM_DESTROY:
+                CompleteClose();
+                return IntPtr.Zero;
+        }
+
+        return NativeMethods.DefWindowProc(windowHandle, message, wParam, lParam);
+    }
+
+    private void CompleteClose()
+    {
+        if (_closed)
+        {
+            return;
+        }
+
+        _closed = true;
+        _windowHandle = IntPtr.Zero;
+        if (ReferenceEquals(Current, this))
+        {
+            Current = null;
+        }
+
+        _onClosed();
+    }
+
+    private void CloseWindow()
+    {
+        if (_windowHandle != IntPtr.Zero)
+        {
+            NativeMethods.DestroyWindow(_windowHandle);
+        }
+
+        UnregisterWindowClass();
+    }
+
+    private void UnregisterWindowClass()
+    {
+        if (_classRegistered)
+        {
+            NativeMethods.UnregisterClass(WindowClassName, NativeMethods.GetModuleHandle(null));
+            _classRegistered = false;
+        }
+    }
+
+    private sealed class DiskSettingsRow
+    {
+        public DiskSettingsRow(string driveLetter, double redLimitGb, bool isSelected)
+        {
+            DriveLetter = driveLetter;
+            RedLimitGb = redLimitGb;
+            IsSelected = isSelected;
+        }
+
+        public string DriveLetter { get; }
+        public double RedLimitGb { get; }
+        public bool IsSelected { get; }
+        public uint DriveLabelId => FirstRowControlId + (uint)(RowIndex * 4);
+        public uint CheckboxId => DriveLabelId + 1;
+        public uint LimitEditId => DriveLabelId + 2;
+        public uint LimitLabelId => DriveLabelId + 3;
+        public int RowIndex { get; set; }
+        public IntPtr Checkbox { get; set; }
+        public IntPtr LimitEdit { get; set; }
+    }
+}
+
 internal static class NativeMethods
 {
     public const uint WM_NULL = 0x0000;
     public const uint WM_DESTROY = 0x0002;
     public const uint WM_CLOSE = 0x0010;
+    public const uint WM_COMMAND = 0x0111;
+    public const uint WM_SETFONT = 0x0030;
     public const uint WM_CONTEXTMENU = 0x007B;
     public const uint WM_TIMER = 0x0113;
     public const uint WM_LBUTTONDBLCLK = 0x0203;
@@ -3841,11 +7961,43 @@ internal static class NativeMethods
 
     public const uint MF_STRING = 0x00000000;
     public const uint MF_GRAYED = 0x00000001;
+    public const uint MF_CHECKED = 0x00000008;
+    public const uint MF_POPUP = 0x00000010;
     public const uint MF_SEPARATOR = 0x00000800;
 
     public const uint TPM_NONOTIFY = 0x0080;
     public const uint TPM_RETURNCMD = 0x0100;
     public const uint TPM_RIGHTBUTTON = 0x0002;
+
+    public const uint WS_OVERLAPPED = 0x00000000;
+    public const uint WS_CAPTION = 0x00C00000;
+    public const uint WS_SYSMENU = 0x00080000;
+    public const uint WS_MINIMIZEBOX = 0x00020000;
+    public const uint WS_CHILD = 0x40000000;
+    public const uint WS_VISIBLE = 0x10000000;
+    public const uint WS_BORDER = 0x00800000;
+    public const uint WS_TABSTOP = 0x00010000;
+    public const uint WS_EX_CLIENTEDGE = 0x00000200;
+    public const uint WS_EX_DLGMODALFRAME = 0x00000001;
+
+    public const uint BS_AUTOCHECKBOX = 0x00000003;
+    public const uint BS_DEFPUSHBUTTON = 0x00000001;
+    public const uint ES_AUTOHSCROLL = 0x00000080;
+    public const uint BM_GETCHECK = 0x00F0;
+    public const uint BM_SETCHECK = 0x00F1;
+    public const uint BST_UNCHECKED = 0x0000;
+    public const uint BST_CHECKED = 0x0001;
+    public const uint BN_CLICKED = 0;
+
+    public const int SM_CXSCREEN = 0;
+    public const int SM_CYSCREEN = 1;
+    public const int COLOR_WINDOW = 5;
+    public const int DEFAULT_GUI_FONT = 17;
+    public const int SW_SHOW = 5;
+    public const uint MB_OK = 0x00000000;
+    public const uint MB_ICONERROR = 0x00000010;
+    public const uint MB_ICONINFORMATION = 0x00000040;
+    public const uint MB_ICONWARNING = 0x00000030;
 
     public const uint BI_RGB = 0;
     public const uint DIB_RGB_COLORS = 0;
@@ -3874,6 +8026,18 @@ internal static class NativeMethods
     {
         public int X;
         public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct SYSTEM_FILETIME
+    {
+        public uint LowDateTime;
+        public uint HighDateTime;
+
+        public long ToInt64()
+        {
+            return ((long)HighDateTime << 32) | LowDateTime;
+        }
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -3955,6 +8119,13 @@ internal static class NativeMethods
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern IntPtr GetModuleHandle(string? moduleName);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetSystemTimes(
+        out SYSTEM_FILETIME idleTime,
+        out SYSTEM_FILETIME kernelTime,
+        out SYSTEM_FILETIME userTime);
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern ushort RegisterClassEx(ref WNDCLASSEX windowClass);
 
@@ -4005,6 +8176,43 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     public static extern bool PostMessage(IntPtr windowHandle, uint message, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SendMessage(IntPtr windowHandle, uint message, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern bool SetWindowText(IntPtr windowHandle, string text);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetWindowTextLength(IntPtr windowHandle);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetWindowText(IntPtr windowHandle, StringBuilder text, int maxCount);
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr windowHandle, int command);
+
+    [DllImport("user32.dll")]
+    public static extern bool UpdateWindow(IntPtr windowHandle);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetFocus(IntPtr windowHandle);
+
+    [DllImport("user32.dll")]
+    public static extern int GetSystemMetrics(int index);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetSysColorBrush(int index);
+
+    [DllImport("gdi32.dll")]
+    public static extern IntPtr GetStockObject(int objectIndex);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int MessageBox(IntPtr windowHandle, string text, string caption, uint type);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool MessageBeep(uint type);
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

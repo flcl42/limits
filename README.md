@@ -1,22 +1,32 @@
 # limits
 
-Windows tray app that shows Codex, Claude, Kimi, and DeepSeek allowance in
-compact notification-area icons.
+Windows background monitor for Codex, Claude, Kimi, DeepSeek, OpenCode, and
+hardware health. The CPU/GPU load-bars icon is always present in the notification
+area so its context menu is always available.
 
-- Codex icon: centered remaining weekly percent and OpenAI-green marker
-- Claude icon: remaining 5-hour percent on top, weekly percent on bottom, and
-  Claude-orange marker
-- Kimi icon: remaining 5-hour percent on top, 7-day percent on bottom, and
-  Kimi-blue marker
-- DeepSeek icon: floored whole-dollar balance in large digits and DeepSeek-blue
-  marker; floored values above `100` display infinity
+- CPU/GPU load icon: always displayed and refreshed every 10 seconds. It shows
+  CPU and GPU usage as horizontal bars; right-click it (or any other visible
+  icon) and use `Visible icons` to show or hide the other icons.
+- OpenCode icon: shows rolling 5-hour remaining percent above weekly remaining
+  percent; the left dots show days until the weekly reset. It is enabled by
+  default and can be hidden from `Visible icons`. Its monthly quota is available
+  in the tooltip and WebSocket feed.
+- Codex, Claude, Kimi, DeepSeek, and CPU/GPU temperature icons are hidden by
+  default and can be enabled independently from `Visible icons`.
+- Disk icon: shown only while a selected drive is at or below its configured
+  free-space limit, when the disk icon is enabled. It displays the red drive
+  letters and sounds a warning on startup/recheck.
 
-Codex, Claude, and Kimi each show up to seven vertical dots along the left edge.
+Icon visibility is stored in `%LOCALAPPDATA%\limits\icon-settings.json`. The
+CPU/GPU load icon is always on; the other seven icons have independent
+show/hide settings.
+
+Codex, Claude, and Kimi data each include up to seven vertical dots along the
+left edge when rendered by a client page.
 The dots represent days until the weekly reset; one disappears as each day
 expires. The middle dot has two blank pixels above and below it, splitting the
-strip into countable groups. Exact percentages, balances, reset times, source
-paths, and manual refresh commands remain available from each icon's popup
-menu.
+strip into countable groups. Exact percentages, balances, reset times, and
+source paths are available in the WebSocket counter document.
 
 Codex status is read from the authenticated current-account usage endpoint
 using `%CODEX_HOME%\auth.json` or `%USERPROFILE%\.codex\auth.json`. The regular
@@ -43,9 +53,55 @@ using the API key and base URL configured by DeepCode in
 precedence. The key is used only as a bearer credential and is never displayed
 or written by `limits`.
 
-The same `limits.exe` process also performs the old limits watchdog work: it
-monitors C: and D: free space and runs the pause/resume batch files when Claude
-or disk thresholds cross.
+OpenCode usage is read locally from its database at
+`%USERPROFILE%\.local\share\opencode\opencode.db` through the installed
+`opencode` database command. The counter feed includes the rolling last-24-hour
+session and token totals. When `%USERPROFILE%\.local\share\opencode\auth.json`
+contains an `opencode-go` API key, the app also reads OpenCode Go's official
+usage endpoint (`GET https://opencode.ai/zen/go/v1/usage`). Go provides a
+rolling 5-hour quota, a weekly quota, and a monthly quota; it does not provide
+a daily quota. These are exposed under
+`openCode.go.rolling`, `openCode.go.weekly`, and `openCode.go.monthly`, each with
+`status`, `usedPercent`, `remainingPercent`, `limitUsd`, and `resetAt`. The
+current Go limits are $12 for 5 hours, $30 weekly, and $60 monthly. The API key
+is used only as a bearer credential and is never included in the WebSocket
+payload.
+
+Hardware readings use Windows `GetSystemTimes` for CPU usage,
+`nvidia-smi` for NVIDIA GPU temperature and usage, and the installed AMD Ryzen
+Master package sensor for the CPU package temperature. The generic Windows
+ACPI thermal-zone counter is deliberately not used because it can report a
+board/ambient zone rather than the Ryzen package temperature. If the AMD
+package sensor is unavailable, the CPU value is shown as unknown instead of
+being guessed. Hardware readings are refreshed every 10 seconds; the usage and
+disk checks keep their longer refresh interval.
+
+The app also runs a localhost-only WebSocket server on port `31001`. Connect a
+page to `ws://127.0.0.1:31001/ws` (or `ws://localhost:31001/ws`) to receive the
+current counter document immediately and after each refresh. The root URL
+`http://127.0.0.1:31001/` returns the WebSocket URL. Messages are JSON with
+`type: "limits.counters"`, `version: 1`, an `updatedAt` timestamp, and nullable
+`codex`, `claude`, `kimi`, `deepSeek`, `unet`, `openCode`, `hardware`, and
+`disk` objects. The `hardware` object includes `cpuUsagePercent`,
+`gpuUsagePercent`, `cpuTemperatureC`, and `gpuTemperatureC`.
+
+UNET balances are read from `https://my.unet.by/login` using the credentials in
+`%LOCALAPPDATA%\limits\unet-credentials.json`. Create or replace that file with
+`.\configure-unet.ps1`; it prompts for up to two accounts and stores only
+Windows-DPAPI-encrypted passwords. The WebSocket `unet` object contains an
+`accounts` array with `username`, `balance`, `currency`, `isAvailable`, and a
+safe `error` field; passwords and session data are never included. Balances are
+refreshed with the regular background refresh.
+
+The disk icon's context menu opens disk settings while the warning is visible.
+When all disks are healthy, open settings with
+`C:\Programs\limits.exe --disk-settings`. Select any detected drives and set an
+individual red limit in GB of free space. The settings are stored in
+`%LOCALAPPDATA%\limits\settings.json`; the default selection is C: and D: at
+5 GB. A selected drive at or below its limit is shown as a red drive letter on
+the icon and sounds a Windows warning. The same drive is not sounded more than
+once per minute. The limits watchdog uses the same selected drives and limits
+when it runs the pause/resume batch files.
 
 The app uses raw Win32 tray APIs and does not depend on the Windows Desktop framework.
 
@@ -63,13 +119,14 @@ dotnet publish .\limits.csproj -c Release -r win-x64 -o . -p:PublishAot=true -p:
 
 The published binary is `.\limits.exe`.
 
-Publish the native executable to `D:\Programs`:
+Publish the native executable to `C:\Programs`:
 
 ```powershell
 .\install.ps1
 ```
 
 The installer publishes to `publish\limits`, asks an existing tray process to
-shut down cleanly, copies only `limits.exe` into `D:\Programs`, updates the
-Startup shortcut, removes old installed `gpt.exe` binaries, and starts it. The
-installed binary is `D:\Programs\limits.exe`.
+shut down cleanly, copies only `limits.exe` into `C:\Programs`, removes old
+installed `gpt.exe` binaries, registers the `limits` logon task at the highest
+run level, and starts that task. The installed binary is
+`C:\Programs\limits.exe`.
