@@ -40,7 +40,9 @@ internal enum TrayIconKind
     Disk,
     OpenCode,
     Temperature,
-    CpuGpuLoad
+    CpuGpuLoad,
+    Devin,
+    OpenRouter
 }
 
 internal sealed class TrayApplication : IDisposable
@@ -58,16 +60,24 @@ internal sealed class TrayApplication : IDisposable
     private const uint OpenCodeResultMessage = NativeMethods.WM_APP + 9;
     private const uint HardwareResultMessage = NativeMethods.WM_APP + 10;
     private const uint UnetResultMessage = NativeMethods.WM_APP + 11;
+    private const uint DevinResultMessage = NativeMethods.WM_APP + 12;
+    private const uint OpenRouterResultMessage = NativeMethods.WM_APP + 13;
     private const uint KimiTrayIconId = 3;
     private const uint DeepSeekTrayIconId = 4;
     private const uint DiskTrayIconId = 5;
     private const uint OpenCodeTrayIconId = 6;
     private const uint TemperatureTrayIconId = 7;
     private const uint MemoryTrayIconId = 8;
+    private const uint DevinTrayIconId = 9;
+    private const uint OpenRouterTrayIconId = 10;
     private const nuint RefreshTimerId = 1;
     private const nuint HardwareRefreshTimerId = 2;
+    private const nuint UsageBalloonDelayTimerId = 3;
+    private const nuint UsageBalloonMonitorTimerId = 4;
     private const uint RefreshIntervalMs = 300_000;
     private const uint HardwareRefreshIntervalMs = 10_000;
+    private const uint UsageBalloonDelayMs = 250;
+    private const uint UsageBalloonMonitorIntervalMs = 100;
     private const int ClaudeRefreshTimeoutSeconds = 25;
     private const uint CommandRefresh = 1001;
     private const uint CommandOpenCodexSessions = 1002;
@@ -78,8 +88,10 @@ internal sealed class TrayApplication : IDisposable
     private const uint CommandOpenDiskSettings = 1007;
     private const uint CommandOpenOpenCodeData = 1008;
     private const uint CommandOpenTaskManager = 1009;
+    private const uint CommandOpenDevinUsage = 1010;
+    private const uint CommandOpenOpenRouterCredits = 1011;
     private const uint CommandToggleFirstTrayIcon = 1100;
-    private const uint CommandToggleLastTrayIcon = 1107;
+    private const uint CommandToggleLastTrayIcon = CommandToggleFirstTrayIcon + (uint)TrayIconKind.OpenRouter;
     private const string ShutdownEventName = @"Local\Limits.Shutdown";
     private const string OpenDiskSettingsEventName = @"Local\Limits.OpenDiskSettings";
 
@@ -91,6 +103,8 @@ internal sealed class TrayApplication : IDisposable
     private static readonly Guid OpenCodeTrayIconGuid = new("c8d1d0c3-5b6a-4c0e-9a73-96abf4c7785e");
     private static readonly Guid TemperatureTrayIconGuid = new("a1d68e24-7e92-4bcb-a2bf-13f8a7e8c6d1");
     private static readonly Guid MemoryTrayIconGuid = new("b2e79f35-8fa3-4cdc-b3c0-24a9b8f9d7e2");
+    private static readonly Guid DevinTrayIconGuid = new("d3b6c0a4-7e21-4b50-9e1f-8e7d8dc33b2a");
+    private static readonly Guid OpenRouterTrayIconGuid = new("d239a2d5-61f8-41a3-ae06-320bda542c1c");
     private static readonly TrayIconKind[] TrayIconsInVisibilityMenu =
     [
         TrayIconKind.Codex,
@@ -100,7 +114,9 @@ internal sealed class TrayApplication : IDisposable
         TrayIconKind.Disk,
         TrayIconKind.OpenCode,
         TrayIconKind.Temperature,
-        TrayIconKind.CpuGpuLoad
+        TrayIconKind.CpuGpuLoad,
+        TrayIconKind.Devin,
+        TrayIconKind.OpenRouter
     ];
 
     private static readonly NativeMethods.WndProcDelegate WindowProcedure = HandleWindowMessage;
@@ -113,20 +129,25 @@ internal sealed class TrayApplication : IDisposable
     private readonly DeepSeekBalanceReader _deepSeekBalanceReader = new();
     private readonly UnetBalanceReader _unetBalanceReader = new();
     private readonly OpenCodeUsageReader _openCodeUsageReader = new();
+    private readonly DevinUsageReader _devinUsageReader = new();
+    private readonly OpenRouterBalanceReader _openRouterBalanceReader = new();
     private readonly HardwareMonitor _hardwareMonitor = new();
     private readonly DiskMonitor _diskMonitor = new();
     private readonly TrayIconSettingsStore _trayIconSettingsStore = new();
     private readonly CounterWebSocketServer _counterWebSocketServer = new();
     private readonly LimitWatchdog _limitWatchdog;
     private readonly string _windowClassName = $"limits.{Environment.ProcessId}";
+    private readonly string _usageBalloonWindowClassName = $"limits.usage-balloon.{Environment.ProcessId}";
     private readonly EventWaitHandle _shutdownEvent;
     private readonly RegisteredWaitHandle _shutdownRegistration;
     private readonly EventWaitHandle _openDiskSettingsEvent;
     private readonly RegisteredWaitHandle _openDiskSettingsRegistration;
     private readonly uint _taskbarCreatedMessage;
     private Task _shellNotifyQueue = Task.CompletedTask;
+    private NativeMethods.WndProcDelegate? _usageBalloonWindowProcedure;
 
     private IntPtr _windowHandle;
+    private IntPtr _usageBalloonWindowHandle;
     private IntPtr _codexIconHandle;
     private IntPtr _claudeIconHandle;
     private IntPtr _kimiIconHandle;
@@ -135,6 +156,8 @@ internal sealed class TrayApplication : IDisposable
     private IntPtr _openCodeIconHandle;
     private IntPtr _temperatureIconHandle;
     private IntPtr _memoryIconHandle;
+    private IntPtr _devinIconHandle;
+    private IntPtr _openRouterIconHandle;
     private bool _codexTrayIconAdded;
     private bool _claudeTrayIconAdded;
     private bool _kimiTrayIconAdded;
@@ -143,7 +166,13 @@ internal sealed class TrayApplication : IDisposable
     private bool _openCodeTrayIconAdded;
     private bool _temperatureTrayIconAdded;
     private bool _memoryTrayIconAdded;
+    private bool _devinTrayIconAdded;
+    private bool _openRouterTrayIconAdded;
     private bool _windowClassRegistered;
+    private bool _usageBalloonWindowClassRegistered;
+    private uint _hoverIconId;
+    private uint _usageBalloonIconId;
+    private UsageBalloonContent? _usageBalloonContent;
     private string? _codexIconKey;
     private string? _claudeIconKey;
     private string? _kimiIconKey;
@@ -152,6 +181,8 @@ internal sealed class TrayApplication : IDisposable
     private string? _openCodeIconKey;
     private string? _temperatureIconKey;
     private string? _memoryIconKey;
+    private string? _devinIconKey;
+    private string? _openRouterIconKey;
     private string? _codexAppliedTooltip;
     private string? _claudeAppliedTooltip;
     private string? _kimiAppliedTooltip;
@@ -160,6 +191,8 @@ internal sealed class TrayApplication : IDisposable
     private string? _openCodeAppliedTooltip;
     private string? _temperatureAppliedTooltip;
     private string? _memoryAppliedTooltip;
+    private string? _devinAppliedTooltip;
+    private string? _openRouterAppliedTooltip;
     private string _codexTooltip = "limits";
     private string _codexStatusText = "Loading Codex usage...";
     private string _codexDetailText = "Reading Codex account usage.";
@@ -202,16 +235,29 @@ internal sealed class TrayApplication : IDisposable
     private string _temperatureUpdatedText = string.Empty;
     private string _temperatureSourceText = string.Empty;
     private string _memoryTooltip = "limits";
-    private string _memoryStatusText = "Loading CPU/GPU usage...";
-    private string _memoryDetailText = "Reading CPU and GPU utilization.";
+    private string _memoryStatusText = "Loading CPU/GPU/RAM/VRAM usage...";
+    private string _memoryDetailText = "Reading CPU, GPU, RAM, and VRAM utilization.";
     private string _memoryUpdatedText = string.Empty;
     private string _memorySourceText = string.Empty;
+    private string _devinTooltip = "limits";
+    private string _devinStatusText = "Loading Devin quota...";
+    private string _devinDetailText = "Reading Devin daily and weekly quota.";
+    private string _devinUpdatedText = string.Empty;
+    private string _devinSourceText = string.Empty;
+    private string _openRouterTooltip = "limits";
+    private string _openRouterStatusText = "Loading OpenRouter balance...";
+    private string _openRouterDetailText = "Reading OpenRouter credits and key limit.";
+    private string _openRouterUpdatedText = string.Empty;
+    private string _openRouterSourceText = string.Empty;
     private DeepSeekBalanceSnapshot? _lastDeepSeekSnapshot;
     private DiskSpaceSnapshot? _lastDiskSnapshot;
     private OpenCodeUsageSnapshot? _lastOpenCodeSnapshot;
     private OpenCodeGoUsageSnapshot? _lastOpenCodeGoSnapshot;
     private string? _openCodeGoUsageError;
+    private DevinUsageSnapshot? _lastDevinSnapshot;
+    private OpenRouterBalanceSnapshot? _lastOpenRouterSnapshot;
     private HardwareSnapshot? _lastHardwareSnapshot;
+    private IReadOnlyList<RamProcessUsage> _lastTopRamProcesses = [];
     private UnetBalanceSnapshot? _lastUnetSnapshot;
     private volatile bool _codexRefreshInFlight;
     private volatile UsageReadResult? _pendingCodexResult;
@@ -228,6 +274,10 @@ internal sealed class TrayApplication : IDisposable
     private volatile OpenCodeUsageReadResult? _pendingOpenCodeResult;
     private volatile bool _hardwareRefreshInFlight;
     private volatile HardwareReadResult? _pendingHardwareResult;
+    private volatile bool _devinRefreshInFlight;
+    private volatile DevinUsageReadResult? _pendingDevinResult;
+    private volatile bool _openRouterRefreshInFlight;
+    private volatile OpenRouterBalanceReadResult? _pendingOpenRouterResult;
     private volatile bool _limitWatchdogInFlight;
     private volatile bool _diskRefreshInFlight;
     private readonly Dictionary<string, DateTimeOffset> _lastDiskAlertAt = new(StringComparer.OrdinalIgnoreCase);
@@ -376,6 +426,23 @@ internal sealed class TrayApplication : IDisposable
         }
 
         _windowClassRegistered = true;
+
+        _usageBalloonWindowProcedure = HandleUsageBalloonWindowMessage;
+        NativeMethods.WNDCLASSEX usageBalloonWindowClass = new()
+        {
+            cbSize = (uint)Marshal.SizeOf<NativeMethods.WNDCLASSEX>(),
+            lpfnWndProc = Marshal.GetFunctionPointerForDelegate(_usageBalloonWindowProcedure),
+            hInstance = NativeMethods.GetModuleHandle(null),
+            lpszClassName = _usageBalloonWindowClassName
+        };
+
+        ushort usageBalloonAtom = NativeMethods.RegisterClassEx(ref usageBalloonWindowClass);
+        if (usageBalloonAtom == 0)
+        {
+            throw new InvalidOperationException($"RegisterClassEx for usage balloon failed: {Marshal.GetLastWin32Error()}");
+        }
+
+        _usageBalloonWindowClassRegistered = true;
     }
 
     private void CreateMessageWindow()
@@ -398,6 +465,25 @@ internal sealed class TrayApplication : IDisposable
         {
             throw new InvalidOperationException($"CreateWindowEx failed: {Marshal.GetLastWin32Error()}");
         }
+
+        _usageBalloonWindowHandle = NativeMethods.CreateWindowEx(
+            NativeMethods.WS_EX_TOPMOST | NativeMethods.WS_EX_TOOLWINDOW | NativeMethods.WS_EX_NOACTIVATE,
+            _usageBalloonWindowClassName,
+            string.Empty,
+            NativeMethods.WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            IntPtr.Zero,
+            IntPtr.Zero,
+            NativeMethods.GetModuleHandle(null),
+            IntPtr.Zero);
+
+        if (_usageBalloonWindowHandle == IntPtr.Zero)
+        {
+            throw new InvalidOperationException($"CreateWindowEx for usage balloon failed: {Marshal.GetLastWin32Error()}");
+        }
     }
 
     private void RefreshUsage()
@@ -409,6 +495,8 @@ internal sealed class TrayApplication : IDisposable
         RefreshUnetBalances();
         RefreshDiskSpace();
         RefreshOpenCodeUsage();
+        RefreshDevinUsage();
+        RefreshOpenRouterBalance();
         RefreshHardware();
     }
 
@@ -964,6 +1052,168 @@ internal sealed class TrayApplication : IDisposable
         }
     }
 
+    private void RefreshDevinUsage()
+    {
+        if (_devinRefreshInFlight)
+        {
+            return;
+        }
+
+        _devinRefreshInFlight = true;
+        IntPtr windowHandle = _windowHandle;
+
+        Task.Run(() =>
+        {
+            DevinUsageReadResult result;
+            try
+            {
+                result = _devinUsageReader.ReadLatestSnapshot();
+            }
+            catch (Exception exception)
+            {
+                result = new DevinUsageReadResult(null, exception.Message);
+            }
+
+            _pendingDevinResult = result;
+
+            if (windowHandle == IntPtr.Zero ||
+                !NativeMethods.PostMessage(windowHandle, DevinResultMessage, IntPtr.Zero, IntPtr.Zero))
+            {
+                _devinRefreshInFlight = false;
+            }
+        });
+    }
+
+    private void ApplyDevinResult()
+    {
+        DevinUsageReadResult? result = _pendingDevinResult;
+        _pendingDevinResult = null;
+        _devinRefreshInFlight = false;
+
+        if (result is null)
+        {
+            return;
+        }
+
+        if (result.Snapshot is null)
+        {
+            if (_lastDevinSnapshot is { } lastSnapshot)
+            {
+                _devinTooltip = BuildDevinTooltip(lastSnapshot, isStale: true);
+                _devinStatusText = $"{BuildDevinHeadline(lastSnapshot)} - refresh failed";
+                _devinDetailText = result.ErrorMessage ?? "Devin quota refresh failed.";
+                _devinUpdatedText = $"Last known {lastSnapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
+                _devinSourceText = lastSnapshot.Source;
+                UpdateDevinTrayIcon(
+                    TrayIconRenderer.CreateDevinIcon(lastSnapshot),
+                    TrayIconRenderer.GetDevinIconKey(lastSnapshot));
+                return;
+            }
+
+            _devinTooltip = BuildDevinUnavailableTooltip(result.ErrorMessage);
+            _devinStatusText = "No Devin quota data found";
+            _devinDetailText = result.ErrorMessage ?? "Devin daily and weekly quota was not found.";
+            _devinUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
+            _devinSourceText = _devinUsageReader.UsageEndpoint;
+            UpdateDevinTrayIcon(
+                TrayIconRenderer.CreateDevinUnavailableIcon(),
+                TrayIconRenderer.DevinUnavailableIconKey);
+            return;
+        }
+
+        DevinUsageSnapshot snapshot = result.Snapshot;
+        _lastDevinSnapshot = snapshot;
+        _devinTooltip = BuildDevinTooltip(snapshot, isStale: false);
+        _devinStatusText = BuildDevinHeadline(snapshot);
+        _devinDetailText = BuildDevinDetail(snapshot);
+        _devinUpdatedText = $"Seen {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
+        _devinSourceText = snapshot.Source;
+        UpdateDevinTrayIcon(
+            TrayIconRenderer.CreateDevinIcon(snapshot),
+            TrayIconRenderer.GetDevinIconKey(snapshot));
+    }
+
+    private void RefreshOpenRouterBalance()
+    {
+        if (_openRouterRefreshInFlight)
+        {
+            return;
+        }
+
+        _openRouterRefreshInFlight = true;
+        IntPtr windowHandle = _windowHandle;
+
+        Task.Run(() =>
+        {
+            OpenRouterBalanceReadResult result;
+            try
+            {
+                result = _openRouterBalanceReader.ReadLatestSnapshot();
+            }
+            catch (Exception exception)
+            {
+                result = new OpenRouterBalanceReadResult(null, exception.Message);
+            }
+
+            _pendingOpenRouterResult = result;
+
+            if (windowHandle == IntPtr.Zero ||
+                !NativeMethods.PostMessage(windowHandle, OpenRouterResultMessage, IntPtr.Zero, IntPtr.Zero))
+            {
+                _openRouterRefreshInFlight = false;
+            }
+        });
+    }
+
+    private void ApplyOpenRouterResult()
+    {
+        OpenRouterBalanceReadResult? result = _pendingOpenRouterResult;
+        _pendingOpenRouterResult = null;
+        _openRouterRefreshInFlight = false;
+
+        if (result is null)
+        {
+            return;
+        }
+
+        if (result.Snapshot is null)
+        {
+            if (_lastOpenRouterSnapshot is { } lastSnapshot)
+            {
+                _openRouterTooltip = $"{BuildOpenRouterTooltip(lastSnapshot)} (last known)";
+                _openRouterStatusText = $"{BuildOpenRouterHeadline(lastSnapshot)} - refresh failed";
+                _openRouterDetailText = result.ErrorMessage ?? "OpenRouter balance refresh failed.";
+                _openRouterUpdatedText = $"Last known {lastSnapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
+                _openRouterSourceText = lastSnapshot.Source;
+                UpdateOpenRouterTrayIcon(
+                    TrayIconRenderer.CreateOpenRouterIcon(lastSnapshot),
+                    TrayIconRenderer.GetOpenRouterIconKey(lastSnapshot));
+                return;
+            }
+
+            _openRouterTooltip = BuildOpenRouterUnavailableTooltip(result.ErrorMessage);
+            _openRouterStatusText = "No OpenRouter balance data found";
+            _openRouterDetailText = result.ErrorMessage ?? "OpenRouter credits were not found.";
+            _openRouterUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
+            _openRouterSourceText = _openRouterBalanceReader.UsageEndpoint;
+            UpdateOpenRouterTrayIcon(
+                TrayIconRenderer.CreateOpenRouterUnavailableIcon(),
+                TrayIconRenderer.OpenRouterUnavailableIconKey);
+            return;
+        }
+
+        OpenRouterBalanceSnapshot snapshot = result.Snapshot;
+        _lastOpenRouterSnapshot = snapshot;
+        _openRouterTooltip = BuildOpenRouterTooltip(snapshot);
+        _openRouterStatusText = BuildOpenRouterHeadline(snapshot);
+        _openRouterDetailText = BuildOpenRouterDetail(snapshot);
+        _openRouterUpdatedText = $"Seen {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
+        _openRouterSourceText = snapshot.Source;
+        UpdateOpenRouterTrayIcon(
+            TrayIconRenderer.CreateOpenRouterIcon(snapshot),
+            TrayIconRenderer.GetOpenRouterIconKey(snapshot));
+    }
+
     private void RefreshHardware()
     {
         if (_hardwareRefreshInFlight)
@@ -980,6 +1230,7 @@ internal sealed class TrayApplication : IDisposable
             try
             {
                 result = _hardwareMonitor.ReadSnapshot();
+                result = result with { TopRamProcesses = RamProcessReader.ReadTopProcesses() };
             }
             catch (Exception exception)
             {
@@ -1007,6 +1258,11 @@ internal sealed class TrayApplication : IDisposable
             return;
         }
 
+        if (result.TopRamProcesses is not null)
+        {
+            _lastTopRamProcesses = result.TopRamProcesses;
+        }
+
         if (result.Snapshot is null)
         {
             string error = result.ErrorMessage ?? "Hardware readings were not available.";
@@ -1016,7 +1272,7 @@ internal sealed class TrayApplication : IDisposable
             _temperatureUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
             _temperatureSourceText = _hardwareMonitor.SourceDescription;
             _memoryTooltip = "Usage: unavailable";
-            _memoryStatusText = "CPU/GPU usage unavailable";
+            _memoryStatusText = "CPU/GPU/RAM/VRAM usage unavailable";
             _memoryDetailText = error;
             _memoryUpdatedText = _temperatureUpdatedText;
             _memorySourceText = _hardwareMonitor.SourceDescription;
@@ -1071,6 +1327,8 @@ internal sealed class TrayApplication : IDisposable
             _lastOpenCodeSnapshot,
             _lastOpenCodeGoSnapshot,
             _openCodeGoUsageError);
+        root["devin"] = BuildDevinCounterJson(_lastDevinSnapshot);
+        root["openRouter"] = BuildOpenRouterCounterJson(_lastOpenRouterSnapshot);
         root["hardware"] = BuildHardwareCounterJson(_lastHardwareSnapshot);
         root["disk"] = BuildDiskCounterJson(_lastDiskSnapshot);
         return root.ToJsonString();
@@ -1245,13 +1503,13 @@ internal sealed class TrayApplication : IDisposable
             ["isAvailable"] = true,
             ["rolling"] = BuildOpenCodeGoWindowCounterJson(snapshot.Rolling, OpenCodeGoLimits.RollingUsd),
             ["weekly"] = BuildOpenCodeGoWindowCounterJson(snapshot.Weekly, OpenCodeGoLimits.WeeklyUsd),
-            ["monthly"] = BuildOpenCodeGoWindowCounterJson(snapshot.Monthly, OpenCodeGoLimits.MonthlyUsd)
+            ["monthly"] = BuildOpenCodeGoWindowCounterJson(snapshot.Monthly, null)
         };
     }
 
     private static JsonObject BuildOpenCodeGoWindowCounterJson(
         OpenCodeGoUsageWindow window,
-        decimal limitUsd)
+        decimal? limitUsd)
     {
         double usedPercent = Math.Clamp(window.UsedPercent, 0d, 100d);
         return new JsonObject
@@ -1262,6 +1520,60 @@ internal sealed class TrayApplication : IDisposable
             ["limitUsd"] = limitUsd,
             ["resetAt"] = FormatCounterTimestamp(window.ResetAt)
         };
+    }
+
+    private static JsonObject? BuildOpenRouterCounterJson(OpenRouterBalanceSnapshot? snapshot)
+    {
+        if (snapshot is null)
+        {
+            return null;
+        }
+
+        return new JsonObject
+        {
+            ["timestamp"] = FormatCounterTimestamp(snapshot.Timestamp),
+            ["spendableBalance"] = snapshot.SpendableBalance,
+            ["accountBalance"] = snapshot.AccountBalance,
+            ["totalCredits"] = snapshot.TotalCredits,
+            ["totalUsage"] = snapshot.TotalUsage,
+            ["keyLimit"] = snapshot.KeyLimit,
+            ["keyLimitRemaining"] = snapshot.KeyLimitRemaining,
+            ["keyLimitReset"] = snapshot.KeyLimitReset,
+            ["usageDaily"] = snapshot.UsageDaily,
+            ["usageWeekly"] = snapshot.UsageWeekly,
+            ["usageMonthly"] = snapshot.UsageMonthly,
+            ["isFreeTier"] = snapshot.IsFreeTier
+        };
+    }
+
+    private static JsonObject? BuildDevinCounterJson(DevinUsageSnapshot? snapshot)
+    {
+        if (snapshot is null)
+        {
+            return null;
+        }
+
+        return new JsonObject
+        {
+            ["timestamp"] = FormatCounterTimestamp(snapshot.Timestamp),
+            ["planName"] = snapshot.PlanName,
+            ["planEndAt"] = FormatCounterTimestamp(snapshot.PlanEndAt),
+            ["daily"] = BuildDevinWindowCounterJson(snapshot.DailyRemainingPercent, snapshot.DailyResetAt),
+            ["weekly"] = BuildDevinWindowCounterJson(snapshot.WeeklyRemainingPercent, snapshot.WeeklyResetAt)
+        };
+    }
+
+    private static JsonObject BuildDevinWindowCounterJson(
+        double? remainingPercent,
+        DateTimeOffset? resetAt)
+    {
+        JsonObject result = new()
+        {
+            ["resetAt"] = FormatCounterTimestamp(resetAt)
+        };
+        SetPercent(result, "remainingPercent", remainingPercent);
+        SetPercent(result, "usedPercent", remainingPercent is { } remaining ? 100d - remaining : null);
+        return result;
     }
 
     private static JsonObject? BuildHardwareCounterJson(HardwareSnapshot? snapshot)
@@ -1280,6 +1592,20 @@ internal sealed class TrayApplication : IDisposable
         SetNullableDouble(result, "gpuTemperatureC", snapshot.GpuTemperatureC);
         SetPercent(result, "cpuUsagePercent", snapshot.CpuUsagePercent);
         SetPercent(result, "gpuUsagePercent", snapshot.GpuUsagePercent);
+        SetPercent(result, "ramUsagePercent", snapshot.RamUsagePercent);
+        SetPercent(result, "vramUsagePercent", snapshot.VramUsagePercent);
+        SetNullableLong(result, "ramTotalBytes", snapshot.RamTotalBytes);
+        SetNullableLong(result, "ramAvailableBytes", snapshot.RamAvailableBytes);
+        SetNullableLong(
+            result,
+            "ramUsedBytes",
+            GetUsedBytes(snapshot.RamTotalBytes, snapshot.RamAvailableBytes));
+        SetNullableLong(result, "vramTotalBytes", snapshot.VramTotalBytes);
+        SetNullableLong(result, "vramAvailableBytes", snapshot.VramAvailableBytes);
+        SetNullableLong(
+            result,
+            "vramUsedBytes",
+            GetUsedBytes(snapshot.VramTotalBytes, snapshot.VramAvailableBytes));
         return result;
     }
 
@@ -1352,6 +1678,16 @@ internal sealed class TrayApplication : IDisposable
         target[propertyName] = value is { } number
             ? JsonValue.Create(number)
             : null;
+    }
+
+    private static long? GetUsedBytes(long? totalBytes, long? availableBytes)
+    {
+        if (totalBytes is not { } total || availableBytes is not { } available || total < 0)
+        {
+            return null;
+        }
+
+        return total - Math.Clamp(available, 0, total);
     }
 
     private void RunLimitWatchdog(ClaudeUsageSnapshot? snapshot)
@@ -1532,6 +1868,56 @@ internal sealed class TrayApplication : IDisposable
             _openCodeTooltip);
     }
 
+    private void UpdateDevinTrayIcon(IntPtr newIconHandle, string iconKey)
+    {
+        if (!_trayIconSettings.IsVisible(TrayIconKind.Devin))
+        {
+            SuppressTrayIcon(
+                DevinTrayIconId,
+                newIconHandle,
+                ref _devinIconHandle,
+                ref _devinTrayIconAdded,
+                ref _devinIconKey,
+                ref _devinAppliedTooltip);
+            return;
+        }
+
+        UpdateTrayIcon(
+            DevinTrayIconId,
+            newIconHandle,
+            ref _devinIconHandle,
+            ref _devinTrayIconAdded,
+            ref _devinIconKey,
+            ref _devinAppliedTooltip,
+            iconKey,
+            _devinTooltip);
+    }
+
+    private void UpdateOpenRouterTrayIcon(IntPtr newIconHandle, string iconKey)
+    {
+        if (!_trayIconSettings.IsVisible(TrayIconKind.OpenRouter))
+        {
+            SuppressTrayIcon(
+                OpenRouterTrayIconId,
+                newIconHandle,
+                ref _openRouterIconHandle,
+                ref _openRouterTrayIconAdded,
+                ref _openRouterIconKey,
+                ref _openRouterAppliedTooltip);
+            return;
+        }
+
+        UpdateTrayIcon(
+            OpenRouterTrayIconId,
+            newIconHandle,
+            ref _openRouterIconHandle,
+            ref _openRouterTrayIconAdded,
+            ref _openRouterIconKey,
+            ref _openRouterAppliedTooltip,
+            iconKey,
+            _openRouterTooltip);
+    }
+
     private void UpdateTemperatureTrayIcon(IntPtr newIconHandle, string iconKey)
     {
         if (!_trayIconSettings.IsVisible(TrayIconKind.Temperature))
@@ -1707,6 +2093,8 @@ internal sealed class TrayApplication : IDisposable
             OpenCodeTrayIconId => OpenCodeTrayIconGuid,
             TemperatureTrayIconId => TemperatureTrayIconGuid,
             MemoryTrayIconId => MemoryTrayIconGuid,
+            DevinTrayIconId => DevinTrayIconGuid,
+            OpenRouterTrayIconId => OpenRouterTrayIconGuid,
             _ => CodexTrayIconGuid
         };
     }
@@ -1748,6 +2136,19 @@ internal sealed class TrayApplication : IDisposable
                     return IntPtr.Zero;
                 }
 
+                if ((nuint)wParam == UsageBalloonDelayTimerId)
+                {
+                    NativeMethods.KillTimer(_windowHandle, UsageBalloonDelayTimerId);
+                    ShowUsageBalloonIfPointerStillOverIcon();
+                    return IntPtr.Zero;
+                }
+
+                if ((nuint)wParam == UsageBalloonMonitorTimerId)
+                {
+                    MonitorUsageBalloonPointer();
+                    return IntPtr.Zero;
+                }
+
                 break;
 
             case CodexResultMessage:
@@ -1785,6 +2186,16 @@ internal sealed class TrayApplication : IDisposable
                 PublishCounterState();
                 return IntPtr.Zero;
 
+            case DevinResultMessage:
+                ApplyDevinResult();
+                PublishCounterState();
+                return IntPtr.Zero;
+
+            case OpenRouterResultMessage:
+                ApplyOpenRouterResult();
+                PublishCounterState();
+                return IntPtr.Zero;
+
             case HardwareResultMessage:
                 ApplyHardwareResult();
                 PublishCounterState();
@@ -1807,19 +2218,30 @@ internal sealed class TrayApplication : IDisposable
                     not DiskTrayIconId and
                     not OpenCodeTrayIconId and
                     not TemperatureTrayIconId and
-                    not MemoryTrayIconId)
+                    not MemoryTrayIconId and
+                    not DevinTrayIconId and
+                    not OpenRouterTrayIconId)
                 {
                     break;
                 }
 
                 switch ((uint)lParam.ToInt64())
                 {
+                    case NativeMethods.WM_MOUSEMOVE:
+                        if (IsUsageBalloonIcon(iconId))
+                        {
+                            ScheduleUsageBalloon(iconId);
+                        }
+                        return IntPtr.Zero;
+
                     case NativeMethods.WM_LBUTTONDBLCLK:
+                        HideUsageBalloon();
                         RefreshUsage();
                         return IntPtr.Zero;
 
                     case NativeMethods.WM_RBUTTONUP:
                     case NativeMethods.WM_CONTEXTMENU:
+                        HideUsageBalloon();
                         ShowContextMenu(iconId);
                         return IntPtr.Zero;
                 }
@@ -1835,6 +2257,769 @@ internal sealed class TrayApplication : IDisposable
         return NativeMethods.DefWindowProc(windowHandle, message, wParam, lParam);
     }
 
+    private static IntPtr HandleUsageBalloonWindowMessage(
+        IntPtr windowHandle,
+        uint message,
+        IntPtr wParam,
+        IntPtr lParam)
+    {
+        return Current?.UsageBalloonWndProc(windowHandle, message, wParam, lParam) ??
+               NativeMethods.DefWindowProc(windowHandle, message, wParam, lParam);
+    }
+
+    private IntPtr UsageBalloonWndProc(IntPtr windowHandle, uint message, IntPtr wParam, IntPtr lParam)
+    {
+        switch (message)
+        {
+            case NativeMethods.WM_PAINT:
+                PaintUsageBalloon(windowHandle);
+                return IntPtr.Zero;
+
+            case NativeMethods.WM_ERASEBKGND:
+                return new IntPtr(1);
+
+            case NativeMethods.WM_MOUSEACTIVATE:
+                return new IntPtr(NativeMethods.MA_NOACTIVATE);
+        }
+
+        return NativeMethods.DefWindowProc(windowHandle, message, wParam, lParam);
+    }
+
+    private static bool IsUsageBalloonIcon(uint iconId)
+    {
+        return iconId is CodexTrayIconId or
+            ClaudeTrayIconId or
+            KimiTrayIconId or
+            DeepSeekTrayIconId or
+            DiskTrayIconId or
+            OpenCodeTrayIconId or
+            TemperatureTrayIconId or
+            MemoryTrayIconId or
+            DevinTrayIconId or
+            OpenRouterTrayIconId;
+    }
+
+    private void ScheduleUsageBalloon(uint iconId)
+    {
+        if (_usageBalloonIconId == iconId || _hoverIconId == iconId)
+        {
+            return;
+        }
+
+        _hoverIconId = iconId;
+        NativeMethods.KillTimer(_windowHandle, UsageBalloonDelayTimerId);
+        NativeMethods.SetTimer(_windowHandle, UsageBalloonDelayTimerId, UsageBalloonDelayMs, IntPtr.Zero);
+    }
+
+    private void ShowUsageBalloonIfPointerStillOverIcon()
+    {
+        uint iconId = _hoverIconId;
+        _hoverIconId = 0;
+        if (!IsUsageBalloonIcon(iconId) ||
+            !TryGetTrayIconRect(iconId, out NativeMethods.RECT trayRect) ||
+            !NativeMethods.GetCursorPos(out NativeMethods.POINT cursor) ||
+            !Contains(trayRect, cursor))
+        {
+            return;
+        }
+
+        UsageBalloonContent content = BuildUsageBalloonContent(iconId);
+        int rowCount = content.Rows.Count;
+        int processCount = content.TopRamProcesses.Count;
+        const int width = 620;
+        int height = 210 + (rowCount * 25) + (string.IsNullOrWhiteSpace(content.SecondaryDetail) ? 0 : 22);
+        if (processCount > 0)
+        {
+            height = Math.Max(height, 154 + (rowCount * 25) + (processCount * 23));
+        }
+
+        NativeMethods.RECT anchor = trayRect;
+        IntPtr monitor = NativeMethods.MonitorFromRect(ref anchor, NativeMethods.MONITOR_DEFAULTTONEAREST);
+        NativeMethods.MONITORINFO monitorInfo = new()
+        {
+            cbSize = (uint)Marshal.SizeOf<NativeMethods.MONITORINFO>()
+        };
+
+        if (monitor == IntPtr.Zero || !NativeMethods.GetMonitorInfo(monitor, ref monitorInfo))
+        {
+            monitorInfo.rcWork = new NativeMethods.RECT
+            {
+                Left = 0,
+                Top = 0,
+                Right = NativeMethods.GetSystemMetrics(NativeMethods.SM_CXSCREEN),
+                Bottom = NativeMethods.GetSystemMetrics(NativeMethods.SM_CYSCREEN)
+            };
+        }
+
+        int x = Math.Clamp(trayRect.Right - width, monitorInfo.rcWork.Left, Math.Max(monitorInfo.rcWork.Left, monitorInfo.rcWork.Right - width));
+        int y = trayRect.Top - height - 8;
+        if (y < monitorInfo.rcWork.Top)
+        {
+            y = trayRect.Bottom + 8;
+        }
+
+        y = Math.Clamp(y, monitorInfo.rcWork.Top, Math.Max(monitorInfo.rcWork.Top, monitorInfo.rcWork.Bottom - height));
+        _usageBalloonContent = content;
+        _usageBalloonIconId = iconId;
+        NativeMethods.SetWindowPos(
+            _usageBalloonWindowHandle,
+            NativeMethods.HWND_TOPMOST,
+            x,
+            y,
+            width,
+            height,
+            NativeMethods.SWP_NOACTIVATE | NativeMethods.SWP_SHOWWINDOW);
+        NativeMethods.InvalidateRect(_usageBalloonWindowHandle, IntPtr.Zero, true);
+        NativeMethods.UpdateWindow(_usageBalloonWindowHandle);
+        NativeMethods.KillTimer(_windowHandle, UsageBalloonMonitorTimerId);
+        NativeMethods.SetTimer(_windowHandle, UsageBalloonMonitorTimerId, UsageBalloonMonitorIntervalMs, IntPtr.Zero);
+    }
+
+    private void MonitorUsageBalloonPointer()
+    {
+        if (_usageBalloonIconId == 0 || !NativeMethods.GetCursorPos(out NativeMethods.POINT cursor))
+        {
+            HideUsageBalloon(clearPendingHover: true);
+            return;
+        }
+
+        if (NativeMethods.GetWindowRect(_usageBalloonWindowHandle, out NativeMethods.RECT balloonRect) &&
+            Contains(balloonRect, cursor))
+        {
+            return;
+        }
+
+        foreach (uint iconId in GetUsageBalloonIconIds())
+        {
+            if (TryGetTrayIconRect(iconId, out NativeMethods.RECT trayRect) && Contains(trayRect, cursor))
+            {
+                return;
+            }
+        }
+
+        HideUsageBalloon(clearPendingHover: true);
+    }
+
+    private static uint[] GetUsageBalloonIconIds()
+    {
+        return
+        [
+            CodexTrayIconId,
+            ClaudeTrayIconId,
+            KimiTrayIconId,
+            DeepSeekTrayIconId,
+            DiskTrayIconId,
+            OpenCodeTrayIconId,
+            TemperatureTrayIconId,
+            MemoryTrayIconId,
+            DevinTrayIconId,
+            OpenRouterTrayIconId
+        ];
+    }
+
+    private bool TryGetTrayIconRect(uint iconId, out NativeMethods.RECT rect)
+    {
+        rect = default;
+        if (_usageBalloonWindowHandle == IntPtr.Zero || !IsTrayIconAdded(iconId))
+        {
+            return false;
+        }
+
+        NativeMethods.NOTIFYICONIDENTIFIER identifier = new()
+        {
+            cbSize = (uint)Marshal.SizeOf<NativeMethods.NOTIFYICONIDENTIFIER>(),
+            hWnd = _windowHandle,
+            uID = iconId,
+            guidItem = GetTrayIconGuid(iconId)
+        };
+        return NativeMethods.Shell_NotifyIconGetRect(ref identifier, out rect) == 0;
+    }
+
+    private bool IsTrayIconAdded(uint iconId)
+    {
+        return iconId switch
+        {
+            CodexTrayIconId => _codexTrayIconAdded,
+            ClaudeTrayIconId => _claudeTrayIconAdded,
+            KimiTrayIconId => _kimiTrayIconAdded,
+            DeepSeekTrayIconId => _deepSeekTrayIconAdded,
+            DiskTrayIconId => _diskTrayIconAdded,
+            OpenCodeTrayIconId => _openCodeTrayIconAdded,
+            TemperatureTrayIconId => _temperatureTrayIconAdded,
+            MemoryTrayIconId => _memoryTrayIconAdded,
+            DevinTrayIconId => _devinTrayIconAdded,
+            OpenRouterTrayIconId => _openRouterTrayIconAdded,
+            _ => false
+        };
+    }
+
+    private void HideUsageBalloon(bool clearPendingHover = false)
+    {
+        NativeMethods.KillTimer(_windowHandle, UsageBalloonMonitorTimerId);
+        if (clearPendingHover)
+        {
+            NativeMethods.KillTimer(_windowHandle, UsageBalloonDelayTimerId);
+            _hoverIconId = 0;
+        }
+
+        _usageBalloonIconId = 0;
+        _usageBalloonContent = null;
+        if (_usageBalloonWindowHandle != IntPtr.Zero)
+        {
+            NativeMethods.ShowWindow(_usageBalloonWindowHandle, NativeMethods.SW_HIDE);
+        }
+    }
+
+    private UsageBalloonContent BuildUsageBalloonContent(uint iconId)
+    {
+        List<UsageBalloonRow> rows = [];
+        string title;
+        string summary;
+        string detail;
+        string secondaryDetail = string.Empty;
+        string updated;
+
+        switch (iconId)
+        {
+            case CodexTrayIconId:
+                title = string.IsNullOrWhiteSpace(_lastCodexSnapshot?.PlanType)
+                    ? "Codex"
+                    : $"Codex {_lastCodexSnapshot.PlanType}";
+                summary = _codexStatusText;
+                detail = JoinBalloonDetails(_codexDetailText, _codexSparkUsageText);
+                updated = _codexUpdatedText;
+                if (_lastCodexSnapshot is { } codex)
+                {
+                    AddCodexRows(rows, codex, string.Empty);
+                    if (_lastCodexSparkSnapshot is { } spark)
+                    {
+                        AddCodexRows(rows, spark, "Spark · ");
+                    }
+                }
+                break;
+
+            case ClaudeTrayIconId:
+                title = "Claude";
+                summary = _claudeStatusText;
+                detail = _claudeDetailText;
+                updated = _claudeUpdatedText;
+                if (_lastClaudeSnapshot is { } claude)
+                {
+                    rows.Add(CreateQuotaRow("5h limit", claude.FiveHourUsedPercent, 100d - claude.FiveHourUsedPercent, claude.FiveHourResetAt));
+                    rows.Add(CreateQuotaRow("7d limit", claude.SevenDayUsedPercent, 100d - claude.SevenDayUsedPercent, claude.SevenDayResetAt));
+                }
+                break;
+
+            case KimiTrayIconId:
+                title = "Kimi Code";
+                summary = _kimiStatusText;
+                detail = JoinBalloonDetails(_kimiDetailText, _kimiTokenUsageText);
+                updated = _kimiUpdatedText;
+                if (_lastKimiSnapshot is { } kimi)
+                {
+                    rows.Add(CreateQuotaRow("5h limit", kimi.FiveHourUsedPercent, kimi.FiveHourRemainingPercent, kimi.FiveHourResetAt));
+                    rows.Add(CreateQuotaRow("7d limit", kimi.SevenDayUsedPercent, kimi.SevenDayRemainingPercent, kimi.SevenDayResetAt));
+                }
+                break;
+
+            case DeepSeekTrayIconId:
+                title = "DeepSeek";
+                summary = _deepSeekStatusText;
+                detail = _deepSeekDetailText;
+                updated = _deepSeekUpdatedText;
+                break;
+
+            case OpenCodeTrayIconId:
+                title = "OpenCode Go";
+                summary = _openCodeStatusText;
+                detail = _openCodeDetailText;
+                updated = _openCodeUpdatedText;
+                if (_lastOpenCodeGoSnapshot is { } openCode)
+                {
+                    rows.Add(CreateQuotaRow("5h limit", openCode.Rolling.UsedPercent, 100d - openCode.Rolling.UsedPercent, openCode.Rolling.ResetAt));
+                    rows.Add(CreateQuotaRow("Weekly limit", openCode.Weekly.UsedPercent, 100d - openCode.Weekly.UsedPercent, openCode.Weekly.ResetAt));
+                    rows.Add(CreateQuotaRow("Monthly limit", openCode.Monthly.UsedPercent, 100d - openCode.Monthly.UsedPercent, openCode.Monthly.ResetAt));
+                }
+                break;
+
+            case DevinTrayIconId:
+                title = GetDevinPlanTitle(_lastDevinSnapshot?.PlanName);
+                summary = _devinStatusText;
+                detail = _devinDetailText;
+                secondaryDetail = $"Plan period ends {FormatPlanEnd(_lastDevinSnapshot?.PlanEndAt)}";
+                updated = _devinUpdatedText;
+                if (_lastDevinSnapshot is { } devinSnapshot)
+                {
+                    rows.Add(CreateQuotaRow("Daily limit", devinSnapshot.DailyRemainingPercent is { } dailyRemaining ? 100d - dailyRemaining : null, devinSnapshot.DailyRemainingPercent, devinSnapshot.DailyResetAt));
+                    rows.Add(CreateQuotaRow("Weekly limit", devinSnapshot.WeeklyRemainingPercent is { } weeklyRemaining ? 100d - weeklyRemaining : null, devinSnapshot.WeeklyRemainingPercent, devinSnapshot.WeeklyResetAt));
+                }
+                break;
+
+            case OpenRouterTrayIconId:
+                title = "OpenRouter";
+                summary = _openRouterStatusText;
+                detail = _openRouterDetailText;
+                updated = _openRouterUpdatedText;
+                if (_lastOpenRouterSnapshot is { } openRouter)
+                {
+                    if (openRouter.KeyLimit is { } keyLimit)
+                    {
+                        decimal? keyUsed = openRouter.KeyLimitRemaining is { } keyRemaining
+                            ? Math.Max(0m, keyLimit - keyRemaining)
+                            : null;
+                        DateTimeOffset? keyResetAt = GetOpenRouterLimitResetAt(openRouter.KeyLimitReset);
+                        string keyLimitLabel = openRouter.KeyLimitReset?.ToLowerInvariant() switch
+                        {
+                            "daily" => "Daily API key cap",
+                            "weekly" => "Weekly API key cap",
+                            "monthly" => "Monthly API key cap",
+                            _ => "API key cap"
+                        };
+                        rows.Add(new UsageBalloonRow(
+                            keyLimitLabel,
+                            FormatOpenRouterAmount(keyUsed),
+                            FormatOpenRouterAmount(openRouter.KeyLimitRemaining),
+                            FormatBalloonCountdown(keyResetAt),
+                            FormatBalloonResetAt(keyResetAt)));
+                    }
+
+                    AddSpendRow(rows, "Spent today", openRouter.UsageDaily);
+                    AddSpendRow(rows, "Spent this week", openRouter.UsageWeekly);
+                    AddSpendRow(rows, "Spent this month", openRouter.UsageMonthly);
+                }
+                break;
+
+            case TemperatureTrayIconId:
+                title = "CPU / GPU temperature";
+                summary = _temperatureStatusText;
+                detail = _temperatureDetailText;
+                updated = _temperatureUpdatedText;
+                break;
+
+            case MemoryTrayIconId:
+                title = "CPU / GPU / RAM usage";
+                summary = _memoryStatusText;
+                detail = _memoryDetailText;
+                updated = _memoryUpdatedText;
+                break;
+
+            case DiskTrayIconId:
+                title = "Disk space";
+                summary = _diskStatusText;
+                detail = _diskDetailText;
+                updated = _diskUpdatedText;
+                break;
+
+            default:
+                title = "Usage";
+                summary = "No usage information available.";
+                detail = string.Empty;
+                updated = string.Empty;
+                break;
+        }
+
+        if (rows.Count == 0 && IsUsageProviderIcon(iconId))
+        {
+            detail = JoinBalloonDetails(detail, "Detailed limit windows are not currently available.");
+        }
+
+        IReadOnlyList<RamProcessUsage> topRamProcesses = iconId == MemoryTrayIconId
+            ? _lastTopRamProcesses
+            : [];
+        return new UsageBalloonContent(title, summary, detail, secondaryDetail, updated, rows, topRamProcesses);
+    }
+
+    private static bool IsUsageProviderIcon(uint iconId)
+    {
+        return iconId is CodexTrayIconId or ClaudeTrayIconId or KimiTrayIconId or
+            DeepSeekTrayIconId or OpenCodeTrayIconId or DevinTrayIconId or OpenRouterTrayIconId;
+    }
+
+    private static void AddCodexRows(List<UsageBalloonRow> rows, CodexUsageSnapshot snapshot, string prefix)
+    {
+        if (snapshot.PrimaryWindowMinutes > 0)
+        {
+            rows.Add(CreateQuotaRow(
+                $"{prefix}{FormatLimitWindow(snapshot.PrimaryWindowMinutes)} limit",
+                snapshot.PrimaryUsedPercent,
+                100d - snapshot.PrimaryUsedPercent,
+                snapshot.PrimaryResetAt));
+        }
+
+        if (snapshot.SecondaryWindowMinutes > 0)
+        {
+            rows.Add(CreateQuotaRow(
+                $"{prefix}{FormatLimitWindow(snapshot.SecondaryWindowMinutes)} limit",
+                snapshot.SecondaryUsedPercent,
+                100d - snapshot.SecondaryUsedPercent,
+                snapshot.SecondaryResetAt));
+        }
+    }
+
+    private static string FormatLimitWindow(int minutes)
+    {
+        if (minutes >= 27 * 24 * 60)
+        {
+            return "Monthly";
+        }
+
+        if (minutes >= 6 * 24 * 60)
+        {
+            return "Weekly";
+        }
+
+        return FormatWindow(minutes);
+    }
+
+    private static UsageBalloonRow CreateQuotaRow(
+        string label,
+        double? usedPercent,
+        double? remainingPercent,
+        DateTimeOffset? resetAt)
+    {
+        return new UsageBalloonRow(
+            label,
+            FormatUsagePercent(usedPercent),
+            FormatUsagePercent(remainingPercent),
+            FormatBalloonCountdown(resetAt),
+            FormatBalloonResetAt(resetAt));
+    }
+
+    private static void AddSpendRow(List<UsageBalloonRow> rows, string label, decimal? amount)
+    {
+        if (amount is { } value)
+        {
+            rows.Add(new UsageBalloonRow(label, FormatOpenRouterAmount(value), "—", "—", "—"));
+        }
+    }
+
+    private static string FormatBalloonCountdown(DateTimeOffset? resetAt)
+    {
+        if (resetAt is null)
+        {
+            return "—";
+        }
+
+        TimeSpan remaining = resetAt.Value - DateTimeOffset.Now;
+        if (remaining <= TimeSpan.Zero)
+        {
+            return "Due";
+        }
+
+        int days = (int)Math.Floor(remaining.TotalDays);
+        if (days > 0)
+        {
+            return remaining.Hours > 0 ? $"{days}d {remaining.Hours}h" : $"{days}d";
+        }
+
+        if (remaining.Hours > 0)
+        {
+            return remaining.Minutes > 0 ? $"{remaining.Hours}h {remaining.Minutes}m" : $"{remaining.Hours}h";
+        }
+
+        return $"{Math.Max(1, (int)Math.Ceiling(remaining.TotalMinutes))}m";
+    }
+
+    private static string FormatBalloonResetAt(DateTimeOffset? resetAt)
+    {
+        if (resetAt is not { } value)
+        {
+            return "—";
+        }
+
+        DateTimeOffset localReset = value.ToLocalTime();
+        string format = localReset - DateTimeOffset.Now >= TimeSpan.FromDays(6)
+            ? "MMM d · ddd h:mm tt"
+            : "ddd h:mm tt";
+        return localReset.ToString(format, CultureInfo.InvariantCulture);
+    }
+
+    private static string FormatPlanEnd(DateTimeOffset? planEndAt)
+    {
+        return planEndAt?.ToLocalTime().ToString("ddd, MMM d yyyy h:mm tt", CultureInfo.InvariantCulture) ?? "not provided";
+    }
+
+    private static DateTimeOffset? GetOpenRouterLimitResetAt(string? resetCadence)
+    {
+        DateTimeOffset utcNow = DateTimeOffset.UtcNow;
+        DateTime utcDate = utcNow.UtcDateTime.Date;
+        return resetCadence?.ToLowerInvariant() switch
+        {
+            "daily" => new DateTimeOffset(utcDate.AddDays(1), TimeSpan.Zero),
+            "weekly" => new DateTimeOffset(utcDate.AddDays(GetDaysUntilNextMonday(utcDate.DayOfWeek)), TimeSpan.Zero),
+            "monthly" => new DateTimeOffset(new DateTime(utcDate.Year, utcDate.Month, 1, 0, 0, 0, DateTimeKind.Utc).AddMonths(1)),
+            _ => null
+        };
+    }
+
+    private static int GetDaysUntilNextMonday(DayOfWeek dayOfWeek)
+    {
+        int days = (8 - (int)dayOfWeek) % 7;
+        return days == 0 ? 7 : days;
+    }
+
+    private static string GetDevinPlanTitle(string? planName)
+    {
+        return string.IsNullOrWhiteSpace(planName) || string.Equals(planName, "Devin", StringComparison.OrdinalIgnoreCase)
+            ? "Devin"
+            : $"Devin {planName}";
+    }
+
+    private static string JoinBalloonDetails(string? first, string? second)
+    {
+        if (string.IsNullOrWhiteSpace(first))
+        {
+            return second ?? string.Empty;
+        }
+
+        if (string.IsNullOrWhiteSpace(second))
+        {
+            return first;
+        }
+
+        return $"{first} · {second}";
+    }
+
+    private static bool Contains(NativeMethods.RECT rect, NativeMethods.POINT point)
+    {
+        return point.X >= rect.Left && point.X < rect.Right && point.Y >= rect.Top && point.Y < rect.Bottom;
+    }
+
+    private void PaintUsageBalloon(IntPtr windowHandle)
+    {
+        NativeMethods.PAINTSTRUCT paint = new()
+        {
+            rgbReserved = new byte[32]
+        };
+        IntPtr deviceContext = NativeMethods.BeginPaint(windowHandle, ref paint);
+        if (deviceContext == IntPtr.Zero)
+        {
+            return;
+        }
+
+        try
+        {
+            if (!NativeMethods.GetClientRect(windowHandle, out NativeMethods.RECT clientRect))
+            {
+                return;
+            }
+
+            IntPtr backgroundBrush = NativeMethods.CreateSolidBrush(ColorRef(31, 34, 40));
+            IntPtr borderBrush = NativeMethods.CreateSolidBrush(ColorRef(72, 78, 88));
+            IntPtr accentBrush = NativeMethods.CreateSolidBrush(ColorRef(89, 166, 255));
+            IntPtr bodyFont = NativeMethods.GetStockObject(NativeMethods.DEFAULT_GUI_FONT);
+            IntPtr titleFont = NativeMethods.CreateFontW(
+                -20, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI");
+            try
+            {
+                NativeMethods.FillRect(deviceContext, ref clientRect, backgroundBrush);
+                NativeMethods.FrameRect(deviceContext, ref clientRect, borderBrush);
+                NativeMethods.RECT accentRect = new()
+                {
+                    Left = clientRect.Left + 1,
+                    Top = clientRect.Top + 1,
+                    Right = clientRect.Left + 4,
+                    Bottom = clientRect.Bottom - 1
+                };
+                NativeMethods.FillRect(deviceContext, ref accentRect, accentBrush);
+                NativeMethods.SetBkMode(deviceContext, NativeMethods.TRANSPARENT);
+
+                UsageBalloonContent content = _usageBalloonContent ?? new UsageBalloonContent(
+                    "Usage", "No usage information available.", string.Empty, string.Empty, string.Empty, [], []);
+                int x = 20;
+                int width = Math.Max(1, clientRect.Right - x - 18);
+                int y = 14;
+                DrawBalloonText(deviceContext, content.Title, x, y, width, 27, ColorRef(250, 251, 252),
+                    NativeMethods.DT_LEFT | NativeMethods.DT_SINGLELINE | NativeMethods.DT_VCENTER | NativeMethods.DT_END_ELLIPSIS,
+                    titleFont);
+                y += 31;
+                DrawBalloonText(deviceContext, content.Summary, x, y, width, 20, ColorRef(225, 229, 235),
+                    NativeMethods.DT_LEFT | NativeMethods.DT_SINGLELINE | NativeMethods.DT_VCENTER | NativeMethods.DT_END_ELLIPSIS,
+                    bodyFont);
+                y += 22;
+                if (!string.IsNullOrWhiteSpace(content.Detail))
+                {
+                    DrawBalloonText(deviceContext, content.Detail, x, y, width, 20, ColorRef(177, 185, 196),
+                        NativeMethods.DT_LEFT | NativeMethods.DT_SINGLELINE | NativeMethods.DT_VCENTER | NativeMethods.DT_END_ELLIPSIS,
+                        bodyFont);
+                    y += 24;
+                }
+
+                if (!string.IsNullOrWhiteSpace(content.SecondaryDetail))
+                {
+                    DrawBalloonText(deviceContext, content.SecondaryDetail, x, y, width, 20, ColorRef(177, 185, 196),
+                        NativeMethods.DT_LEFT | NativeMethods.DT_SINGLELINE | NativeMethods.DT_VCENTER | NativeMethods.DT_END_ELLIPSIS,
+                        bodyFont);
+                    y += 22;
+                }
+
+                if (content.Rows.Count > 0)
+                {
+                    NativeMethods.RECT separator = new()
+                    {
+                        Left = x,
+                        Top = y + 1,
+                        Right = clientRect.Right - 18,
+                        Bottom = y + 2
+                    };
+                    NativeMethods.FillRect(deviceContext, ref separator, borderBrush);
+                    y += 10;
+
+                    int[] columns = [x, x + 142, x + 210, x + 282, x + 370];
+                    int[] widths = [138, 64, 68, 84, width - 370];
+                    string[] headings = ["LIMIT", "USED", "LEFT", "TILL RESET", "RESET AT · LOCAL"];
+                    for (int column = 0; column < headings.Length; column++)
+                    {
+                        uint alignment = column == 0
+                            ? NativeMethods.DT_LEFT
+                            : NativeMethods.DT_RIGHT;
+                        DrawBalloonText(deviceContext, headings[column], columns[column], y, widths[column], 18,
+                            ColorRef(134, 145, 160), alignment | NativeMethods.DT_SINGLELINE | NativeMethods.DT_VCENTER | NativeMethods.DT_END_ELLIPSIS,
+                            bodyFont);
+                    }
+
+                    y += 22;
+                    foreach (UsageBalloonRow row in content.Rows)
+                    {
+                        string[] values = [row.Limit, row.Used, row.Remaining, row.UntilReset, row.ResetAt];
+                        for (int column = 0; column < values.Length; column++)
+                        {
+                            uint alignment = column == 0
+                                ? NativeMethods.DT_LEFT
+                                : NativeMethods.DT_RIGHT;
+                            DrawBalloonText(deviceContext, values[column], columns[column], y, widths[column], 20,
+                                ColorRef(231, 234, 239), alignment | NativeMethods.DT_SINGLELINE | NativeMethods.DT_VCENTER | NativeMethods.DT_END_ELLIPSIS,
+                                bodyFont);
+                        }
+
+                        y += 25;
+                    }
+                }
+
+                if (content.TopRamProcesses.Count > 0)
+                {
+                    NativeMethods.RECT separator = new()
+                    {
+                        Left = x,
+                        Top = y + 1,
+                        Right = clientRect.Right - 18,
+                        Bottom = y + 2
+                    };
+                    NativeMethods.FillRect(deviceContext, ref separator, borderBrush);
+                    y += 10;
+
+                    int processColumnX = x + width - 148;
+                    int pidColumnX = x + width - 92;
+                    DrawBalloonText(deviceContext, "TOP RAM PROCESSES · WORKING SET", x, y, width - 148, 18,
+                        ColorRef(134, 145, 160),
+                        NativeMethods.DT_LEFT | NativeMethods.DT_SINGLELINE | NativeMethods.DT_VCENTER | NativeMethods.DT_END_ELLIPSIS,
+                        bodyFont);
+                    DrawBalloonText(deviceContext, "PID", processColumnX, y, 48, 18,
+                        ColorRef(134, 145, 160),
+                        NativeMethods.DT_RIGHT | NativeMethods.DT_SINGLELINE | NativeMethods.DT_VCENTER,
+                        bodyFont);
+                    DrawBalloonText(deviceContext, "RAM", pidColumnX, y, 90, 18,
+                        ColorRef(134, 145, 160),
+                        NativeMethods.DT_RIGHT | NativeMethods.DT_SINGLELINE | NativeMethods.DT_VCENTER,
+                        bodyFont);
+                    y += 22;
+
+                    foreach (RamProcessUsage process in content.TopRamProcesses)
+                    {
+                        DrawBalloonText(deviceContext, process.Name, x, y, width - 148, 20,
+                            ColorRef(231, 234, 239),
+                            NativeMethods.DT_LEFT | NativeMethods.DT_SINGLELINE | NativeMethods.DT_VCENTER | NativeMethods.DT_END_ELLIPSIS,
+                            bodyFont);
+                        DrawBalloonText(deviceContext, process.ProcessId.ToString(CultureInfo.InvariantCulture), processColumnX, y, 48, 20,
+                            ColorRef(177, 185, 196),
+                            NativeMethods.DT_RIGHT | NativeMethods.DT_SINGLELINE | NativeMethods.DT_VCENTER,
+                            bodyFont);
+                        DrawBalloonText(deviceContext, DiskMonitor.FormatBytes(process.WorkingSetBytes), pidColumnX, y, 90, 20,
+                            ColorRef(231, 234, 239),
+                            NativeMethods.DT_RIGHT | NativeMethods.DT_SINGLELINE | NativeMethods.DT_VCENTER,
+                            bodyFont);
+                        y += 23;
+                    }
+                }
+
+                if (!string.IsNullOrWhiteSpace(content.Updated))
+                {
+                    DrawBalloonText(deviceContext, content.Updated, x, clientRect.Bottom - 23, width, 16,
+                        ColorRef(131, 140, 152),
+                        NativeMethods.DT_LEFT | NativeMethods.DT_SINGLELINE | NativeMethods.DT_VCENTER | NativeMethods.DT_END_ELLIPSIS,
+                        bodyFont);
+                }
+            }
+            finally
+            {
+                if (bodyFont != IntPtr.Zero)
+                {
+                    NativeMethods.SelectObject(deviceContext, bodyFont);
+                }
+
+                NativeMethods.DeleteObject(backgroundBrush);
+                NativeMethods.DeleteObject(borderBrush);
+                NativeMethods.DeleteObject(accentBrush);
+                if (titleFont != IntPtr.Zero)
+                {
+                    NativeMethods.DeleteObject(titleFont);
+                }
+            }
+        }
+        finally
+        {
+            NativeMethods.EndPaint(windowHandle, ref paint);
+        }
+    }
+
+    private static void DrawBalloonText(
+        IntPtr deviceContext,
+        string text,
+        int x,
+        int y,
+        int width,
+        int height,
+        uint color,
+        uint format,
+        IntPtr font)
+    {
+        if (font != IntPtr.Zero)
+        {
+            NativeMethods.SelectObject(deviceContext, font);
+        }
+
+        NativeMethods.SetTextColor(deviceContext, color);
+        NativeMethods.RECT textRect = new()
+        {
+            Left = x,
+            Top = y,
+            Right = x + width,
+            Bottom = y + height
+        };
+        NativeMethods.DrawText(deviceContext, text, text.Length, ref textRect, format);
+    }
+
+    private static uint ColorRef(byte red, byte green, byte blue)
+    {
+        return (uint)(red | (green << 8) | (blue << 16));
+    }
+
+    private sealed record UsageBalloonContent(
+        string Title,
+        string Summary,
+        string Detail,
+        string SecondaryDetail,
+        string Updated,
+        IReadOnlyList<UsageBalloonRow> Rows,
+        IReadOnlyList<RamProcessUsage> TopRamProcesses);
+
+    private sealed record UsageBalloonRow(
+        string Limit,
+        string Used,
+        string Remaining,
+        string UntilReset,
+        string ResetAt);
+
     private void RecreateTrayIcons()
     {
         _codexTrayIconAdded = false;
@@ -1845,6 +3030,8 @@ internal sealed class TrayApplication : IDisposable
         _openCodeTrayIconAdded = false;
         _temperatureTrayIconAdded = false;
         _memoryTrayIconAdded = false;
+        _devinTrayIconAdded = false;
+        _openRouterTrayIconAdded = false;
         _codexIconKey = null;
         _claudeIconKey = null;
         _kimiIconKey = null;
@@ -1853,6 +3040,8 @@ internal sealed class TrayApplication : IDisposable
         _openCodeIconKey = null;
         _temperatureIconKey = null;
         _memoryIconKey = null;
+        _devinIconKey = null;
+        _openRouterIconKey = null;
         _codexAppliedTooltip = null;
         _claudeAppliedTooltip = null;
         _kimiAppliedTooltip = null;
@@ -1861,6 +3050,8 @@ internal sealed class TrayApplication : IDisposable
         _openCodeAppliedTooltip = null;
         _temperatureAppliedTooltip = null;
         _memoryAppliedTooltip = null;
+        _devinAppliedTooltip = null;
+        _openRouterAppliedTooltip = null;
 
         RefreshVisibleTrayIcons();
         RefreshUsage();
@@ -1945,6 +3136,32 @@ internal sealed class TrayApplication : IDisposable
                 TrayIconRenderer.OpenCodeUnavailableIconKey);
         }
 
+        if (_lastDevinSnapshot is { } devinSnapshot)
+        {
+            UpdateDevinTrayIcon(
+                TrayIconRenderer.CreateDevinIcon(devinSnapshot),
+                TrayIconRenderer.GetDevinIconKey(devinSnapshot));
+        }
+        else
+        {
+            UpdateDevinTrayIcon(
+                TrayIconRenderer.CreateDevinUnavailableIcon(),
+                TrayIconRenderer.DevinUnavailableIconKey);
+        }
+
+        if (_lastOpenRouterSnapshot is { } openRouterSnapshot)
+        {
+            UpdateOpenRouterTrayIcon(
+                TrayIconRenderer.CreateOpenRouterIcon(openRouterSnapshot),
+                TrayIconRenderer.GetOpenRouterIconKey(openRouterSnapshot));
+        }
+        else
+        {
+            UpdateOpenRouterTrayIcon(
+                TrayIconRenderer.CreateOpenRouterUnavailableIcon(),
+                TrayIconRenderer.OpenRouterUnavailableIconKey);
+        }
+
         if (_lastHardwareSnapshot is { } hardwareSnapshot)
         {
             UpdateTemperatureTrayIcon(
@@ -1976,6 +3193,8 @@ internal sealed class TrayApplication : IDisposable
             TrayIconKind.OpenCode => "OpenCode Go",
             TrayIconKind.Temperature => "CPU/GPU temperature",
             TrayIconKind.CpuGpuLoad => "CPU/GPU load (always on)",
+            TrayIconKind.Devin => "Devin quota",
+            TrayIconKind.OpenRouter => "OpenRouter balance",
             _ => "Codex"
         };
     }
@@ -2052,6 +3271,7 @@ internal sealed class TrayApplication : IDisposable
 
     private void ShowContextMenu(uint iconId)
     {
+        HideUsageBalloon(clearPendingHover: true);
         IntPtr menuHandle = NativeMethods.CreatePopupMenu();
         if (menuHandle == IntPtr.Zero)
         {
@@ -2110,6 +3330,24 @@ internal sealed class TrayApplication : IDisposable
                 sourceText = _openCodeSourceText;
                 openCommand = CommandOpenOpenCodeData;
                 openLabel = "Open OpenCode data";
+                break;
+
+            case DevinTrayIconId:
+                statusText = _devinStatusText;
+                detailText = _devinDetailText;
+                updatedText = _devinUpdatedText;
+                sourceText = _devinSourceText;
+                openCommand = CommandOpenDevinUsage;
+                openLabel = "Open Devin usage";
+                break;
+
+            case OpenRouterTrayIconId:
+                statusText = _openRouterStatusText;
+                detailText = _openRouterDetailText;
+                updatedText = _openRouterUpdatedText;
+                sourceText = _openRouterSourceText;
+                openCommand = CommandOpenOpenRouterCredits;
+                openLabel = "Open OpenRouter credits";
                 break;
 
             case TemperatureTrayIconId:
@@ -2225,6 +3463,14 @@ internal sealed class TrayApplication : IDisposable
                 OpenOpenCodeDataDirectory();
                 break;
 
+            case CommandOpenDevinUsage:
+                OpenDevinUsagePage();
+                break;
+
+            case CommandOpenOpenRouterCredits:
+                OpenOpenRouterCreditsPage();
+                break;
+
             case CommandOpenTaskManager:
                 OpenTaskManager();
                 break;
@@ -2304,6 +3550,24 @@ internal sealed class TrayApplication : IDisposable
         });
     }
 
+    private static void OpenDevinUsagePage()
+    {
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = "https://app.devin.ai/settings/usage",
+            UseShellExecute = true
+        });
+    }
+
+    private static void OpenOpenRouterCreditsPage()
+    {
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = "https://openrouter.ai/settings/credits",
+            UseShellExecute = true
+        });
+    }
+
     private static void OpenTaskManager()
     {
         Process.Start(new ProcessStartInfo
@@ -2363,6 +3627,13 @@ internal sealed class TrayApplication : IDisposable
 
     private void CleanupNativeResources()
     {
+        HideUsageBalloon(clearPendingHover: true);
+        if (_usageBalloonWindowHandle != IntPtr.Zero)
+        {
+            NativeMethods.DestroyWindow(_usageBalloonWindowHandle);
+            _usageBalloonWindowHandle = IntPtr.Zero;
+        }
+
         RemoveTrayIcon(CodexTrayIconId, ref _codexTrayIconAdded);
         RemoveTrayIcon(ClaudeTrayIconId, ref _claudeTrayIconAdded);
         RemoveTrayIcon(KimiTrayIconId, ref _kimiTrayIconAdded);
@@ -2371,6 +3642,8 @@ internal sealed class TrayApplication : IDisposable
         RemoveTrayIcon(OpenCodeTrayIconId, ref _openCodeTrayIconAdded);
         RemoveTrayIcon(TemperatureTrayIconId, ref _temperatureTrayIconAdded);
         RemoveTrayIcon(MemoryTrayIconId, ref _memoryTrayIconAdded);
+        RemoveTrayIcon(DevinTrayIconId, ref _devinTrayIconAdded);
+        RemoveTrayIcon(OpenRouterTrayIconId, ref _openRouterTrayIconAdded);
 
         _diskSettingsWindow?.Dispose();
         _diskSettingsWindow = null;
@@ -2379,6 +3652,8 @@ internal sealed class TrayApplication : IDisposable
         {
             NativeMethods.KillTimer(_windowHandle, RefreshTimerId);
             NativeMethods.KillTimer(_windowHandle, HardwareRefreshTimerId);
+            NativeMethods.KillTimer(_windowHandle, UsageBalloonDelayTimerId);
+            NativeMethods.KillTimer(_windowHandle, UsageBalloonMonitorTimerId);
         }
 
         _hardwareMonitor.Dispose();
@@ -2391,11 +3666,19 @@ internal sealed class TrayApplication : IDisposable
         DestroyIconHandle(ref _openCodeIconHandle);
         DestroyIconHandle(ref _temperatureIconHandle);
         DestroyIconHandle(ref _memoryIconHandle);
+        DestroyIconHandle(ref _devinIconHandle);
+        DestroyIconHandle(ref _openRouterIconHandle);
 
         if (_windowClassRegistered)
         {
             NativeMethods.UnregisterClass(_windowClassName, NativeMethods.GetModuleHandle(null));
             _windowClassRegistered = false;
+        }
+
+        if (_usageBalloonWindowClassRegistered)
+        {
+            NativeMethods.UnregisterClass(_usageBalloonWindowClassName, NativeMethods.GetModuleHandle(null));
+            _usageBalloonWindowClassRegistered = false;
         }
     }
 
@@ -2663,7 +3946,7 @@ internal sealed class TrayApplication : IDisposable
     private static string BuildOpenCodeGoDetail(OpenCodeGoUsageSnapshot snapshot)
     {
         return $"Rolling 5-hour limit ${OpenCodeGoLimits.RollingUsd}, " +
-               $"weekly ${OpenCodeGoLimits.WeeklyUsd}, monthly ${OpenCodeGoLimits.MonthlyUsd}; " +
+               $"weekly ${OpenCodeGoLimits.WeeklyUsd}; monthly allowance varies by model; " +
                BuildOpenCodeGoSummary(snapshot);
     }
 
@@ -2679,6 +3962,93 @@ internal sealed class TrayApplication : IDisposable
         return string.IsNullOrWhiteSpace(goUsageError)
             ? text
             : $"{text}; {goUsageError}";
+    }
+
+    private static string BuildOpenRouterTooltip(OpenRouterBalanceSnapshot snapshot)
+    {
+        return TruncateTooltip(
+            $"OpenRouter: {FormatOpenRouterAmount(snapshot.SpendableBalance)} left" +
+            (snapshot.UsageDaily is { } daily ? $", {FormatOpenRouterAmount(daily)} today" : string.Empty));
+    }
+
+    private static string BuildOpenRouterUnavailableTooltip(string? errorMessage)
+    {
+        return string.IsNullOrWhiteSpace(errorMessage)
+            ? "OpenRouter: balance unavailable"
+            : TruncateTooltip($"OpenRouter: balance unavailable ({errorMessage})");
+    }
+
+    private static string BuildOpenRouterHeadline(OpenRouterBalanceSnapshot snapshot)
+    {
+        string text = $"OpenRouter: {FormatOpenRouterAmount(snapshot.SpendableBalance)} left";
+        if (snapshot.KeyLimitRemaining is { } keyRemaining &&
+            snapshot.AccountBalance is { } balance &&
+            keyRemaining < balance)
+        {
+            text += " (key limit)";
+        }
+
+        return snapshot.IsFreeTier ? $"{text} | free tier" : text;
+    }
+
+    private static string BuildOpenRouterDetail(OpenRouterBalanceSnapshot snapshot)
+    {
+        List<string> parts = [];
+        if (snapshot.AccountBalance is { } balance)
+        {
+            parts.Add(
+                $"Account {FormatOpenRouterAmount(balance)} " +
+                $"({FormatOpenRouterAmount(snapshot.TotalUsage)} of {FormatOpenRouterAmount(snapshot.TotalCredits)} used)");
+        }
+
+        if (snapshot.KeyLimit is { } limit)
+        {
+            string reset = string.IsNullOrWhiteSpace(snapshot.KeyLimitReset)
+                ? string.Empty
+                : $", resets {snapshot.KeyLimitReset}";
+            parts.Add(
+                $"key {FormatOpenRouterAmount(snapshot.KeyLimitRemaining)} of {FormatOpenRouterAmount(limit)}{reset}");
+        }
+
+        parts.Add(
+            $"key spend today {FormatOpenRouterAmount(snapshot.UsageDaily)}, " +
+            $"week {FormatOpenRouterAmount(snapshot.UsageWeekly)}, " +
+            $"month {FormatOpenRouterAmount(snapshot.UsageMonthly)}");
+        return string.Join("; ", parts);
+    }
+
+    private static string FormatOpenRouterAmount(decimal? amount)
+    {
+        return amount is { } value
+            ? $"${value.ToString("0.00", CultureInfo.InvariantCulture)}"
+            : "?";
+    }
+
+    private static string BuildDevinTooltip(DevinUsageSnapshot snapshot, bool isStale)
+    {
+        return TruncateTooltip(
+            $"{GetDevinPlanTitle(snapshot.PlanName)}: daily {FormatUsagePercent(snapshot.DailyRemainingPercent)} left, " +
+            $"weekly {FormatUsagePercent(snapshot.WeeklyRemainingPercent)} left" +
+            (isStale ? " (last known)" : string.Empty));
+    }
+
+    private static string BuildDevinUnavailableTooltip(string? errorMessage)
+    {
+        return string.IsNullOrWhiteSpace(errorMessage)
+            ? "Devin: quota unavailable"
+            : TruncateTooltip($"Devin: quota unavailable ({errorMessage})");
+    }
+
+    private static string BuildDevinHeadline(DevinUsageSnapshot snapshot)
+    {
+        return $"{GetDevinPlanTitle(snapshot.PlanName)}: daily {FormatUsagePercent(snapshot.DailyRemainingPercent)} left | " +
+               $"weekly {FormatUsagePercent(snapshot.WeeklyRemainingPercent)} left";
+    }
+
+    private static string BuildDevinDetail(DevinUsageSnapshot snapshot)
+    {
+        return $"Daily {FormatResetCountdown(snapshot.DailyResetAt)}, " +
+               $"weekly {FormatResetCountdown(snapshot.WeeklyResetAt)}";
     }
 
     private static string BuildTemperatureTooltip(HardwareSnapshot snapshot)
@@ -2705,19 +4075,25 @@ internal sealed class TrayApplication : IDisposable
     {
         return TruncateTooltip(
             $"Usage: CPU {FormatUsagePercent(snapshot.CpuUsagePercent)}, " +
-            $"GPU {FormatUsagePercent(snapshot.GpuUsagePercent)}");
+            $"GPU {FormatUsagePercent(snapshot.GpuUsagePercent)}, " +
+            $"RAM {FormatUsagePercent(snapshot.RamUsagePercent)}, " +
+            $"VRAM {FormatUsagePercent(snapshot.VramUsagePercent)}");
     }
 
     private static string BuildUsageHeadline(HardwareSnapshot snapshot)
     {
         return $"Usage: CPU {FormatUsagePercent(snapshot.CpuUsagePercent)} | " +
-               $"GPU {FormatUsagePercent(snapshot.GpuUsagePercent)}";
+               $"GPU {FormatUsagePercent(snapshot.GpuUsagePercent)} | " +
+               $"RAM {FormatUsagePercent(snapshot.RamUsagePercent)} | " +
+               $"VRAM {FormatUsagePercent(snapshot.VramUsagePercent)}";
     }
 
     private static string BuildUsageDetail(HardwareSnapshot snapshot)
     {
         return $"CPU {FormatUsagePercent(snapshot.CpuUsagePercent)}; " +
-               $"GPU {FormatUsagePercent(snapshot.GpuUsagePercent)}";
+               $"GPU {FormatUsagePercent(snapshot.GpuUsagePercent)}; " +
+               $"RAM {FormatMemoryUsage(snapshot.RamUsagePercent, snapshot.RamTotalBytes, snapshot.RamAvailableBytes)}; " +
+               $"VRAM {FormatMemoryUsage(snapshot.VramUsagePercent, snapshot.VramTotalBytes, snapshot.VramAvailableBytes)}";
     }
 
     private static string FormatTemperature(double? temperatureC)
@@ -2735,6 +4111,22 @@ internal sealed class TrayApplication : IDisposable
         }
 
         return $"{Math.Clamp(usagePercent.Value, 0d, 100d):0.#}%";
+    }
+
+    private static string FormatMemoryUsage(
+        double? usagePercent,
+        long? totalBytes,
+        long? availableBytes)
+    {
+        if (totalBytes is not { } total || availableBytes is not { } available || total <= 0)
+        {
+            return FormatUsagePercent(usagePercent);
+        }
+
+        long clampedAvailable = Math.Clamp(available, 0, total);
+        long usedBytes = total - clampedAvailable;
+        return $"{DiskMonitor.FormatBytes(usedBytes)} / {DiskMonitor.FormatBytes(total)} " +
+               $"({FormatUsagePercent(usagePercent)})";
     }
 
     private void AlertDiskLimits(DiskSpaceSnapshot snapshot)
@@ -4776,7 +6168,6 @@ internal static class OpenCodeGoLimits
 {
     public const decimal RollingUsd = 12m;
     public const decimal WeeklyUsd = 30m;
-    public const decimal MonthlyUsd = 60m;
 }
 
 internal sealed record OpenCodeGoUsageWindow(
@@ -5151,6 +6542,599 @@ internal sealed class UnetBalanceReader
             HttpRequestException => "UNET HTTP request failed.",
             _ => "UNET login or balance parsing failed."
         };
+    }
+}
+
+internal sealed record DevinUsageSnapshot(
+    DateTimeOffset Timestamp,
+    string? PlanName,
+    double? DailyRemainingPercent,
+    double? WeeklyRemainingPercent,
+    DateTimeOffset? DailyResetAt,
+    DateTimeOffset? WeeklyResetAt,
+    DateTimeOffset? PlanEndAt,
+    string Source);
+
+internal sealed record DevinUsageReadResult(DevinUsageSnapshot? Snapshot, string? ErrorMessage);
+
+internal sealed class DevinUsageReader
+{
+    private const string DefaultApiBaseUrl = "https://server.codeium.com";
+    private const string GetUserStatusPath = "/exa.seat_management_pb.SeatManagementService/GetUserStatus";
+    private const string DevinCredentialsFileName = "credentials.toml";
+    private static readonly HttpClient HttpClient = new()
+    {
+        Timeout = TimeSpan.FromSeconds(15)
+    };
+
+    public string CredentialsPath { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "Devin",
+        DevinCredentialsFileName);
+
+    public string UsageEndpoint => $"{DefaultApiBaseUrl}{GetUserStatusPath}";
+
+    public DevinUsageReadResult ReadLatestSnapshot()
+    {
+        try
+        {
+            DevinCredential credential = ReadCredential();
+            string endpoint = new Uri(
+                new Uri(credential.ApiBaseUrl, UriKind.Absolute),
+                GetUserStatusPath).ToString();
+
+            using HttpRequestMessage request = new(HttpMethod.Post, endpoint)
+            {
+                Content = new ByteArrayContent(BuildGetUserStatusRequest(credential.Token))
+            };
+            request.Content.Headers.TryAddWithoutValidation("Content-Type", "application/proto");
+            request.Headers.TryAddWithoutValidation("Connect-Protocol-Version", "1");
+            request.Headers.TryAddWithoutValidation(
+                "Authorization",
+                $"Basic {credential.Token}-{credential.Token}");
+
+            using HttpResponseMessage response = HttpClient.Send(request);
+            if (!response.IsSuccessStatusCode)
+            {
+                return new DevinUsageReadResult(
+                    null,
+                    $"Devin quota request failed: HTTP {(int)response.StatusCode}");
+            }
+
+            byte[] responseBody = response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+            DevinUsageSnapshot? snapshot = ParseUserStatus(responseBody, endpoint);
+            return snapshot is null
+                ? new DevinUsageReadResult(null, "Devin quota response could not be parsed.")
+                : new DevinUsageReadResult(snapshot, null);
+        }
+        catch (TaskCanceledException)
+        {
+            return new DevinUsageReadResult(null, "Devin quota request timed out.");
+        }
+        catch (HttpRequestException)
+        {
+            return new DevinUsageReadResult(null, "Devin quota request failed.");
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return new DevinUsageReadResult(null, "Devin credentials could not be read.");
+        }
+        catch (IOException)
+        {
+            return new DevinUsageReadResult(null, "Devin credentials could not be read.");
+        }
+        catch (InvalidOperationException exception)
+        {
+            return new DevinUsageReadResult(null, exception.Message);
+        }
+        catch (FormatException)
+        {
+            return new DevinUsageReadResult(null, "Devin quota response was invalid.");
+        }
+        catch (Exception)
+        {
+            return new DevinUsageReadResult(null, "Devin quota is unavailable.");
+        }
+    }
+
+    private DevinCredential ReadCredential()
+    {
+        if (!File.Exists(CredentialsPath))
+        {
+            throw new InvalidOperationException($"Devin credentials were not found at {CredentialsPath}.");
+        }
+
+        string contents = File.ReadAllText(CredentialsPath);
+        string token = ReadTomlString(contents, "windsurf_api_key")
+            ?? throw new InvalidOperationException("Devin API key was not found in the local credentials file.");
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            throw new InvalidOperationException("Devin API key was empty in the local credentials file.");
+        }
+
+        string apiBaseUrl = ReadTomlString(contents, "api_server_url") ?? DefaultApiBaseUrl;
+        if (!Uri.TryCreate(apiBaseUrl, UriKind.Absolute, out Uri? apiBaseUri) ||
+            (!string.Equals(apiBaseUri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
+             !string.Equals(apiBaseUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new InvalidOperationException("Devin API server URL was invalid.");
+        }
+
+        return new DevinCredential(token, apiBaseUri.ToString().TrimEnd('/'));
+    }
+
+    private static string? ReadTomlString(string contents, string key)
+    {
+        foreach (string line in contents.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
+        {
+            int equalsIndex = line.IndexOf('=');
+            if (equalsIndex <= 0 ||
+                !string.Equals(line[..equalsIndex].Trim(), key, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            string value = line[(equalsIndex + 1)..].Trim();
+            if (value.Length >= 2 && value[0] == '"' && value[^1] == '"')
+            {
+                return value[1..^1]
+                    .Replace("\\\\", "\\", StringComparison.Ordinal)
+                    .Replace("\\\"", "\"", StringComparison.Ordinal);
+            }
+
+            if (value.Length >= 2 && value[0] == '\'' && value[^1] == '\'')
+            {
+                return value[1..^1];
+            }
+
+            return value;
+        }
+
+        return null;
+    }
+
+    private static byte[] BuildGetUserStatusRequest(string token)
+    {
+        List<byte> metadata = [];
+        AppendStringField(metadata, 1, "chisel");
+        AppendStringField(metadata, 2, "0.0.0-dev");
+        AppendStringField(metadata, 3, token);
+        AppendStringField(metadata, 4, "en");
+        AppendStringField(metadata, 5, "windows");
+        AppendStringField(metadata, 7, "0.0.0-dev");
+
+        List<byte> body = [10];
+        AppendVarint(body, (ulong)metadata.Count);
+        body.AddRange(metadata);
+        return body.ToArray();
+    }
+
+    private static void AppendStringField(List<byte> target, int fieldNumber, string value)
+    {
+        byte[] bytes = Encoding.UTF8.GetBytes(value);
+        target.Add((byte)((fieldNumber << 3) | 2));
+        AppendVarint(target, (ulong)bytes.Length);
+        target.AddRange(bytes);
+    }
+
+    private static void AppendVarint(List<byte> target, ulong value)
+    {
+        while (value > 0x7F)
+        {
+            target.Add((byte)((value & 0x7F) | 0x80));
+            value >>= 7;
+        }
+
+        target.Add((byte)value);
+    }
+
+    private static DevinUsageSnapshot? ParseUserStatus(byte[] response, string source)
+    {
+        List<ProtoField>? responseFields = DecodeFields(response);
+        byte[]? userStatusBytes = GetBytes(responseFields, 1);
+        List<ProtoField>? userStatusFields = userStatusBytes is null
+            ? null
+            : DecodeFields(userStatusBytes);
+        byte[]? planStatusBytes = GetBytes(userStatusFields, 13);
+        List<ProtoField>? planStatusFields = planStatusBytes is null
+            ? null
+            : DecodeFields(planStatusBytes);
+        if (planStatusFields is null)
+        {
+            return null;
+        }
+
+        string? planName = null;
+        byte[]? planInfoBytes = GetBytes(planStatusFields, 1);
+        if (planInfoBytes is not null)
+        {
+            planName = GetString(DecodeFields(planInfoBytes), 2);
+        }
+
+        return new DevinUsageSnapshot(
+            DateTimeOffset.UtcNow,
+            planName,
+            GetPercent(planStatusFields, 14),
+            GetPercent(planStatusFields, 15),
+            GetResetAt(planStatusFields, 17),
+            GetResetAt(planStatusFields, 18),
+            GetTimestampAt(planStatusFields, 3),
+            source);
+    }
+
+    private static DateTimeOffset? GetTimestampAt(List<ProtoField>? fields, int fieldNumber)
+    {
+        byte[]? timestampBytes = GetBytes(fields, fieldNumber);
+        return timestampBytes is null
+            ? null
+            : GetResetAt(DecodeFields(timestampBytes), 1);
+    }
+
+    private static double? GetPercent(List<ProtoField>? fields, int fieldNumber)
+    {
+        ulong? value = GetVarint(fields, fieldNumber);
+        return value is null ? null : Math.Clamp((double)value.Value, 0d, 100d);
+    }
+
+    private static DateTimeOffset? GetResetAt(List<ProtoField>? fields, int fieldNumber)
+    {
+        ulong? value = GetVarint(fields, fieldNumber);
+        if (value is null || value.Value > long.MaxValue || value.Value == 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            return DateTimeOffset.FromUnixTimeSeconds((long)value.Value);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return null;
+        }
+    }
+
+    private static byte[]? GetBytes(List<ProtoField>? fields, int fieldNumber)
+    {
+        return fields?.FirstOrDefault(field => field.Number == fieldNumber && field.Bytes is not null)?.Bytes;
+    }
+
+    private static ulong? GetVarint(List<ProtoField>? fields, int fieldNumber)
+    {
+        return fields?.FirstOrDefault(field => field.Number == fieldNumber && field.Varint is not null)?.Varint;
+    }
+
+    private static string? GetString(List<ProtoField>? fields, int fieldNumber)
+    {
+        byte[]? bytes = GetBytes(fields, fieldNumber);
+        return bytes is null ? null : Encoding.UTF8.GetString(bytes);
+    }
+
+    private static List<ProtoField>? DecodeFields(byte[] buffer)
+    {
+        List<ProtoField> fields = [];
+        int offset = 0;
+        while (offset < buffer.Length)
+        {
+            if (!TryReadVarint(buffer, ref offset, out ulong tag) || tag >> 3 == 0)
+            {
+                return null;
+            }
+
+            int fieldNumber = checked((int)(tag >> 3));
+            int wireType = (int)(tag & 7);
+            switch (wireType)
+            {
+                case 0:
+                    if (!TryReadVarint(buffer, ref offset, out ulong varint))
+                    {
+                        return null;
+                    }
+
+                    fields.Add(new ProtoField(fieldNumber, varint, null));
+                    break;
+
+                case 1:
+                    if (buffer.Length - offset < sizeof(long))
+                    {
+                        return null;
+                    }
+
+                    offset += sizeof(long);
+                    break;
+
+                case 2:
+                    if (!TryReadVarint(buffer, ref offset, out ulong byteLength) ||
+                        byteLength > int.MaxValue ||
+                        byteLength > (ulong)(buffer.Length - offset))
+                    {
+                        return null;
+                    }
+
+                    int length = (int)byteLength;
+                    byte[] bytes = new byte[length];
+                    Buffer.BlockCopy(buffer, offset, bytes, 0, length);
+                    offset += length;
+                    fields.Add(new ProtoField(fieldNumber, null, bytes));
+                    break;
+
+                case 5:
+                    if (buffer.Length - offset < sizeof(int))
+                    {
+                        return null;
+                    }
+
+                    offset += sizeof(int);
+                    break;
+
+                default:
+                    return null;
+            }
+        }
+
+        return fields;
+    }
+
+    private static bool TryReadVarint(byte[] buffer, ref int offset, out ulong value)
+    {
+        value = 0;
+        for (int shift = 0; shift < 64; shift += 7)
+        {
+            if (offset >= buffer.Length)
+            {
+                return false;
+            }
+
+            byte current = buffer[offset++];
+            if (shift == 63 && (current & 0xFE) != 0)
+            {
+                return false;
+            }
+
+            value |= (ulong)(current & 0x7F) << shift;
+            if ((current & 0x80) == 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private sealed record DevinCredential(string Token, string ApiBaseUrl);
+
+    private sealed record ProtoField(int Number, ulong? Varint, byte[]? Bytes);
+}
+
+internal sealed record OpenRouterBalanceSnapshot(
+    DateTimeOffset Timestamp,
+    decimal? TotalCredits,
+    decimal? TotalUsage,
+    string? KeyLabel,
+    decimal? KeyLimit,
+    decimal? KeyLimitRemaining,
+    string? KeyLimitReset,
+    decimal? UsageDaily,
+    decimal? UsageWeekly,
+    decimal? UsageMonthly,
+    bool IsFreeTier,
+    string KeySource,
+    string Source)
+{
+    public decimal? AccountBalance =>
+        TotalCredits is { } credits && TotalUsage is { } usage ? credits - usage : null;
+
+    // What can actually be spent with this key: the lower of the account balance and the key's own limit.
+    public decimal? SpendableBalance =>
+        (AccountBalance, KeyLimitRemaining) switch
+        {
+            ({ } balance, { } keyRemaining) => Math.Min(balance, keyRemaining),
+            ({ } balance, null) => balance,
+            (null, { } keyRemaining) => keyRemaining,
+            _ => null
+        };
+}
+
+internal sealed record OpenRouterBalanceReadResult(OpenRouterBalanceSnapshot? Snapshot, string? ErrorMessage);
+
+internal sealed class OpenRouterBalanceReader
+{
+    private const string ApiBaseUrl = "https://openrouter.ai/api/v1";
+    private const string KeyEndpoint = ApiBaseUrl + "/key";
+    private const string CreditsEndpoint = ApiBaseUrl + "/credits";
+    private const string ApiKeyEnvironmentVariable = "OPENROUTER_API_KEY";
+    private static readonly HttpClient HttpClient = new()
+    {
+        Timeout = TimeSpan.FromSeconds(20)
+    };
+
+    public string AuthPath { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".local",
+        "share",
+        "opencode",
+        "auth.json");
+
+    public string UsageEndpoint => KeyEndpoint;
+
+    public OpenRouterBalanceReadResult ReadLatestSnapshot()
+    {
+        try
+        {
+            (string apiKey, string keySource) = ReadApiKey();
+
+            using JsonDocument keyDocument = SendGet(KeyEndpoint, apiKey, required: true)!;
+            JsonElement keyData = GetData(keyDocument, "key");
+
+            decimal? totalCredits = null;
+            decimal? totalUsage = null;
+            using JsonDocument? creditsDocument = SendGet(CreditsEndpoint, apiKey, required: false);
+            if (creditsDocument is not null)
+            {
+                JsonElement creditsData = GetData(creditsDocument, "credits");
+                totalCredits = ReadNullableDecimal(creditsData, "total_credits");
+                totalUsage = ReadNullableDecimal(creditsData, "total_usage");
+            }
+
+            OpenRouterBalanceSnapshot snapshot = new(
+                DateTimeOffset.UtcNow,
+                totalCredits,
+                totalUsage,
+                ReadNonEmptyString(keyData, "label"),
+                ReadNullableDecimal(keyData, "limit"),
+                ReadNullableDecimal(keyData, "limit_remaining"),
+                ReadNonEmptyString(keyData, "limit_reset"),
+                ReadNullableDecimal(keyData, "usage_daily"),
+                ReadNullableDecimal(keyData, "usage_weekly"),
+                ReadNullableDecimal(keyData, "usage_monthly"),
+                keyData.TryGetProperty("is_free_tier", out JsonElement freeTier) &&
+                freeTier.ValueKind == JsonValueKind.True,
+                keySource,
+                creditsDocument is null ? KeyEndpoint : $"{KeyEndpoint} + {CreditsEndpoint}");
+
+            if (snapshot.SpendableBalance is null)
+            {
+                return new OpenRouterBalanceReadResult(
+                    null,
+                    "OpenRouter credits are unavailable and the key has no spending limit.");
+            }
+
+            return new OpenRouterBalanceReadResult(snapshot, null);
+        }
+        catch (TaskCanceledException)
+        {
+            return new OpenRouterBalanceReadResult(null, "OpenRouter balance request timed out.");
+        }
+        catch (HttpRequestException)
+        {
+            return new OpenRouterBalanceReadResult(null, "OpenRouter balance request failed.");
+        }
+        catch (JsonException)
+        {
+            return new OpenRouterBalanceReadResult(null, "OpenRouter balance response was invalid.");
+        }
+        catch (InvalidOperationException exception)
+        {
+            return new OpenRouterBalanceReadResult(null, exception.Message);
+        }
+        catch (IOException)
+        {
+            return new OpenRouterBalanceReadResult(null, "OpenRouter credentials could not be read.");
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return new OpenRouterBalanceReadResult(null, "OpenRouter credentials could not be read.");
+        }
+        catch (Exception)
+        {
+            return new OpenRouterBalanceReadResult(null, "OpenRouter balance is unavailable.");
+        }
+    }
+
+    private (string ApiKey, string Source) ReadApiKey()
+    {
+        if (File.Exists(AuthPath))
+        {
+            using FileStream stream = new(
+                AuthPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            using JsonDocument document = JsonDocument.Parse(stream);
+            if (document.RootElement.ValueKind == JsonValueKind.Object &&
+                document.RootElement.TryGetProperty("openrouter", out JsonElement provider) &&
+                provider.ValueKind == JsonValueKind.Object &&
+                ReadNonEmptyString(provider, "key") is { } fileKey)
+            {
+                return (fileKey, AuthPath);
+            }
+        }
+
+        string? environmentKey = Environment.GetEnvironmentVariable(ApiKeyEnvironmentVariable);
+        if (!string.IsNullOrWhiteSpace(environmentKey))
+        {
+            return (environmentKey.Trim(), ApiKeyEnvironmentVariable);
+        }
+
+        throw new InvalidOperationException(
+            $"OpenRouter API key was not found in {AuthPath} or {ApiKeyEnvironmentVariable}.");
+    }
+
+    private static JsonDocument? SendGet(string endpoint, string apiKey, bool required)
+    {
+        using HttpRequestMessage request = new(HttpMethod.Get, endpoint);
+        request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
+        request.Headers.TryAddWithoutValidation("Accept", "application/json");
+        request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.4");
+
+        using HttpResponseMessage response = HttpClient.Send(request);
+        if (!response.IsSuccessStatusCode)
+        {
+            if (!required)
+            {
+                return null;
+            }
+
+            string message = response.StatusCode switch
+            {
+                HttpStatusCode.Unauthorized => "OpenRouter API key was rejected.",
+                HttpStatusCode.TooManyRequests => "OpenRouter rate limited the balance request.",
+                _ => $"OpenRouter balance request failed: HTTP {(int)response.StatusCode}"
+            };
+            throw new InvalidOperationException(message);
+        }
+
+        string body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        return JsonDocument.Parse(body);
+    }
+
+    private static JsonElement GetData(JsonDocument document, string endpointName)
+    {
+        if (document.RootElement.ValueKind != JsonValueKind.Object ||
+            !document.RootElement.TryGetProperty("data", out JsonElement data) ||
+            data.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException($"OpenRouter {endpointName} response did not include data.");
+        }
+
+        return data;
+    }
+
+    private static decimal? ReadNullableDecimal(JsonElement parent, string propertyName)
+    {
+        if (!parent.TryGetProperty(propertyName, out JsonElement element))
+        {
+            return null;
+        }
+
+        if (element.ValueKind == JsonValueKind.Number && element.TryGetDecimal(out decimal numericValue))
+        {
+            return numericValue;
+        }
+
+        if (element.ValueKind == JsonValueKind.String &&
+            decimal.TryParse(
+                element.GetString(),
+                NumberStyles.Number,
+                CultureInfo.InvariantCulture,
+                out decimal stringValue))
+        {
+            return stringValue;
+        }
+
+        return null;
+    }
+
+    private static string? ReadNonEmptyString(JsonElement parent, string propertyName)
+    {
+        if (!parent.TryGetProperty(propertyName, out JsonElement element) ||
+            element.ValueKind != JsonValueKind.String)
+        {
+            return null;
+        }
+
+        string? value = element.GetString();
+        return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
     }
 }
 
@@ -5529,11 +7513,72 @@ internal sealed record HardwareSnapshot(
     double? GpuTemperatureC,
     double? CpuUsagePercent,
     double? GpuUsagePercent,
+    double? RamUsagePercent,
+    double? VramUsagePercent,
+    long? RamTotalBytes,
+    long? RamAvailableBytes,
+    long? VramTotalBytes,
+    long? VramAvailableBytes,
     string? GpuName,
     DateTimeOffset Timestamp,
     string SourceDescription);
 
-internal sealed record HardwareReadResult(HardwareSnapshot? Snapshot, string? ErrorMessage);
+internal sealed record HardwareReadResult(
+    HardwareSnapshot? Snapshot,
+    string? ErrorMessage,
+    IReadOnlyList<RamProcessUsage>? TopRamProcesses = null);
+
+internal sealed record RamProcessUsage(int ProcessId, string Name, long WorkingSetBytes);
+
+internal static class RamProcessReader
+{
+    public static IReadOnlyList<RamProcessUsage> ReadTopProcesses(int maxCount = 5)
+    {
+        Process[] processes;
+        try
+        {
+            processes = Process.GetProcesses();
+        }
+        catch
+        {
+            return [];
+        }
+
+        List<RamProcessUsage> usage = [];
+        foreach (Process process in processes)
+        {
+            try
+            {
+                long workingSetBytes = process.WorkingSet64;
+                if (workingSetBytes > 0)
+                {
+                    usage.Add(new RamProcessUsage(process.Id, process.ProcessName, workingSetBytes));
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                // The process may exit while its memory is being read.
+            }
+            catch (System.ComponentModel.Win32Exception)
+            {
+                // Windows can deny access to protected processes.
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Skip processes whose details are not readable by this user.
+            }
+            finally
+            {
+                process.Dispose();
+            }
+        }
+
+        return usage
+            .OrderByDescending(process => process.WorkingSetBytes)
+            .Take(Math.Max(0, maxCount))
+            .ToArray();
+    }
+}
 
 internal sealed class HardwareMonitor
 {
@@ -5542,22 +7587,29 @@ internal sealed class HardwareMonitor
     private CpuTimeSample? _lastCpuTimeSample;
 
     public string SourceDescription =>
-        "GetSystemTimes + AMD Ryzen Master package sensor + nvidia-smi";
+        "GetSystemTimes + GlobalMemoryStatusEx + AMD Ryzen Master package sensor + nvidia-smi";
 
     public HardwareReadResult ReadSnapshot()
     {
         try
         {
             NvidiaSnapshot gpu = ReadNvidiaSnapshot();
+            PhysicalMemorySnapshot ram = ReadPhysicalMemorySnapshot();
             return new HardwareReadResult(
                 new HardwareSnapshot(
-                    ReadCpuTemperature(),
-                    gpu.TemperatureC,
-                    ReadCpuUsagePercent(),
-                    gpu.UtilizationPercent,
-                    gpu.Name,
-                    DateTimeOffset.UtcNow,
-                    SourceDescription),
+                    CpuTemperatureC: ReadCpuTemperature(),
+                    GpuTemperatureC: gpu.TemperatureC,
+                    CpuUsagePercent: ReadCpuUsagePercent(),
+                    GpuUsagePercent: gpu.UtilizationPercent,
+                    RamUsagePercent: ram.UsagePercent,
+                    VramUsagePercent: GetUsedPercent(gpu.TotalBytes, gpu.AvailableBytes),
+                    RamTotalBytes: ram.TotalBytes,
+                    RamAvailableBytes: ram.AvailableBytes,
+                    VramTotalBytes: gpu.TotalBytes,
+                    VramAvailableBytes: gpu.AvailableBytes,
+                    GpuName: gpu.Name,
+                    Timestamp: DateTimeOffset.UtcNow,
+                    SourceDescription: SourceDescription),
                 null);
         }
         catch (Exception exception)
@@ -5608,6 +7660,52 @@ internal sealed class HardwareMonitor
 
         long busyDelta = Math.Max(0, totalDelta - idleDelta);
         return Math.Clamp(busyDelta * 100d / totalDelta, 0d, 100d);
+    }
+
+    private static PhysicalMemorySnapshot ReadPhysicalMemorySnapshot()
+    {
+        NativeMethods.MEMORYSTATUSEX status = new()
+        {
+            Length = (uint)Marshal.SizeOf<NativeMethods.MEMORYSTATUSEX>()
+        };
+        if (!NativeMethods.GlobalMemoryStatusEx(ref status) || status.TotalPhysicalBytes == 0)
+        {
+            return PhysicalMemorySnapshot.Empty;
+        }
+
+        long? totalBytes = ToInt64(status.TotalPhysicalBytes);
+        long? availableBytes = ToInt64(status.AvailablePhysicalBytes);
+        if (totalBytes is not { } total || total <= 0)
+        {
+            return PhysicalMemorySnapshot.Empty;
+        }
+
+        if (availableBytes is { } available)
+        {
+            availableBytes = Math.Clamp(available, 0, total);
+        }
+
+        return new PhysicalMemorySnapshot(
+            GetUsedPercent(totalBytes, availableBytes),
+            totalBytes,
+            availableBytes);
+    }
+
+    private static double? GetUsedPercent(long? totalBytes, long? availableBytes)
+    {
+        if (totalBytes is not { } total || total <= 0 ||
+            availableBytes is not { } available)
+        {
+            return null;
+        }
+
+        long clampedAvailable = Math.Clamp(available, 0, total);
+        return Math.Clamp((total - clampedAvailable) * 100d / total, 0d, 100d);
+    }
+
+    private static long? ToInt64(ulong value)
+    {
+        return value <= long.MaxValue ? (long)value : null;
     }
 
     private static NvidiaSnapshot ReadNvidiaSnapshot()
@@ -5826,6 +7924,14 @@ internal sealed class HardwareMonitor
         public static NvidiaSnapshot Empty => new(null, null, null, null, null);
     }
 
+    private sealed record PhysicalMemorySnapshot(
+        double? UsagePercent,
+        long? TotalBytes,
+        long? AvailableBytes)
+    {
+        public static PhysicalMemorySnapshot Empty => new(null, null, null);
+    }
+
     private readonly record struct CpuTimeSample(
         long IdleTicks,
         long KernelTicks,
@@ -6007,7 +8113,9 @@ internal sealed record TrayIconSettings(
     bool Disk,
     bool OpenCode,
     bool Temperature,
-    bool CpuGpuLoad)
+    bool CpuGpuLoad,
+    bool Devin,
+    bool OpenRouter)
 {
     public static TrayIconSettings Default => new(
         Codex: false,
@@ -6017,7 +8125,9 @@ internal sealed record TrayIconSettings(
         Disk: true,
         OpenCode: true,
         Temperature: false,
-        CpuGpuLoad: true);
+        CpuGpuLoad: true,
+        Devin: true,
+        OpenRouter: true);
 
     public bool IsVisible(TrayIconKind iconKind)
     {
@@ -6030,6 +8140,8 @@ internal sealed record TrayIconSettings(
             TrayIconKind.OpenCode => OpenCode,
             TrayIconKind.Temperature => Temperature,
             TrayIconKind.CpuGpuLoad => true,
+            TrayIconKind.Devin => Devin,
+            TrayIconKind.OpenRouter => OpenRouter,
             _ => Codex
         };
     }
@@ -6045,6 +8157,8 @@ internal sealed record TrayIconSettings(
             TrayIconKind.OpenCode => this with { OpenCode = !OpenCode },
             TrayIconKind.Temperature => this with { Temperature = !Temperature },
             TrayIconKind.CpuGpuLoad => this with { CpuGpuLoad = true },
+            TrayIconKind.Devin => this with { Devin = !Devin },
+            TrayIconKind.OpenRouter => this with { OpenRouter = !OpenRouter },
             _ => this with { Codex = !Codex }
         };
     }
@@ -6079,7 +8193,9 @@ internal sealed class TrayIconSettingsStore
                 Disk: ReadBoolean(root, "disk", defaults.Disk),
                 OpenCode: ReadBoolean(root, "openCode", defaults.OpenCode),
                 Temperature: ReadBoolean(root, "temperature", defaults.Temperature),
-                CpuGpuLoad: true);
+                CpuGpuLoad: true,
+                Devin: ReadBoolean(root, "devin", defaults.Devin),
+                OpenRouter: ReadBoolean(root, "openRouter", defaults.OpenRouter));
         }
         catch (Exception)
         {
@@ -6099,7 +8215,9 @@ internal sealed class TrayIconSettingsStore
             ["disk"] = settings.Disk,
             ["openCode"] = settings.OpenCode,
             ["temperature"] = settings.Temperature,
-            ["cpuGpuLoad"] = true
+            ["cpuGpuLoad"] = true,
+            ["devin"] = settings.Devin,
+            ["openRouter"] = settings.OpenRouter
         };
         File.WriteAllText(SettingsPath, root.ToJsonString(JsonOptions) + Environment.NewLine);
     }
@@ -6831,6 +8949,8 @@ internal static class TrayIconRenderer
     public const string DeepSeekUnavailableIconKey = "deepseek:?";
     public const string DiskUnavailableIconKey = "disk:?";
     public const string OpenCodeUnavailableIconKey = "opencode:?";
+    public const string DevinUnavailableIconKey = "devin:?";
+    public const string OpenRouterUnavailableIconKey = "openrouter:?";
     public const string TemperatureUnavailableIconKey = "temperature:?";
     public const string MemoryUnavailableIconKey = "memory:?";
 
@@ -6841,10 +8961,14 @@ internal static class TrayIconRenderer
     private const uint DeepSeekBrandColor = 0xFF4D6BFE;
     private const uint DiskBrandColor = 0xFF4A90E2;
     private const uint OpenCodeBrandColor = 0xFF7B61FF;
+    private const uint DevinBrandColor = 0xFF6E5AF7;
+    private const uint OpenRouterBrandColor = 0xFF94A3B8;
     private const uint TemperatureBrandColor = 0xFFE76F51;
     private const uint MemoryBrandColor = 0xFF5B8DEF;
     private const uint CpuBarColor = 0xFF39A96B;
     private const uint GpuBarColor = 0xFF9B6BFF;
+    private const uint RamBarColor = 0xFF2CA9E1;
+    private const uint VramBarColor = 0xFFFFA940;
 
     private static readonly IconPalette LightThemePalette = new(
         UnknownColor: 0xFF444444,
@@ -7010,6 +9134,41 @@ internal static class TrayIconRenderer
         return CreateCenteredIcon("?", palette.UnknownColor, DeepSeekBrandColor);
     }
 
+    public static IntPtr CreateOpenRouterIcon(OpenRouterBalanceSnapshot snapshot)
+    {
+        IconPalette palette = GetPalette();
+        if (snapshot.SpendableBalance is not { } balance)
+        {
+            return CreateOpenRouterUnavailableIcon();
+        }
+
+        uint balanceColor = ColorForBalance(balance, isAvailable: balance > 0, palette);
+        string text = FormatBalanceIconText(balance);
+
+        if (text == "infinity")
+        {
+            uint[] infinityPixels = new uint[IconSize * IconSize];
+            DrawBrandTriangle(infinityPixels, OpenRouterBrandColor);
+            DrawInfinity(infinityPixels, balanceColor);
+            return CreateNativeIcon(infinityPixels);
+        }
+
+        return CreateCenteredIcon(text, balanceColor, OpenRouterBrandColor);
+    }
+
+    public static string GetOpenRouterIconKey(OpenRouterBalanceSnapshot snapshot)
+    {
+        return snapshot.SpendableBalance is { } balance
+            ? $"openrouter:{FormatBalanceIconText(balance)}:{balance > 0}:{ColorForBalance(balance, balance > 0, GetPalette())}"
+            : OpenRouterUnavailableIconKey;
+    }
+
+    public static IntPtr CreateOpenRouterUnavailableIcon()
+    {
+        IconPalette palette = GetPalette();
+        return CreateCenteredIcon("?", palette.UnknownColor, OpenRouterBrandColor);
+    }
+
     public static IntPtr CreateDiskIcon(DiskSpaceSnapshot snapshot)
     {
         IconPalette palette = GetPalette();
@@ -7062,6 +9221,38 @@ internal static class TrayIconRenderer
         return CreateCenteredIcon("?", palette.UnknownColor, OpenCodeBrandColor);
     }
 
+    public static IntPtr CreateDevinIcon(DevinUsageSnapshot snapshot)
+    {
+        IconPalette palette = GetPalette();
+        int dailyRemaining = GetRemainingPercent(snapshot.DailyRemainingPercent);
+        int weeklyRemaining = GetRemainingPercent(snapshot.WeeklyRemainingPercent);
+        return CreateIcon(
+            dailyRemaining.ToString(CultureInfo.InvariantCulture),
+            snapshot.DailyRemainingPercent is null
+                ? palette.UnknownColor
+                : ColorForRemaining(dailyRemaining, palette),
+            weeklyRemaining.ToString(CultureInfo.InvariantCulture),
+            snapshot.WeeklyRemainingPercent is null
+                ? palette.UnknownColor
+                : ColorForRemaining(weeklyRemaining, palette),
+            DevinBrandColor,
+            snapshot.WeeklyResetAt);
+    }
+
+    public static string GetDevinIconKey(DevinUsageSnapshot snapshot)
+    {
+        int dailyRemaining = GetRemainingPercent(snapshot.DailyRemainingPercent);
+        int weeklyRemaining = GetRemainingPercent(snapshot.WeeklyRemainingPercent);
+        int resetDays = GetResetDayDotCount(snapshot.WeeklyResetAt);
+        return $"devin:{dailyRemaining}:{weeklyRemaining}:{resetDays}";
+    }
+
+    public static IntPtr CreateDevinUnavailableIcon()
+    {
+        IconPalette palette = GetPalette();
+        return CreateIcon("?", palette.UnknownColor, "?", palette.UnknownColor, DevinBrandColor);
+    }
+
     public static IntPtr CreateTemperatureIcon(HardwareSnapshot snapshot)
     {
         IconPalette palette = GetPalette();
@@ -7098,21 +9289,33 @@ internal static class TrayIconRenderer
         uint[] pixels = new uint[IconSize * IconSize];
         DrawUsageBar(
             pixels,
-            2,
+            0,
             GetUsageRatio(snapshot.CpuUsagePercent),
             ColorForUsage(snapshot.CpuUsagePercent, palette, CpuBarColor));
         DrawUsageBar(
             pixels,
-            10,
+            4,
             GetUsageRatio(snapshot.GpuUsagePercent),
             ColorForUsage(snapshot.GpuUsagePercent, palette, GpuBarColor));
+        DrawUsageBar(
+            pixels,
+            8,
+            GetUsageRatio(snapshot.RamUsagePercent),
+            ColorForUsage(snapshot.RamUsagePercent, palette, RamBarColor));
+        DrawUsageBar(
+            pixels,
+            12,
+            GetUsageRatio(snapshot.VramUsagePercent),
+            ColorForUsage(snapshot.VramUsagePercent, palette, VramBarColor));
         return CreateNativeIcon(pixels);
     }
 
     public static string GetMemoryIconKey(HardwareSnapshot snapshot)
     {
         return $"usage:{GetUsageBarCount(snapshot.CpuUsagePercent)}:" +
-               $"{GetUsageBarCount(snapshot.GpuUsagePercent)}";
+               $"{GetUsageBarCount(snapshot.GpuUsagePercent)}:" +
+               $"{GetUsageBarCount(snapshot.RamUsagePercent)}:" +
+               $"{GetUsageBarCount(snapshot.VramUsagePercent)}";
     }
 
     public static IntPtr CreateMemoryUnavailableIcon()
@@ -7175,6 +9378,13 @@ internal static class TrayIconRenderer
         return daysRemaining <= 0
             ? 0
             : Math.Clamp((int)Math.Ceiling(daysRemaining), 0, 7);
+    }
+
+    private static int GetRemainingPercent(double? remainingPercent)
+    {
+        return remainingPercent is { } value && double.IsFinite(value)
+            ? Math.Clamp((int)Math.Round(value, MidpointRounding.AwayFromZero), 0, 100)
+            : 0;
     }
 
     private static void DrawResetDayDots(uint[] pixels, int count, uint color)
@@ -7944,8 +10154,12 @@ internal static class NativeMethods
     public const uint WM_CLOSE = 0x0010;
     public const uint WM_COMMAND = 0x0111;
     public const uint WM_SETFONT = 0x0030;
+    public const uint WM_PAINT = 0x000F;
+    public const uint WM_ERASEBKGND = 0x0014;
+    public const uint WM_MOUSEACTIVATE = 0x0021;
     public const uint WM_CONTEXTMENU = 0x007B;
     public const uint WM_TIMER = 0x0113;
+    public const uint WM_MOUSEMOVE = 0x0200;
     public const uint WM_LBUTTONDBLCLK = 0x0203;
     public const uint WM_RBUTTONUP = 0x0205;
     public const uint WM_APP = 0x8000;
@@ -7977,8 +10191,12 @@ internal static class NativeMethods
     public const uint WS_VISIBLE = 0x10000000;
     public const uint WS_BORDER = 0x00800000;
     public const uint WS_TABSTOP = 0x00010000;
+    public const uint WS_POPUP = 0x80000000;
     public const uint WS_EX_CLIENTEDGE = 0x00000200;
     public const uint WS_EX_DLGMODALFRAME = 0x00000001;
+    public const uint WS_EX_TOPMOST = 0x00000008;
+    public const uint WS_EX_TOOLWINDOW = 0x00000080;
+    public const uint WS_EX_NOACTIVATE = 0x08000000;
 
     public const uint BS_AUTOCHECKBOX = 0x00000003;
     public const uint BS_DEFPUSHBUTTON = 0x00000001;
@@ -7993,7 +10211,20 @@ internal static class NativeMethods
     public const int SM_CYSCREEN = 1;
     public const int COLOR_WINDOW = 5;
     public const int DEFAULT_GUI_FONT = 17;
+    public const int SW_HIDE = 0;
     public const int SW_SHOW = 5;
+    public const int SW_SHOWNOACTIVATE = 4;
+    public const int MA_NOACTIVATE = 3;
+    public const uint SWP_NOACTIVATE = 0x0010;
+    public const uint SWP_SHOWWINDOW = 0x0040;
+    public static readonly IntPtr HWND_TOPMOST = new(-1);
+    public const uint DT_LEFT = 0x00000000;
+    public const uint DT_RIGHT = 0x00000002;
+    public const uint DT_VCENTER = 0x00000004;
+    public const uint DT_SINGLELINE = 0x00000020;
+    public const uint DT_END_ELLIPSIS = 0x00008000;
+    public const int TRANSPARENT = 1;
+    public const uint MONITOR_DEFAULTTONEAREST = 0x00000002;
     public const uint MB_OK = 0x00000000;
     public const uint MB_ICONERROR = 0x00000010;
     public const uint MB_ICONINFORMATION = 0x00000040;
@@ -8029,6 +10260,48 @@ internal static class NativeMethods
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    internal struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct PAINTSTRUCT
+    {
+        public IntPtr hdc;
+        [MarshalAs(UnmanagedType.Bool)]
+        public bool fErase;
+        public RECT rcPaint;
+        [MarshalAs(UnmanagedType.Bool)]
+        public bool fRestore;
+        [MarshalAs(UnmanagedType.Bool)]
+        public bool fIncUpdate;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
+        public byte[] rgbReserved;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct MONITORINFO
+    {
+        public uint cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct NOTIFYICONIDENTIFIER
+    {
+        public uint cbSize;
+        public IntPtr hWnd;
+        public uint uID;
+        public Guid guidItem;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     internal struct SYSTEM_FILETIME
     {
         public uint LowDateTime;
@@ -8038,6 +10311,20 @@ internal static class NativeMethods
         {
             return ((long)HighDateTime << 32) | LowDateTime;
         }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct MEMORYSTATUSEX
+    {
+        public uint Length;
+        public uint MemoryLoad;
+        public ulong TotalPhysicalBytes;
+        public ulong AvailablePhysicalBytes;
+        public ulong TotalPageFileBytes;
+        public ulong AvailablePageFileBytes;
+        public ulong TotalVirtualBytes;
+        public ulong AvailableVirtualBytes;
+        public ulong AvailableExtendedVirtualBytes;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -8126,6 +10413,10 @@ internal static class NativeMethods
         out SYSTEM_FILETIME kernelTime,
         out SYSTEM_FILETIME userTime);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX status);
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern ushort RegisterClassEx(ref WNDCLASSEX windowClass);
 
@@ -8207,6 +10498,81 @@ internal static class NativeMethods
     [DllImport("gdi32.dll")]
     public static extern IntPtr GetStockObject(int objectIndex);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr BeginPaint(IntPtr windowHandle, ref PAINTSTRUCT paint);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool EndPaint(IntPtr windowHandle, ref PAINTSTRUCT paint);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetClientRect(IntPtr windowHandle, out RECT rectangle);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetWindowRect(IntPtr windowHandle, out RECT rectangle);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool InvalidateRect(IntPtr windowHandle, IntPtr rectangle, [MarshalAs(UnmanagedType.Bool)] bool erase);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern int FillRect(IntPtr deviceContext, ref RECT rectangle, IntPtr brush);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern int FrameRect(IntPtr deviceContext, ref RECT rectangle, IntPtr brush);
+
+    [DllImport("gdi32.dll", SetLastError = true)]
+    public static extern IntPtr CreateSolidBrush(uint colorRef);
+
+    [DllImport("gdi32.dll")]
+    public static extern uint SetTextColor(IntPtr deviceContext, uint colorRef);
+
+    [DllImport("gdi32.dll")]
+    public static extern int SetBkMode(IntPtr deviceContext, int mode);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "DrawTextW")]
+    public static extern int DrawText(IntPtr deviceContext, string text, int characterCount, ref RECT rectangle, uint format);
+
+    [DllImport("gdi32.dll")]
+    public static extern IntPtr SelectObject(IntPtr deviceContext, IntPtr objectHandle);
+
+    [DllImport("gdi32.dll", CharSet = CharSet.Unicode, EntryPoint = "CreateFontW", SetLastError = true)]
+    public static extern IntPtr CreateFontW(
+        int height,
+        int width,
+        int escapement,
+        int orientation,
+        int weight,
+        uint italic,
+        uint underline,
+        uint strikeOut,
+        uint characterSet,
+        uint outputPrecision,
+        uint clipPrecision,
+        uint quality,
+        uint pitchAndFamily,
+        string faceName);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetWindowPos(
+        IntPtr windowHandle,
+        IntPtr insertAfter,
+        int x,
+        int y,
+        int width,
+        int height,
+        uint flags);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr MonitorFromRect(ref RECT rectangle, uint flags);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetMonitorInfoW", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO monitorInfo);
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern int MessageBox(IntPtr windowHandle, string text, string caption, uint type);
 
@@ -8217,6 +10583,9 @@ internal static class NativeMethods
     [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool Shell_NotifyIcon(uint message, ref NOTIFYICONDATA data);
+
+    [DllImport("shell32.dll", SetLastError = true)]
+    public static extern int Shell_NotifyIconGetRect(ref NOTIFYICONIDENTIFIER identifier, out RECT iconRectangle);
 
     [DllImport("user32.dll")]
     public static extern IntPtr CreatePopupMenu();
