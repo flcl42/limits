@@ -3885,7 +3885,7 @@ internal sealed class TrayApplication : IDisposable
         string? goUsageError)
     {
         string localText =
-            $"OpenCode: {FormatCompactTokens(snapshot.TotalTokens)} tokens in 24h, " +
+            $"OpenCode: {FormatCompactTokens(snapshot.TotalTokens)} tokens today, " +
             $"{snapshot.SessionCount} {(snapshot.SessionCount == 1 ? "session" : "sessions")}";
         if (goSnapshot is null)
         {
@@ -3911,7 +3911,7 @@ internal sealed class TrayApplication : IDisposable
         OpenCodeUsageSnapshot snapshot,
         OpenCodeGoUsageSnapshot? goSnapshot)
     {
-        string localText = $"OpenCode: {FormatCompactTokens(snapshot.TotalTokens)} tokens in 24h | " +
+        string localText = $"OpenCode: {FormatCompactTokens(snapshot.TotalTokens)} tokens today | " +
                            $"{snapshot.SessionCount} {(snapshot.SessionCount == 1 ? "session" : "sessions")}";
         return goSnapshot is null
             ? localText
@@ -7035,19 +7035,37 @@ internal sealed class OpenRouterBalanceReader
     {
         if (File.Exists(AuthPath))
         {
-            using FileStream stream = new(
-                AuthPath,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete);
-            using JsonDocument document = JsonDocument.Parse(stream);
-            if (document.RootElement.ValueKind == JsonValueKind.Object &&
-                document.RootElement.TryGetProperty("openrouter", out JsonElement provider) &&
-                provider.ValueKind == JsonValueKind.Object &&
-                ReadNonEmptyString(provider, "key") is { } fileKey)
+            try
             {
-                return (fileKey, AuthPath);
+                using FileStream stream = new(
+                    AuthPath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete);
+                using JsonDocument document = JsonDocument.Parse(stream);
+                if (document.RootElement.ValueKind == JsonValueKind.Object &&
+                    document.RootElement.TryGetProperty("openrouter", out JsonElement provider) &&
+                    provider.ValueKind == JsonValueKind.Object &&
+                    ReadNonEmptyString(provider, "key") is { } fileKey)
+                {
+                    return (fileKey, AuthPath);
+                }
             }
+            catch (Exception exception) when (exception is
+                IOException or
+                UnauthorizedAccessException or
+                JsonException)
+            {
+                // Fall through to `opencode auth export` below.
+            }
+        }
+
+        // OpenCode v2 keeps credentials in its service credential store
+        // instead of <data>/auth.json.
+        string? exportedKey = OpenCodeUsageReader.ReadExportedApiKey("openrouter");
+        if (!string.IsNullOrWhiteSpace(exportedKey))
+        {
+            return (exportedKey, "opencode auth export");
         }
 
         string? environmentKey = Environment.GetEnvironmentVariable(ApiKeyEnvironmentVariable);
@@ -7065,7 +7083,7 @@ internal sealed class OpenRouterBalanceReader
         using HttpRequestMessage request = new(HttpMethod.Get, endpoint);
         request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
         request.Headers.TryAddWithoutValidation("Accept", "application/json");
-        request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.4");
+        request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.5.1");
 
         using HttpResponseMessage response = HttpClient.Send(request);
         if (!response.IsSuccessStatusCode)
@@ -7168,20 +7186,12 @@ internal sealed class OpenCodeUsageReader
 
             string executablePath = ResolveOpenCodeExecutable()
                 ?? throw new InvalidOperationException("The OpenCode executable was not found on PATH.");
-            DateTimeOffset windowStart = DateTimeOffset.UtcNow.AddDays(-1);
-            string query = $"SELECT COUNT(*) AS session_count, " +
-                           "COALESCE(SUM(tokens_input), 0) AS input_tokens, " +
-                           "COALESCE(SUM(tokens_output), 0) AS output_tokens, " +
-                           "COALESCE(SUM(tokens_reasoning), 0) AS reasoning_tokens, " +
-                           "COALESCE(SUM(tokens_cache_read), 0) AS cache_read_tokens, " +
-                           "COALESCE(SUM(tokens_cache_write), 0) AS cache_write_tokens, " +
-                           "COALESCE(SUM(cost), 0) AS cost, " +
-                           "MAX(time_updated) AS latest_activity_at " +
-                           "FROM session " +
-                           $"WHERE time_updated >= {windowStart.ToUnixTimeMilliseconds()}";
 
-            string response = RunDatabaseQuery(executablePath, query);
-            OpenCodeUsageSnapshot snapshot = ParseSnapshot(response, windowStart);
+            // OpenCode v2 removed the `opencode db` subcommand and renamed the
+            // `session` table to `session_v2`, so read today's totals through
+            // the supported `opencode stats --json --days 1` command instead.
+            string response = RunStatsQuery(executablePath);
+            OpenCodeUsageSnapshot snapshot = ParseSnapshot(response);
             return new OpenCodeUsageReadResult(snapshot, goResult.Snapshot, goResult.ErrorMessage, null);
         }
         catch (Exception exception)
@@ -7198,16 +7208,11 @@ internal sealed class OpenCodeUsageReader
     {
         try
         {
-            if (!File.Exists(AuthPath))
-            {
-                throw new InvalidOperationException("OpenCode Go credentials were not found.");
-            }
-
             string apiKey = ReadGoApiKey();
             using HttpRequestMessage request = new(HttpMethod.Get, GoUsageEndpoint);
             request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
             request.Headers.TryAddWithoutValidation("Accept", "application/json");
-            request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.4");
+            request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.5.1");
 
             using HttpResponseMessage response = GoHttpClient.Send(request);
             if (!response.IsSuccessStatusCode)
@@ -7255,23 +7260,99 @@ internal sealed class OpenCodeUsageReader
 
     private string ReadGoApiKey()
     {
-        using FileStream stream = new(
-            AuthPath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.ReadWrite | FileShare.Delete);
-        using JsonDocument document = JsonDocument.Parse(stream);
-        JsonElement root = document.RootElement;
-        if (!root.TryGetProperty("opencode-go", out JsonElement provider) ||
-            provider.ValueKind != JsonValueKind.Object ||
-            !provider.TryGetProperty("key", out JsonElement keyElement) ||
-            keyElement.ValueKind != JsonValueKind.String ||
-            string.IsNullOrWhiteSpace(keyElement.GetString()))
+        // OpenCode v2 no longer keeps credentials in <data>/auth.json; they
+        // live in the service credential store. Keep the legacy file as a
+        // fallback, then read the key via `opencode auth export`.
+        if (File.Exists(AuthPath))
         {
-            throw new InvalidOperationException("OpenCode Go API key was not found.");
+            try
+            {
+                using FileStream stream = new(
+                    AuthPath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete);
+                using JsonDocument document = JsonDocument.Parse(stream);
+                JsonElement root = document.RootElement;
+                if (root.TryGetProperty("opencode-go", out JsonElement provider) &&
+                    provider.ValueKind == JsonValueKind.Object &&
+                    provider.TryGetProperty("key", out JsonElement keyElement) &&
+                    keyElement.ValueKind == JsonValueKind.String &&
+                    !string.IsNullOrWhiteSpace(keyElement.GetString()))
+                {
+                    return keyElement.GetString()!;
+                }
+            }
+            catch (Exception exception) when (exception is
+                IOException or
+                UnauthorizedAccessException or
+                JsonException)
+            {
+                // Fall through to `opencode auth export` below.
+            }
         }
 
-        return keyElement.GetString()!;
+        string? exportedKey = ReadExportedApiKey("opencode-go");
+        if (!string.IsNullOrWhiteSpace(exportedKey))
+        {
+            return exportedKey;
+        }
+
+        throw new InvalidOperationException("OpenCode Go API key was not found.");
+    }
+
+    internal static string? ReadExportedApiKey(string integrationId)
+    {
+        string? executablePath = ResolveOpenCodeExecutable();
+        if (string.IsNullOrWhiteSpace(executablePath))
+        {
+            return null;
+        }
+
+        string output;
+        try
+        {
+            output = RunOpenCodeCommand(executablePath, ["auth", "export"]);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(output);
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
+            {
+                return null;
+            }
+
+            foreach (JsonElement entry in document.RootElement.EnumerateArray())
+            {
+                if (entry.ValueKind != JsonValueKind.Object ||
+                    !entry.TryGetProperty("integrationID", out JsonElement idElement) ||
+                    idElement.ValueKind != JsonValueKind.String ||
+                    !string.Equals(idElement.GetString(), integrationId, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (entry.TryGetProperty("value", out JsonElement valueElement) &&
+                    valueElement.ValueKind == JsonValueKind.Object &&
+                    valueElement.TryGetProperty("key", out JsonElement keyElement) &&
+                    keyElement.ValueKind == JsonValueKind.String &&
+                    !string.IsNullOrWhiteSpace(keyElement.GetString()))
+                {
+                    return keyElement.GetString()!;
+                }
+            }
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+
+        return null;
     }
 
     private static OpenCodeGoUsageSnapshot ParseGoUsageResponse(string responseBody)
@@ -7326,7 +7407,7 @@ internal sealed class OpenCodeUsageReader
             resetAt);
     }
 
-    private static string? ResolveOpenCodeExecutable()
+    internal static string? ResolveOpenCodeExecutable()
     {
         List<string> candidates = [];
 
@@ -7348,10 +7429,35 @@ internal sealed class OpenCodeUsageReader
                 }
 
                 candidates.Add(Path.Combine(directory, "opencode.exe"));
+                // npm global installs place a shim (opencode.cmd/ps1) on PATH
+                // while the real binary lives under @opencode/cli.
+                candidates.Add(Path.Combine(directory, "node_modules", "@opencode", "cli", "bin", "opencode.exe"));
                 candidates.Add(Path.Combine(directory, "node_modules", "opencode-ai", "bin", "opencode.exe"));
             }
         }
 
+        string? appData = Environment.GetEnvironmentVariable("APPDATA");
+        if (!string.IsNullOrWhiteSpace(appData))
+        {
+            candidates.Add(Path.Combine(appData, "npm", "node_modules", "@opencode", "cli", "bin", "opencode.exe"));
+            candidates.Add(Path.Combine(appData, "npm", "node_modules", "opencode-ai", "bin", "opencode.exe"));
+        }
+
+        string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        if (!string.IsNullOrWhiteSpace(programFiles))
+        {
+            candidates.Add(Path.Combine(programFiles, "nodejs", "node_modules", "@opencode", "cli", "bin", "opencode.exe"));
+            candidates.Add(Path.Combine(programFiles, "nodejs", "node_modules", "opencode-ai", "bin", "opencode.exe"));
+        }
+
+        candidates.Add(Path.Combine(
+            "C:\\Programs",
+            "nodejs",
+            "node_modules",
+            "@opencode",
+            "cli",
+            "bin",
+            "opencode.exe"));
         candidates.Add(Path.Combine(
             "C:\\Programs",
             "nodejs",
@@ -7365,7 +7471,22 @@ internal sealed class OpenCodeUsageReader
             .FirstOrDefault(File.Exists);
     }
 
-    private static string RunDatabaseQuery(string executablePath, string query)
+    private static string RunStatsQuery(string executablePath)
+    {
+        // `stats --json --days 1` reports today's totals; without flags it
+        // reports year-to-date. Prefer today's window, retrying with
+        // --standalone when the background service is unreachable.
+        try
+        {
+            return RunOpenCodeCommand(executablePath, ["stats", "--json", "--days", "1"]);
+        }
+        catch (InvalidOperationException exception) when (!exception.Message.Contains("timed out", StringComparison.OrdinalIgnoreCase))
+        {
+            return RunOpenCodeCommand(executablePath, ["stats", "--json", "--days", "1", "--standalone"]);
+        }
+    }
+
+    private static string RunOpenCodeCommand(string executablePath, string[] arguments)
     {
         using Process process = new();
         process.StartInfo = new ProcessStartInfo
@@ -7377,14 +7498,14 @@ internal sealed class OpenCodeUsageReader
             RedirectStandardError = true,
             WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
         };
-        process.StartInfo.ArgumentList.Add("db");
-        process.StartInfo.ArgumentList.Add("--format");
-        process.StartInfo.ArgumentList.Add("json");
-        process.StartInfo.ArgumentList.Add(query);
+        foreach (string argument in arguments)
+        {
+            process.StartInfo.ArgumentList.Add(argument);
+        }
 
         if (!process.Start())
         {
-            throw new InvalidOperationException("OpenCode database query could not be started.");
+            throw new InvalidOperationException("OpenCode command could not be started.");
         }
 
         Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
@@ -7399,7 +7520,7 @@ internal sealed class OpenCodeUsageReader
             {
             }
 
-            throw new InvalidOperationException("OpenCode database query timed out.");
+            throw new InvalidOperationException("OpenCode command timed out.");
         }
 
         string output = outputTask.GetAwaiter().GetResult().Trim();
@@ -7408,45 +7529,155 @@ internal sealed class OpenCodeUsageReader
         {
             throw new InvalidOperationException(
                 string.IsNullOrWhiteSpace(error)
-                    ? $"OpenCode database query failed with exit code {process.ExitCode}."
+                    ? $"OpenCode command failed with exit code {process.ExitCode}."
                     : error);
         }
 
         if (output.Length == 0)
         {
-            throw new InvalidOperationException("OpenCode database query returned no data.");
+            throw new InvalidOperationException("OpenCode command returned no data.");
         }
 
         return output;
     }
 
-    private static OpenCodeUsageSnapshot ParseSnapshot(string response, DateTimeOffset windowStart)
+    private static OpenCodeUsageSnapshot ParseSnapshot(string response)
     {
         using JsonDocument document = JsonDocument.Parse(response);
         JsonElement root = document.RootElement;
-        if (root.ValueKind != JsonValueKind.Array || root.GetArrayLength() == 0)
+        if (root.ValueKind != JsonValueKind.Object)
         {
-            throw new InvalidOperationException("OpenCode database query returned an invalid result.");
+            throw new InvalidOperationException("OpenCode stats returned an invalid result.");
         }
 
-        JsonElement row = root[0];
-        long? latestActivityMilliseconds = ReadNullableInt64(row, "latest_activity_at");
-        DateTimeOffset? latestActivityAt = latestActivityMilliseconds is null
-            ? null
-            : DateTimeOffset.FromUnixTimeMilliseconds(latestActivityMilliseconds.Value).ToLocalTime();
+        DateTimeOffset windowStart = DateTimeOffset.UtcNow.AddDays(-1);
+        DateTimeOffset timestamp = DateTimeOffset.UtcNow;
+        if (root.TryGetProperty("range", out JsonElement range) &&
+            range.ValueKind == JsonValueKind.Object)
+        {
+            if (ReadOptionalInt64(range, "from") is { } fromMilliseconds)
+            {
+                try
+                {
+                    windowStart = DateTimeOffset.FromUnixTimeMilliseconds(fromMilliseconds);
+                }
+                catch (ArgumentOutOfRangeException)
+                {
+                }
+            }
+
+            if (ReadOptionalInt64(range, "to") is { } toMilliseconds)
+            {
+                try
+                {
+                    timestamp = DateTimeOffset.FromUnixTimeMilliseconds(toMilliseconds);
+                }
+                catch (ArgumentOutOfRangeException)
+                {
+                }
+            }
+        }
+
+        long sessionCount = ReadOptionalInt64(root, "sessions") ?? 0;
+        long inputTokens = 0;
+        long outputTokens = 0;
+        long reasoningTokens = 0;
+        long cacheReadTokens = 0;
+        long cacheWriteTokens = 0;
+        if (root.TryGetProperty("tokens", out JsonElement tokens) &&
+            tokens.ValueKind == JsonValueKind.Object)
+        {
+            inputTokens = ReadOptionalInt64(tokens, "input") ?? 0;
+            outputTokens = ReadOptionalInt64(tokens, "output") ?? 0;
+            reasoningTokens = ReadOptionalInt64(tokens, "reasoning") ?? 0;
+            if (tokens.TryGetProperty("cache", out JsonElement cache) &&
+                cache.ValueKind == JsonValueKind.Object)
+            {
+                cacheReadTokens = ReadOptionalInt64(cache, "read") ?? 0;
+                cacheWriteTokens = ReadOptionalInt64(cache, "write") ?? 0;
+            }
+        }
+
+        decimal cost = ReadOptionalDecimal(root, "cost") ?? 0m;
 
         return new OpenCodeUsageSnapshot(
-            ReadInt64(row, "session_count"),
-            ReadInt64(row, "input_tokens"),
-            ReadInt64(row, "output_tokens"),
-            ReadInt64(row, "reasoning_tokens"),
-            ReadInt64(row, "cache_read_tokens"),
-            ReadInt64(row, "cache_write_tokens"),
-            ReadDecimal(row, "cost"),
-            DateTimeOffset.UtcNow,
+            sessionCount,
+            inputTokens,
+            outputTokens,
+            reasoningTokens,
+            cacheReadTokens,
+            cacheWriteTokens,
+            cost,
+            timestamp,
             windowStart,
-            latestActivityAt,
+            null,
             Path.Combine(DataDirectoryPathForSource(), "opencode.db"));
+    }
+
+    private static long? ReadOptionalInt64(JsonElement parent, string propertyName)
+    {
+        if (!parent.TryGetProperty(propertyName, out JsonElement element) ||
+            element.ValueKind == JsonValueKind.Null ||
+            element.ValueKind == JsonValueKind.Undefined)
+        {
+            return null;
+        }
+
+        if (element.ValueKind == JsonValueKind.Number)
+        {
+            if (element.TryGetInt64(out long integerValue))
+            {
+                return integerValue;
+            }
+
+            if (element.TryGetDouble(out double doubleValue) && double.IsFinite(doubleValue))
+            {
+                return (long)Math.Max(long.MinValue, Math.Min(long.MaxValue, doubleValue));
+            }
+
+            return null;
+        }
+
+        if (element.ValueKind == JsonValueKind.String &&
+            long.TryParse(element.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out long stringValue))
+        {
+            return stringValue;
+        }
+
+        return null;
+    }
+
+    private static decimal? ReadOptionalDecimal(JsonElement parent, string propertyName)
+    {
+        if (!parent.TryGetProperty(propertyName, out JsonElement element) ||
+            element.ValueKind == JsonValueKind.Null ||
+            element.ValueKind == JsonValueKind.Undefined)
+        {
+            return null;
+        }
+
+        if (element.ValueKind == JsonValueKind.Number)
+        {
+            if (element.TryGetDecimal(out decimal decimalValue))
+            {
+                return decimalValue;
+            }
+
+            if (element.TryGetDouble(out double doubleValue) && double.IsFinite(doubleValue))
+            {
+                return (decimal)doubleValue;
+            }
+
+            return null;
+        }
+
+        if (element.ValueKind == JsonValueKind.String &&
+            decimal.TryParse(element.GetString(), NumberStyles.Number, CultureInfo.InvariantCulture, out decimal stringValue))
+        {
+            return stringValue;
+        }
+
+        return null;
     }
 
     private static string DataDirectoryPathForSource()
@@ -7456,55 +7687,6 @@ internal sealed class OpenCodeUsageReader
             ".local",
             "share",
             "opencode");
-    }
-
-    private static long ReadInt64(JsonElement parent, string propertyName)
-    {
-        long? value = ReadNullableInt64(parent, propertyName);
-        return value ?? throw new InvalidOperationException($"OpenCode result did not include {propertyName}.");
-    }
-
-    private static long? ReadNullableInt64(JsonElement parent, string propertyName)
-    {
-        if (!parent.TryGetProperty(propertyName, out JsonElement element) ||
-            element.ValueKind == JsonValueKind.Null)
-        {
-            return null;
-        }
-
-        if (element.ValueKind == JsonValueKind.Number && element.TryGetInt64(out long numericValue))
-        {
-            return numericValue;
-        }
-
-        if (element.ValueKind == JsonValueKind.String &&
-            long.TryParse(element.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out long stringValue))
-        {
-            return stringValue;
-        }
-
-        throw new InvalidOperationException($"OpenCode result has an invalid {propertyName}.");
-    }
-
-    private static decimal ReadDecimal(JsonElement parent, string propertyName)
-    {
-        if (!parent.TryGetProperty(propertyName, out JsonElement element))
-        {
-            throw new InvalidOperationException($"OpenCode result did not include {propertyName}.");
-        }
-
-        if (element.ValueKind == JsonValueKind.Number && element.TryGetDecimal(out decimal numericValue))
-        {
-            return numericValue;
-        }
-
-        if (element.ValueKind == JsonValueKind.String &&
-            decimal.TryParse(element.GetString(), NumberStyles.Number, CultureInfo.InvariantCulture, out decimal stringValue))
-        {
-            return stringValue;
-        }
-
-        throw new InvalidOperationException($"OpenCode result has an invalid {propertyName}.");
     }
 }
 

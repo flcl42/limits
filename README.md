@@ -72,12 +72,16 @@ using the API key and base URL configured by DeepCode in
 precedence. The key is used only as a bearer credential and is never displayed
 or written by `limits`.
 
-OpenCode usage is read locally from its database at
-`%USERPROFILE%\.local\share\opencode\opencode.db` through the installed
-`opencode` database command. The counter feed includes the rolling last-24-hour
-session and token totals. When `%USERPROFILE%\.local\share\opencode\auth.json`
+OpenCode usage is read from `opencode stats --json --days 1` (today's session
+and token totals) through the installed `opencode` executable, which is
+resolved from `OPENCODE_BIN`, `PATH`, or the npm global install
+(`@opencode/cli`). The `opencode db` subcommand was removed in OpenCode v2, so
+it is no longer used. When `%USERPROFILE%\.local\share\opencode\auth.json`
 contains an `opencode-go` API key, the app also reads OpenCode Go's official
-usage endpoint (`GET https://opencode.ai/zen/go/v1/usage`). Go provides a
+usage endpoint (`GET https://opencode.ai/zen/go/v1/usage`). The key is read from the
+legacy `%USERPROFILE%\.local\share\opencode\auth.json` when present, otherwise
+from `opencode auth export` (OpenCode v2 keeps credentials in its service
+credential store). Go provides a
 rolling 5-hour quota, a weekly quota, and a monthly quota; it does not provide
 a daily quota. These are exposed under
 `openCode.go.rolling`, `openCode.go.weekly`, and `openCode.go.monthly`, each with
@@ -89,9 +93,9 @@ bearer credential and is never included in the WebSocket payload.
 OpenRouter balance is read from `GET https://openrouter.ai/api/v1/key` (key
 limit and daily/weekly/monthly key spend) and
 `GET https://openrouter.ai/api/v1/credits` (account credits and total usage)
-using the `openrouter` API key in
-`%USERPROFILE%\.local\share\opencode\auth.json`, falling back to
-`OPENROUTER_API_KEY`. The key is used only as a bearer credential and is never
+using the `openrouter` API key from `opencode auth export` (falling back to the
+legacy `%USERPROFILE%\.local\share\opencode\auth.json`, then to
+`OPENROUTER_API_KEY`). The key is used only as a bearer credential and is never
 displayed or included in the WebSocket payload.
 
 Hardware readings use Windows `GetSystemTimes` for CPU usage,
