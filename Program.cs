@@ -26,6 +26,18 @@ internal static class Program
             return TrayApplication.RequestOpenDiskSettings();
         }
 
+        if (args.Any(argument => string.Equals(argument, "--autostart", StringComparison.OrdinalIgnoreCase) ||
+                                 string.Equals(argument, "--enable-autostart", StringComparison.OrdinalIgnoreCase)))
+        {
+            return TrayApplication.EnableAutostart();
+        }
+
+        if (args.Any(argument => string.Equals(argument, "--no-autostart", StringComparison.OrdinalIgnoreCase) ||
+                                 string.Equals(argument, "--disable-autostart", StringComparison.OrdinalIgnoreCase)))
+        {
+            return TrayApplication.DisableAutostart();
+        }
+
         using TrayApplication application = new();
         return application.Run();
     }
@@ -362,6 +374,53 @@ internal sealed class TrayApplication : IDisposable
         catch (WaitHandleCannotBeOpenedException)
         {
             return 1;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return 2;
+        }
+        catch (IOException)
+        {
+            return 3;
+        }
+    }
+
+    private const string AutostartValueName = "limits";
+    private const string AutostartRunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+
+    public static int EnableAutostart()
+    {
+        try
+        {
+            string exePath = Environment.ProcessPath ?? Path.Combine(AppContext.BaseDirectory, "limits.exe");
+            string value = exePath.StartsWith("\"", StringComparison.Ordinal) ? exePath : $"\"{exePath}\"";
+            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(AutostartRunKeyPath, writable: true)
+                ?? Registry.CurrentUser.CreateSubKey(AutostartRunKeyPath, writable: true);
+            if (key is null)
+            {
+                return 1;
+            }
+
+            key.SetValue(AutostartValueName, value, RegistryValueKind.String);
+            return 0;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return 2;
+        }
+        catch (IOException)
+        {
+            return 3;
+        }
+    }
+
+    public static int DisableAutostart()
+    {
+        try
+        {
+            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(AutostartRunKeyPath, writable: true);
+            key?.DeleteValue(AutostartValueName, throwOnMissingValue: false);
+            return 0;
         }
         catch (UnauthorizedAccessException)
         {
@@ -7083,7 +7142,7 @@ internal sealed class OpenRouterBalanceReader
         using HttpRequestMessage request = new(HttpMethod.Get, endpoint);
         request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
         request.Headers.TryAddWithoutValidation("Accept", "application/json");
-        request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.5.1");
+        request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.6.0");
 
         using HttpResponseMessage response = HttpClient.Send(request);
         if (!response.IsSuccessStatusCode)
@@ -7212,7 +7271,7 @@ internal sealed class OpenCodeUsageReader
             using HttpRequestMessage request = new(HttpMethod.Get, GoUsageEndpoint);
             request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
             request.Headers.TryAddWithoutValidation("Accept", "application/json");
-            request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.5.1");
+            request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.6.0");
 
             using HttpResponseMessage response = GoHttpClient.Send(request);
             if (!response.IsSuccessStatusCode)
@@ -9379,22 +9438,36 @@ internal static class TrayIconRenderer
     {
         IconPalette palette = GetPalette();
         int rollingRemaining = CodexUsageMath.GetRemainingPercent(snapshot.Rolling.UsedPercent);
-        int weeklyRemaining = CodexUsageMath.GetRemainingPercent(snapshot.Weekly.UsedPercent);
+        int bottomRemaining = GetOpenCodeBottomRemaining(snapshot);
         return CreateIcon(
             rollingRemaining.ToString(CultureInfo.InvariantCulture),
             ColorForRemaining(rollingRemaining, palette),
-            weeklyRemaining.ToString(CultureInfo.InvariantCulture),
-            ColorForRemaining(weeklyRemaining, palette),
+            bottomRemaining.ToString(CultureInfo.InvariantCulture),
+            ColorForRemaining(bottomRemaining, palette),
             OpenCodeBrandColor,
-            snapshot.Weekly.ResetAt);
+            GetOpenCodeBottomResetAt(snapshot));
     }
 
     public static string GetOpenCodeIconKey(OpenCodeGoUsageSnapshot snapshot)
     {
         int rollingRemaining = CodexUsageMath.GetRemainingPercent(snapshot.Rolling.UsedPercent);
+        int bottomRemaining = GetOpenCodeBottomRemaining(snapshot);
+        int resetDays = GetResetDayDotCount(GetOpenCodeBottomResetAt(snapshot));
+        return $"opencode:{rollingRemaining}:{bottomRemaining}:{resetDays}";
+    }
+
+    private static int GetOpenCodeBottomRemaining(OpenCodeGoUsageSnapshot snapshot)
+    {
         int weeklyRemaining = CodexUsageMath.GetRemainingPercent(snapshot.Weekly.UsedPercent);
-        int resetDays = GetResetDayDotCount(snapshot.Weekly.ResetAt);
-        return $"opencode:{rollingRemaining}:{weeklyRemaining}:{resetDays}";
+        int monthlyRemaining = CodexUsageMath.GetRemainingPercent(snapshot.Monthly.UsedPercent);
+        return Math.Min(weeklyRemaining, monthlyRemaining);
+    }
+
+    private static DateTimeOffset? GetOpenCodeBottomResetAt(OpenCodeGoUsageSnapshot snapshot)
+    {
+        int weeklyRemaining = CodexUsageMath.GetRemainingPercent(snapshot.Weekly.UsedPercent);
+        int monthlyRemaining = CodexUsageMath.GetRemainingPercent(snapshot.Monthly.UsedPercent);
+        return monthlyRemaining < weeklyRemaining ? snapshot.Monthly.ResetAt : snapshot.Weekly.ResetAt;
     }
 
     public static IntPtr CreateOpenCodeUnavailableIcon()

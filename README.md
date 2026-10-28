@@ -9,8 +9,8 @@ the notification area so its context menu is always available.
   rows use distinct colors and the tooltip/menu contain exact percentages and
   memory amounts. Right-click it (or any other visible icon) and use `Visible
   icons` to show or hide the other icons.
-- OpenCode icon: shows rolling 5-hour remaining percent above weekly remaining
-  percent; the left dots show days until the weekly reset. It is enabled by
+- OpenCode icon: shows rolling 5-hour remaining percent above the lower of weekly
+  and monthly remaining percent; the left dots show days until that window's reset. It is enabled by
   default and can be hidden from `Visible icons`. Its monthly quota is available
   in the tooltip and WebSocket feed.
 - Devin icon: shows daily agentic quota remaining above weekly agentic quota
@@ -170,3 +170,16 @@ shut down cleanly, copies only `limits.exe` into `C:\Programs`, removes old
 installed `gpt.exe` binaries, registers the `limits` logon task at the highest
 run level, and starts that task. The installed binary is
 `C:\Programs\limits.exe`.
+
+To start `limits` automatically on Windows logon without the installer, run
+once (no admin rights needed):
+
+```powershell
+C:\Programs\limits.exe --autostart
+```
+
+This writes the current executable path (with no arguments) to
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` under the value name
+`limits`, so subsequent logons launch a bare `limits.exe`. Remove it with
+`C:\Programs\limits.exe --no-autostart`. (`--enable-autostart` and
+`--disable-autostart` are accepted as aliases.)
