@@ -74,6 +74,7 @@ internal sealed class TrayApplication : IDisposable
     private const uint UnetResultMessage = NativeMethods.WM_APP + 11;
     private const uint DevinResultMessage = NativeMethods.WM_APP + 12;
     private const uint OpenRouterResultMessage = NativeMethods.WM_APP + 13;
+    private const uint ModelflareResultMessage = NativeMethods.WM_APP + 14;
     private const uint KimiTrayIconId = 3;
     private const uint DeepSeekTrayIconId = 4;
     private const uint DiskTrayIconId = 5;
@@ -143,6 +144,7 @@ internal sealed class TrayApplication : IDisposable
     private readonly OpenCodeUsageReader _openCodeUsageReader = new();
     private readonly DevinUsageReader _devinUsageReader = new();
     private readonly OpenRouterBalanceReader _openRouterBalanceReader = new();
+    private readonly ModelflareBalanceReader _modelflareBalanceReader = new();
     private readonly HardwareMonitor _hardwareMonitor = new();
     private readonly DiskMonitor _diskMonitor = new();
     private readonly TrayIconSettingsStore _trayIconSettingsStore = new();
@@ -213,6 +215,9 @@ internal sealed class TrayApplication : IDisposable
     private string _codexSourceText = string.Empty;
     private CodexUsageSnapshot? _lastCodexSnapshot;
     private CodexUsageSnapshot? _lastCodexSparkSnapshot;
+    private string? _lastCodexErrorMessage;
+    private ModelflareBalanceSnapshot? _lastModelflareSnapshot;
+    private string? _lastModelflareErrorMessage;
     private string _claudeTooltip = "limits";
     private string _claudeStatusText = "Loading Claude usage...";
     private string _claudeDetailText = "Reading Claude OAuth usage.";
@@ -290,6 +295,8 @@ internal sealed class TrayApplication : IDisposable
     private volatile DevinUsageReadResult? _pendingDevinResult;
     private volatile bool _openRouterRefreshInFlight;
     private volatile OpenRouterBalanceReadResult? _pendingOpenRouterResult;
+    private volatile bool _modelflareRefreshInFlight;
+    private volatile ModelflareBalanceReadResult? _pendingModelflareResult;
     private volatile bool _limitWatchdogInFlight;
     private volatile bool _diskRefreshInFlight;
     private readonly Dictionary<string, DateTimeOffset> _lastDiskAlertAt = new(StringComparer.OrdinalIgnoreCase);
@@ -548,6 +555,7 @@ internal sealed class TrayApplication : IDisposable
     private void RefreshUsage()
     {
         RefreshCodexUsage();
+        RefreshModelflareBalance();
         RefreshClaudeUsage();
         RefreshKimiUsage();
         RefreshDeepSeekBalance();
@@ -700,6 +708,115 @@ internal sealed class TrayApplication : IDisposable
         });
     }
 
+    private void RefreshModelflareBalance()
+    {
+        if (_modelflareRefreshInFlight)
+        {
+            return;
+        }
+
+        _modelflareRefreshInFlight = true;
+        IntPtr windowHandle = _windowHandle;
+
+        Task.Run(() =>
+        {
+            ModelflareBalanceReadResult result;
+            try
+            {
+                result = _modelflareBalanceReader.ReadLatestSnapshot();
+            }
+            catch (Exception exception)
+            {
+                result = new ModelflareBalanceReadResult(null, exception.Message);
+            }
+
+            _pendingModelflareResult = result;
+
+            if (windowHandle == IntPtr.Zero ||
+                !NativeMethods.PostMessage(windowHandle, ModelflareResultMessage, IntPtr.Zero, IntPtr.Zero))
+            {
+                _modelflareRefreshInFlight = false;
+            }
+        });
+    }
+
+    private void ApplyModelflareResult()
+    {
+        ModelflareBalanceReadResult? result = _pendingModelflareResult;
+        _pendingModelflareResult = null;
+        _modelflareRefreshInFlight = false;
+
+        if (result is null)
+        {
+            return;
+        }
+
+        if (result.Snapshot is not null)
+        {
+            _lastModelflareSnapshot = result.Snapshot;
+            _lastModelflareErrorMessage = null;
+        }
+        else if (!string.IsNullOrWhiteSpace(result.ErrorMessage))
+        {
+            _lastModelflareErrorMessage = result.ErrorMessage;
+            if (!_modelflareBalanceReader.IsConfigured)
+            {
+                _lastModelflareSnapshot = null;
+            }
+        }
+
+        UpdateCodexDisplay();
+    }
+
+    private void UpdateCodexDisplay()
+    {
+        if (_lastModelflareSnapshot is { } modelflare)
+        {
+            _codexTooltip = BuildModelflareTooltip(modelflare);
+            _codexStatusText = BuildModelflareHeadline(modelflare);
+            _codexDetailText = BuildModelflareDetail(modelflare);
+            _codexSparkUsageText = "Modelflare: dollar-based billing (no rate limits)";
+            _codexUpdatedText = $"Seen {modelflare.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
+            _codexSourceText = modelflare.Source;
+            UpdateCodexTrayIcon(
+                TrayIconRenderer.CreateModelflareIcon(modelflare),
+                TrayIconRenderer.GetModelflareIconKey(modelflare));
+            return;
+        }
+
+        if (_lastCodexSnapshot is { } snapshot)
+        {
+            _codexTooltip = BuildCodexTooltip(snapshot);
+            _codexStatusText = BuildCodexHeadline(snapshot);
+            _codexDetailText = BuildCodexDetail(snapshot);
+            _codexSparkUsageText = BuildSparkUsage(_lastCodexSparkSnapshot);
+            _codexUpdatedText = $"Seen {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
+            _codexSourceText = snapshot.SourceFile;
+            UpdateCodexTrayIcon(
+                TrayIconRenderer.CreateUsageIcon(snapshot),
+                TrayIconRenderer.GetCodexIconKey(snapshot));
+            return;
+        }
+
+        string? error = _lastCodexErrorMessage;
+        if (_modelflareBalanceReader.IsConfigured && !string.IsNullOrWhiteSpace(_lastModelflareErrorMessage))
+        {
+            error = string.IsNullOrWhiteSpace(error)
+                ? _lastModelflareErrorMessage
+                : $"{error} {_lastModelflareErrorMessage}";
+        }
+
+        _codexTooltip = "Codex: usage unavailable";
+        _codexStatusText = "No Codex usage data found";
+        _codexDetailText = error ?? "No token_count events were found.";
+        _codexSparkUsageText = BuildSparkUsage(_lastCodexSparkSnapshot);
+        _codexUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
+        _codexSourceText = _modelflareBalanceReader.IsConfigured
+            ? _modelflareBalanceReader.DisplaySource
+            : _codexUsageReader.SessionsPath;
+        UpdateCodexTrayIcon(TrayIconRenderer.CreateUnavailableIcon(), TrayIconRenderer.CodexUnavailableIconKey);
+    }
+
     private void ApplyCodexResult()
     {
         UsageReadResult? result = _pendingCodexResult;
@@ -711,36 +828,33 @@ internal sealed class TrayApplication : IDisposable
             return;
         }
 
-        if (result.Snapshot is null)
-        {
-            if (result.SparkSnapshot is not null)
-            {
-                _lastCodexSparkSnapshot = result.SparkSnapshot;
-            }
-
-            _codexTooltip = "Codex: usage unavailable";
-            _codexStatusText = "No Codex usage data found";
-            _codexDetailText = result.ErrorMessage ?? "No token_count events were found.";
-            _codexSparkUsageText = BuildSparkUsage(result.SparkSnapshot);
-            _codexUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
-            _codexSourceText = _codexUsageReader.SessionsPath;
-            UpdateCodexTrayIcon(TrayIconRenderer.CreateUnavailableIcon(), TrayIconRenderer.CodexUnavailableIconKey);
-            return;
-        }
-
-        CodexUsageSnapshot snapshot = result.Snapshot;
-        _lastCodexSnapshot = snapshot;
         if (result.SparkSnapshot is not null)
         {
             _lastCodexSparkSnapshot = result.SparkSnapshot;
         }
-        _codexTooltip = BuildCodexTooltip(snapshot);
-        _codexStatusText = BuildCodexHeadline(snapshot);
-        _codexDetailText = BuildCodexDetail(snapshot);
-        _codexSparkUsageText = BuildSparkUsage(result.SparkSnapshot);
-        _codexUpdatedText = $"Seen {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
-        _codexSourceText = snapshot.SourceFile;
-        UpdateCodexTrayIcon(TrayIconRenderer.CreateUsageIcon(snapshot), TrayIconRenderer.GetCodexIconKey(snapshot));
+
+        if (result.Snapshot is not null)
+        {
+            _lastCodexSnapshot = result.Snapshot;
+            _lastCodexErrorMessage = null;
+        }
+        else
+        {
+            _lastCodexErrorMessage = result.ErrorMessage ?? "No token_count events were found.";
+            if (_lastCodexSnapshot is null && _lastModelflareSnapshot is null)
+            {
+                _codexTooltip = "Codex: usage unavailable";
+                _codexStatusText = "No Codex usage data found";
+                _codexDetailText = _lastCodexErrorMessage;
+                _codexSparkUsageText = BuildSparkUsage(result.SparkSnapshot);
+                _codexUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
+                _codexSourceText = _codexUsageReader.SessionsPath;
+                UpdateCodexTrayIcon(TrayIconRenderer.CreateUnavailableIcon(), TrayIconRenderer.CodexUnavailableIconKey);
+                return;
+            }
+        }
+
+        UpdateCodexDisplay();
     }
 
     private void RefreshClaudeUsage()
@@ -1377,7 +1491,8 @@ internal sealed class TrayApplication : IDisposable
             ["version"] = 1,
             ["updatedAt"] = FormatCounterTimestamp(DateTimeOffset.UtcNow)
         };
-        root["codex"] = BuildCodexCounterJson(_lastCodexSnapshot, _lastCodexSparkSnapshot);
+        root["codex"] = BuildCodexCounterJson(_lastCodexSnapshot, _lastCodexSparkSnapshot, _lastModelflareSnapshot);
+        root["modelflare"] = BuildModelflareCounterJson(_lastModelflareSnapshot, _lastModelflareErrorMessage);
         root["claude"] = BuildClaudeCounterJson(_lastClaudeSnapshot);
         root["kimi"] = BuildKimiCounterJson(_lastKimiSnapshot);
         root["deepSeek"] = BuildDeepSeekCounterJson(_lastDeepSeekSnapshot);
@@ -1395,16 +1510,53 @@ internal sealed class TrayApplication : IDisposable
 
     private static JsonObject? BuildCodexCounterJson(
         CodexUsageSnapshot? snapshot,
-        CodexUsageSnapshot? sparkSnapshot)
+        CodexUsageSnapshot? sparkSnapshot,
+        ModelflareBalanceSnapshot? modelflareSnapshot)
+    {
+        if (snapshot is null && modelflareSnapshot is null)
+        {
+            return null;
+        }
+
+        JsonObject result;
+        if (snapshot is not null)
+        {
+            result = BuildCodexLimitCounterJson(snapshot);
+            result["spark"] = sparkSnapshot is null ? null : BuildCodexLimitCounterJson(sparkSnapshot);
+        }
+        else
+        {
+            result = new JsonObject
+            {
+                ["provider"] = "modelflare"
+            };
+        }
+
+        result["modelflare"] = modelflareSnapshot is null ? null : BuildModelflareCounterJson(modelflareSnapshot, null);
+        return result;
+    }
+
+    private static JsonObject? BuildModelflareCounterJson(
+        ModelflareBalanceSnapshot? snapshot,
+        string? errorMessage)
     {
         if (snapshot is null)
         {
             return null;
         }
 
-        JsonObject result = BuildCodexLimitCounterJson(snapshot);
-        result["spark"] = sparkSnapshot is null ? null : BuildCodexLimitCounterJson(sparkSnapshot);
-        return result;
+        return new JsonObject
+        {
+            ["timestamp"] = FormatCounterTimestamp(snapshot.Timestamp),
+            ["totalGranted"] = snapshot.TotalGranted,
+            ["totalUsed"] = snapshot.TotalUsed,
+            ["totalAvailable"] = snapshot.TotalAvailable,
+            ["periodUsage"] = snapshot.PeriodUsage,
+            ["hasPaymentMethod"] = snapshot.HasPaymentMethod,
+            ["source"] = snapshot.Source,
+            ["balanceEndpoint"] = snapshot.BalanceEndpoint,
+            ["error"] = errorMessage
+        };
     }
 
     private static JsonObject BuildCodexLimitCounterJson(CodexUsageSnapshot snapshot)
@@ -2255,6 +2407,11 @@ internal sealed class TrayApplication : IDisposable
                 PublishCounterState();
                 return IntPtr.Zero;
 
+            case ModelflareResultMessage:
+                ApplyModelflareResult();
+                PublishCounterState();
+                return IntPtr.Zero;
+
             case HardwareResultMessage:
                 ApplyHardwareResult();
                 PublishCounterState();
@@ -2541,13 +2698,19 @@ internal sealed class TrayApplication : IDisposable
         switch (iconId)
         {
             case CodexTrayIconId:
-                title = string.IsNullOrWhiteSpace(_lastCodexSnapshot?.PlanType)
-                    ? "Codex"
-                    : $"Codex {_lastCodexSnapshot.PlanType}";
+                title = _lastModelflareSnapshot is not null
+                    ? "Codex (Modelflare)"
+                    : string.IsNullOrWhiteSpace(_lastCodexSnapshot?.PlanType)
+                        ? "Codex"
+                        : $"Codex {_lastCodexSnapshot.PlanType}";
                 summary = _codexStatusText;
                 detail = JoinBalloonDetails(_codexDetailText, _codexSparkUsageText);
                 updated = _codexUpdatedText;
-                if (_lastCodexSnapshot is { } codex)
+                if (_lastModelflareSnapshot is { } modelflareSnapshot)
+                {
+                    AddModelflareRows(rows, modelflareSnapshot);
+                }
+                else if (_lastCodexSnapshot is { } codex)
                 {
                     AddCodexRows(rows, codex, string.Empty);
                     if (_lastCodexSparkSnapshot is { } spark)
@@ -2713,6 +2876,14 @@ internal sealed class TrayApplication : IDisposable
                 100d - snapshot.SecondaryUsedPercent,
                 snapshot.SecondaryResetAt));
         }
+    }
+
+    private static void AddModelflareRows(List<UsageBalloonRow> rows, ModelflareBalanceSnapshot snapshot)
+    {
+        AddSpendRow(rows, "Available balance", snapshot.TotalAvailable);
+        AddSpendRow(rows, "Granted credits", snapshot.TotalGranted);
+        AddSpendRow(rows, "Used credits", snapshot.TotalUsed);
+        AddSpendRow(rows, "Period usage", snapshot.PeriodUsage);
     }
 
     private static string FormatLimitWindow(int minutes)
@@ -3118,7 +3289,13 @@ internal sealed class TrayApplication : IDisposable
 
     private void RefreshVisibleTrayIcons()
     {
-        if (_lastCodexSnapshot is { } codexSnapshot)
+        if (_lastModelflareSnapshot is { } modelflareSnapshot)
+        {
+            UpdateCodexTrayIcon(
+                TrayIconRenderer.CreateModelflareIcon(modelflareSnapshot),
+                TrayIconRenderer.GetModelflareIconKey(modelflareSnapshot));
+        }
+        else if (_lastCodexSnapshot is { } codexSnapshot)
         {
             UpdateCodexTrayIcon(
                 TrayIconRenderer.CreateUsageIcon(codexSnapshot),
@@ -3769,6 +3946,36 @@ internal sealed class TrayApplication : IDisposable
             NativeMethods.DestroyIcon(iconHandle);
             iconHandle = IntPtr.Zero;
         }
+    }
+
+    private static string BuildModelflareTooltip(ModelflareBalanceSnapshot snapshot)
+    {
+        return TruncateTooltip(
+            $"Codex (Modelflare): {FormatModelflareAmount(snapshot.TotalAvailable)} left");
+    }
+
+    private static string BuildModelflareHeadline(ModelflareBalanceSnapshot snapshot)
+    {
+        return $"Modelflare: {FormatModelflareAmount(snapshot.TotalAvailable)} left " +
+               $"({FormatModelflareAmount(snapshot.TotalUsed)} of {FormatModelflareAmount(snapshot.TotalGranted)} used)";
+    }
+
+    private static string BuildModelflareDetail(ModelflareBalanceSnapshot snapshot)
+    {
+        string detail = $"Granted {FormatModelflareAmount(snapshot.TotalGranted)}, " +
+                        $"used {FormatModelflareAmount(snapshot.TotalUsed)}, " +
+                        $"available {FormatModelflareAmount(snapshot.TotalAvailable)}";
+        if (snapshot.PeriodUsage is { } periodUsage)
+        {
+            detail += $"; period usage {FormatModelflareAmount(periodUsage)}";
+        }
+
+        return detail;
+    }
+
+    private static string FormatModelflareAmount(decimal amount)
+    {
+        return $"${amount.ToString("0.00", CultureInfo.InvariantCulture)}";
     }
 
     private static string BuildCodexTooltip(CodexUsageSnapshot snapshot)
@@ -4850,6 +5057,11 @@ internal sealed class CodexUsageReader
 
             RateLimitInfo primary = ReadLimit(rateLimits, "primary");
             RateLimitInfo secondary = ReadLimit(rateLimits, "secondary");
+            if (primary.WindowMinutes <= 0 && secondary.WindowMinutes <= 0)
+            {
+                return null;
+            }
+
             string? planType = rateLimits.TryGetProperty("plan_type", out JsonElement planTypeElement)
                 ? planTypeElement.GetString()
                 : null;
@@ -4971,6 +5183,321 @@ internal sealed class CodexUsageReader
     private sealed record RateLimitInfo(double UsedPercent, int WindowMinutes, DateTimeOffset? ResetsAt);
 
     private sealed record CodexCredential(string AccessToken, string AccountId);
+}
+
+internal sealed record ModelflareBalanceSnapshot(
+    decimal TotalGranted,
+    decimal TotalUsed,
+    decimal TotalAvailable,
+    decimal? PeriodUsage,
+    bool? HasPaymentMethod,
+    DateTimeOffset Timestamp,
+    string Source,
+    string BalanceEndpoint);
+
+internal sealed record ModelflareBalanceReadResult(ModelflareBalanceSnapshot? Snapshot, string? ErrorMessage);
+
+internal sealed class ModelflareBalanceReader
+{
+    private const string DefaultBaseUrl = "https://modelflare.dev/v1";
+    private static readonly HttpClient HttpClient = new()
+    {
+        Timeout = TimeSpan.FromSeconds(20)
+    };
+
+    public string CodexHomePath { get; } = ResolveCodexHome();
+    public string AuthPath => Path.Combine(CodexHomePath, "auth.json");
+    public string ConfigPath => Path.Combine(CodexHomePath, "config.toml");
+
+    public bool IsConfigured => TryReadApiKey(out _, out _);
+
+    public string DisplaySource => File.Exists(ConfigPath) ? $"{AuthPath} + {ConfigPath}" : AuthPath;
+
+    public ModelflareBalanceReadResult ReadLatestSnapshot()
+    {
+        try
+        {
+            if (!TryReadApiKey(out string? apiKey, out string? keyError) || string.IsNullOrWhiteSpace(apiKey))
+            {
+                return new ModelflareBalanceReadResult(null, keyError ?? $"Modelflare API key was not found in {AuthPath}.");
+            }
+
+            string baseUrl = ReadBaseUrl();
+            string creditEndpoint = BuildEndpoint(baseUrl, "dashboard/billing/credit_grants");
+            string usageEndpoint = BuildEndpoint(baseUrl, "dashboard/billing/usage");
+            string subscriptionEndpoint = BuildEndpoint(baseUrl, "dashboard/billing/subscription");
+
+            (decimal granted, decimal used, decimal available) credits = ReadCredits(creditEndpoint, apiKey);
+            decimal? periodUsage = TryReadPeriodUsage(usageEndpoint, apiKey);
+            bool? hasPaymentMethod = TryReadHasPaymentMethod(subscriptionEndpoint, apiKey);
+
+            string source = File.Exists(ConfigPath) ? $"{AuthPath} + {ConfigPath}" : AuthPath;
+            ModelflareBalanceSnapshot snapshot = new(
+                credits.granted,
+                credits.used,
+                credits.available,
+                periodUsage,
+                hasPaymentMethod,
+                DateTimeOffset.UtcNow,
+                source,
+                creditEndpoint);
+            return new ModelflareBalanceReadResult(snapshot, null);
+        }
+        catch (TaskCanceledException)
+        {
+            return new ModelflareBalanceReadResult(null, "Modelflare balance request timed out.");
+        }
+        catch (HttpRequestException)
+        {
+            return new ModelflareBalanceReadResult(null, "Modelflare balance request failed.");
+        }
+        catch (JsonException)
+        {
+            return new ModelflareBalanceReadResult(null, "Modelflare balance response was invalid.");
+        }
+        catch (InvalidOperationException exception)
+        {
+            return new ModelflareBalanceReadResult(null, exception.Message);
+        }
+        catch (IOException)
+        {
+            return new ModelflareBalanceReadResult(null, "Modelflare credentials could not be read.");
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return new ModelflareBalanceReadResult(null, "Modelflare credentials could not be read.");
+        }
+        catch (Exception)
+        {
+            return new ModelflareBalanceReadResult(null, "Modelflare balance is unavailable.");
+        }
+    }
+
+    private bool TryReadApiKey(out string? apiKey, out string? error)
+    {
+        apiKey = null;
+        error = null;
+        try
+        {
+            if (!File.Exists(AuthPath))
+            {
+                error = $"Missing Codex credentials file: {AuthPath}";
+                return false;
+            }
+
+            using FileStream stream = new(AuthPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using JsonDocument document = JsonDocument.Parse(stream);
+            JsonElement root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                error = "Codex auth.json is not a JSON object.";
+                return false;
+            }
+
+            if (root.TryGetProperty("OPENAI_API_KEY", out JsonElement keyElement) &&
+                keyElement.ValueKind == JsonValueKind.String &&
+                !string.IsNullOrWhiteSpace(keyElement.GetString()))
+            {
+                apiKey = keyElement.GetString()!.Trim();
+                return true;
+            }
+
+            error = $"Modelflare API key (OPENAI_API_KEY) was not found in {AuthPath}.";
+            return false;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
+        {
+            error = exception.Message;
+            return false;
+        }
+    }
+
+    private string ReadBaseUrl()
+    {
+        try
+        {
+            if (File.Exists(ConfigPath))
+            {
+                foreach (string rawLine in File.ReadLines(ConfigPath))
+                {
+                    string line = rawLine.Trim();
+                    if (line.StartsWith("base_url", StringComparison.OrdinalIgnoreCase))
+                    {
+                        int equals = line.IndexOf('=');
+                        if (equals > 0)
+                        {
+                            string value = line[(equals + 1)..].Trim().Trim('"', '\'', ' ', '\t');
+                            if (Uri.TryCreate(value, UriKind.Absolute, out Uri? uri) &&
+                                uri.Scheme is "http" or "https" &&
+                                uri.Host.Contains("modelflare", StringComparison.OrdinalIgnoreCase))
+                            {
+                                return value.TrimEnd('/');
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+
+        return DefaultBaseUrl;
+    }
+
+    private static string BuildEndpoint(string baseUrl, string relativePath)
+    {
+        string trimmed = baseUrl.Trim().TrimEnd('/');
+        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out Uri? uri) ||
+            (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+        {
+            throw new InvalidOperationException("Modelflare base URL is not a valid HTTP URL.");
+        }
+
+        return $"{trimmed}/{relativePath}";
+    }
+
+    private static (decimal Granted, decimal Used, decimal Available) ReadCredits(string endpoint, string apiKey)
+    {
+        using HttpRequestMessage request = new(HttpMethod.Get, endpoint);
+        request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
+        request.Headers.TryAddWithoutValidation("Accept", "application/json");
+        request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.6.1");
+
+        using HttpResponseMessage response = HttpClient.Send(request);
+        if (!response.IsSuccessStatusCode)
+        {
+            string message = response.StatusCode switch
+            {
+                System.Net.HttpStatusCode.Unauthorized => "Modelflare API key was rejected (401).",
+                System.Net.HttpStatusCode.Forbidden => "Modelflare API key is not allowed to read billing (403).",
+                System.Net.HttpStatusCode.TooManyRequests => "Modelflare rate limited the billing request (429).",
+                System.Net.HttpStatusCode.NotFound => "Modelflare billing endpoint was not found (not a Modelflare key?).",
+                _ => $"Modelflare billing request failed: HTTP {(int)response.StatusCode}"
+            };
+            throw new InvalidOperationException(message);
+        }
+
+        string body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        using JsonDocument document = JsonDocument.Parse(body);
+        JsonElement root = document.RootElement;
+        return (
+            ReadDecimal(root, "total_granted"),
+            ReadDecimal(root, "total_used"),
+            ReadDecimal(root, "total_available"));
+    }
+
+    private static decimal? TryReadPeriodUsage(string endpoint, string apiKey)
+    {
+        try
+        {
+            using HttpRequestMessage request = new(HttpMethod.Get, endpoint);
+            request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
+            request.Headers.TryAddWithoutValidation("Accept", "application/json");
+            request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.6.1");
+
+            using HttpResponseMessage response = HttpClient.Send(request);
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            string body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            using JsonDocument document = JsonDocument.Parse(body);
+            JsonElement root = document.RootElement;
+            if (root.TryGetProperty("total_usage", out JsonElement usageElement))
+            {
+                if (usageElement.ValueKind == JsonValueKind.Number && usageElement.TryGetDecimal(out decimal value))
+                {
+                    return value;
+                }
+
+                if (usageElement.ValueKind == JsonValueKind.String &&
+                    decimal.TryParse(usageElement.GetString(), NumberStyles.Number, CultureInfo.InvariantCulture, out decimal parsed))
+                {
+                    return parsed;
+                }
+            }
+
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool? TryReadHasPaymentMethod(string endpoint, string apiKey)
+    {
+        try
+        {
+            using HttpRequestMessage request = new(HttpMethod.Get, endpoint);
+            request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
+            request.Headers.TryAddWithoutValidation("Accept", "application/json");
+            request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.6.1");
+
+            using HttpResponseMessage response = HttpClient.Send(request);
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            string body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            using JsonDocument document = JsonDocument.Parse(body);
+            JsonElement root = document.RootElement;
+            if (root.TryGetProperty("has_payment_method", out JsonElement element))
+            {
+                return element.ValueKind switch
+                {
+                    JsonValueKind.True => true,
+                    JsonValueKind.False => false,
+                    _ => null
+                };
+            }
+
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static decimal ReadDecimal(JsonElement parent, string propertyName)
+    {
+        if (!parent.TryGetProperty(propertyName, out JsonElement element))
+        {
+            throw new InvalidOperationException($"Modelflare billing response did not include {propertyName}.");
+        }
+
+        if (element.ValueKind == JsonValueKind.Number && element.TryGetDecimal(out decimal numericValue))
+        {
+            return numericValue;
+        }
+
+        if (element.ValueKind == JsonValueKind.String &&
+            decimal.TryParse(element.GetString(), NumberStyles.Number, CultureInfo.InvariantCulture, out decimal stringValue))
+        {
+            return stringValue;
+        }
+
+        throw new InvalidOperationException($"Modelflare billing response has an invalid {propertyName}.");
+    }
+
+    private static string ResolveCodexHome()
+    {
+        string? configuredHome = Environment.GetEnvironmentVariable("CODEX_HOME");
+        if (!string.IsNullOrWhiteSpace(configuredHome))
+        {
+            return Environment.ExpandEnvironmentVariables(configuredHome);
+        }
+
+        string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        return Path.Combine(userProfile, ".codex");
+    }
 }
 
 internal sealed record ClaudeUsageSnapshot(
@@ -9281,6 +9808,28 @@ internal static class TrayIconRenderer
         int weeklyRemaining = CodexUsageMath.GetWeeklyRemainingPercent(snapshot);
         int resetDays = GetResetDayDotCount(CodexUsageMath.GetWeeklyResetAt(snapshot));
         return $"codex:{weeklyRemaining}:{resetDays}";
+    }
+
+    public static IntPtr CreateModelflareIcon(ModelflareBalanceSnapshot snapshot)
+    {
+        IconPalette palette = GetPalette();
+        uint balanceColor = ColorForBalance(snapshot.TotalAvailable, isAvailable: snapshot.TotalAvailable > 0, palette);
+        string text = FormatBalanceIconText(snapshot.TotalAvailable);
+
+        if (text == "infinity")
+        {
+            uint[] infinityPixels = new uint[IconSize * IconSize];
+            DrawBrandTriangle(infinityPixels, OpenAiBrandColor);
+            DrawInfinity(infinityPixels, balanceColor);
+            return CreateNativeIcon(infinityPixels);
+        }
+
+        return CreateCenteredIcon(text, balanceColor, OpenAiBrandColor);
+    }
+
+    public static string GetModelflareIconKey(ModelflareBalanceSnapshot snapshot)
+    {
+        return $"modelflare:{FormatBalanceIconText(snapshot.TotalAvailable)}:{snapshot.TotalAvailable > 0}";
     }
 
     public static IntPtr CreateUnavailableIcon()

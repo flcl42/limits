@@ -51,7 +51,20 @@ Codex status is read from the authenticated current-account usage endpoint
 using `%CODEX_HOME%\auth.json` or `%USERPROFILE%\.codex\auth.json`. The regular
 and Spark limits are read separately so concurrent sessions cannot replace the
 regular allowance with Spark's allowance. Local session files are used only as
-a fallback when the account endpoint is unavailable.
+a fallback when the account endpoint is unavailable. Session `token_count`
+events without any rate-limit window are ignored, since Codex proxies such as
+Modelflare report those as null.
+
+When `%USERPROFILE%\.codex\auth.json` contains an `OPENAI_API_KEY` (API-key
+mode, e.g. Modelflare) the Codex tray icon switches to dollar-based billing:
+`GET {base_url}/dashboard/billing/credit_grants` (granted/used/available),
+`GET {base_url}/dashboard/billing/usage` (period usage), and
+`GET {base_url}/dashboard/billing/subscription` (payment method) using the
+`model_providers.modelflare` `base_url` from `%USERPROFILE%\.codex\config.toml`
+(default `https://modelflare.dev/v1`). The icon shows whole available dollars,
+the tooltip/menu show granted/used/available amounts, and the WebSocket feed
+exposes them under `modelflare` and inside `codex.modelflare`. The key is used
+only as a bearer credential and is never displayed or included in the payload.
 
 Claude status is read from Claude Code's OAuth usage metadata endpoint. An
 expired access token is refreshed with the stored refresh token, and the last
