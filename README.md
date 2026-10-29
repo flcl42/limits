@@ -114,7 +114,10 @@ displayed or included in the WebSocket payload.
 Hardware readings use Windows `GetSystemTimes` for CPU usage,
 `GlobalMemoryStatusEx` for physical RAM, `nvidia-smi` for NVIDIA GPU
 temperature, usage, and VRAM, and the installed AMD Ryzen Master package
-sensor for the CPU package temperature. The generic Windows ACPI thermal-zone
+sensor for the CPU package temperature. Without `nvidia-smi` (VMs, AMD/Intel
+GPUs), the adapter name comes from the display-driver registry and GPU usage
+from the `GPU Engine` utilization counters; temperature and VRAM stay unknown
+there because no readable sensor exists. The generic Windows ACPI thermal-zone
 counter is deliberately not used because it can report a board/ambient zone
 rather than the Ryzen package temperature. If a sensor is unavailable, that
 value is shown as unknown instead of being guessed. Hardware readings are

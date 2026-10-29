@@ -5365,7 +5365,7 @@ internal sealed class ModelflareBalanceReader
         using HttpRequestMessage request = new(HttpMethod.Get, endpoint);
         request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
         request.Headers.TryAddWithoutValidation("Accept", "application/json");
-        request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.6.1");
+        request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.6.2");
 
         using HttpResponseMessage response = HttpClient.Send(request);
         if (!response.IsSuccessStatusCode)
@@ -5397,7 +5397,7 @@ internal sealed class ModelflareBalanceReader
             using HttpRequestMessage request = new(HttpMethod.Get, endpoint);
             request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
             request.Headers.TryAddWithoutValidation("Accept", "application/json");
-            request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.6.1");
+            request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.6.2");
 
             using HttpResponseMessage response = HttpClient.Send(request);
             if (!response.IsSuccessStatusCode)
@@ -5437,7 +5437,7 @@ internal sealed class ModelflareBalanceReader
             using HttpRequestMessage request = new(HttpMethod.Get, endpoint);
             request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
             request.Headers.TryAddWithoutValidation("Accept", "application/json");
-            request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.6.1");
+            request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.6.2");
 
             using HttpResponseMessage response = HttpClient.Send(request);
             if (!response.IsSuccessStatusCode)
@@ -7669,7 +7669,7 @@ internal sealed class OpenRouterBalanceReader
         using HttpRequestMessage request = new(HttpMethod.Get, endpoint);
         request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
         request.Headers.TryAddWithoutValidation("Accept", "application/json");
-        request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.6.0");
+        request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.6.2");
 
         using HttpResponseMessage response = HttpClient.Send(request);
         if (!response.IsSuccessStatusCode)
@@ -7798,7 +7798,7 @@ internal sealed class OpenCodeUsageReader
             using HttpRequestMessage request = new(HttpMethod.Get, GoUsageEndpoint);
             request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
             request.Headers.TryAddWithoutValidation("Accept", "application/json");
-            request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.6.0");
+            request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.6.2");
 
             using HttpResponseMessage response = GoHttpClient.Send(request);
             if (!response.IsSuccessStatusCode)
@@ -8352,16 +8352,21 @@ internal sealed class HardwareMonitor
 {
     private static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(10);
     private readonly AmdPackageTemperatureReader _amdPackageTemperatureReader = new();
+    private readonly GpuEngineUsageReader _gpuEngineUsageReader = new();
     private CpuTimeSample? _lastCpuTimeSample;
 
     public string SourceDescription =>
-        "GetSystemTimes + GlobalMemoryStatusEx + AMD Ryzen Master package sensor + nvidia-smi";
+        "GetSystemTimes + GlobalMemoryStatusEx + AMD Ryzen Master package sensor + nvidia-smi, with display-driver name and GPU Engine counter fallback";
 
     public HardwareReadResult ReadSnapshot()
     {
         try
         {
-            NvidiaSnapshot gpu = ReadNvidiaSnapshot();
+            GpuSnapshot gpu = ReadNvidiaGpuSnapshot();
+            if (gpu == GpuSnapshot.Empty)
+            {
+                gpu = ReadFallbackGpuSnapshot();
+            }
             PhysicalMemorySnapshot ram = ReadPhysicalMemorySnapshot();
             return new HardwareReadResult(
                 new HardwareSnapshot(
@@ -8389,6 +8394,75 @@ internal sealed class HardwareMonitor
     public void Dispose()
     {
         _amdPackageTemperatureReader.Dispose();
+        _gpuEngineUsageReader.Dispose();
+    }
+
+    private GpuSnapshot ReadFallbackGpuSnapshot()
+    {
+        // No NVIDIA adapter: fall back to the display-driver name and the
+        // Windows GPU Engine utilization counters. Temperature and VRAM have
+        // no readable sensor on such adapters and stay unknown.
+        return new GpuSnapshot(
+            ReadDisplayAdapterName(),
+            null,
+            _gpuEngineUsageReader.ReadUtilizationPercent(),
+            null,
+            null);
+    }
+
+    private static string? ReadDisplayAdapterName()
+    {
+        try
+        {
+            using RegistryKey? classKey = Registry.LocalMachine.OpenSubKey(
+                @"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}");
+            if (classKey is null)
+            {
+                return null;
+            }
+
+            List<string> names = [];
+            foreach (string subKeyName in classKey.GetSubKeyNames())
+            {
+                // Some subkeys (e.g. Configuration) deny read access.
+                try
+                {
+                    using RegistryKey? deviceKey = classKey.OpenSubKey(subKeyName);
+                    if (deviceKey?.GetValue("DriverDesc") is not string description ||
+                        string.IsNullOrWhiteSpace(description))
+                    {
+                        continue;
+                    }
+
+                    string name = description.Trim();
+                    if (!names.Contains(name, StringComparer.OrdinalIgnoreCase))
+                    {
+                        names.Add(name);
+                    }
+                }
+                catch (Exception exception) when (exception is
+                    System.Security.SecurityException or
+                    UnauthorizedAccessException or
+                    IOException)
+                {
+                    continue;
+                }
+            }
+
+            if (names.Count == 0)
+            {
+                return null;
+            }
+
+            List<string> physical = names
+                .Where(name => !name.Contains("Remote", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            return physical.Count > 0 ? string.Join(" + ", physical) : names[0];
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private double? ReadCpuTemperature()
@@ -8476,12 +8550,12 @@ internal sealed class HardwareMonitor
         return value <= long.MaxValue ? (long)value : null;
     }
 
-    private static NvidiaSnapshot ReadNvidiaSnapshot()
+    private static GpuSnapshot ReadNvidiaGpuSnapshot()
     {
         string? nvidiaSmiPath = ResolveToolPath("nvidia-smi.exe");
         if (nvidiaSmiPath is null)
         {
-            return NvidiaSnapshot.Empty;
+            return GpuSnapshot.Empty;
         }
 
         try
@@ -8492,7 +8566,7 @@ internal sealed class HardwareMonitor
                     "--query-gpu=name,temperature.gpu,utilization.gpu,memory.total,memory.free",
                     "--format=csv,noheader,nounits"
                 ]);
-            List<NvidiaGpu> gpus = [];
+            List<GpuDevice> gpus = [];
             foreach (string line in output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
             {
                 string[] fields = line.Split(',');
@@ -8513,7 +8587,7 @@ internal sealed class HardwareMonitor
                 }
 
                 string gpuName = string.Join(",", fields[..temperatureIndex]).Trim();
-                gpus.Add(new NvidiaGpu(
+                gpus.Add(new GpuDevice(
                     gpuName,
                     gpuTemperature,
                     gpuUtilization,
@@ -8523,7 +8597,7 @@ internal sealed class HardwareMonitor
 
             if (gpus.Count == 0)
             {
-                return NvidiaSnapshot.Empty;
+                return GpuSnapshot.Empty;
             }
 
             long? total = SumNullable(gpus.Select(gpu => gpu.TotalBytes));
@@ -8543,7 +8617,7 @@ internal sealed class HardwareMonitor
             string gpuDisplayName = gpus.Count == 1
                 ? gpus[0].Name
                 : $"NVIDIA GPUs ({gpus.Count})";
-            return new NvidiaSnapshot(
+            return new GpuSnapshot(
                 string.IsNullOrWhiteSpace(gpuDisplayName) ? "NVIDIA GPU" : gpuDisplayName,
                 maxTemperature,
                 maxUtilization,
@@ -8552,7 +8626,7 @@ internal sealed class HardwareMonitor
         }
         catch (Exception)
         {
-            return NvidiaSnapshot.Empty;
+            return GpuSnapshot.Empty;
         }
     }
 
@@ -8675,21 +8749,21 @@ internal sealed class HardwareMonitor
         return hasValue ? total : null;
     }
 
-    private sealed record NvidiaGpu(
+    private sealed record GpuDevice(
         string Name,
         double? TemperatureC,
         double? UtilizationPercent,
         long? TotalBytes,
         long? AvailableBytes);
 
-    private sealed record NvidiaSnapshot(
+    private sealed record GpuSnapshot(
         string? Name,
         double? TemperatureC,
         double? UtilizationPercent,
         long? TotalBytes,
         long? AvailableBytes)
     {
-        public static NvidiaSnapshot Empty => new(null, null, null, null, null);
+        public static GpuSnapshot Empty => new(null, null, null, null, null);
     }
 
     private sealed record PhysicalMemorySnapshot(
@@ -8704,6 +8778,144 @@ internal sealed class HardwareMonitor
         long IdleTicks,
         long KernelTicks,
         long UserTicks);
+}
+
+internal sealed class GpuEngineUsageReader : IDisposable
+{
+    private const string EngineCounterPath = @"\GPU Engine(*)\Utilization Percentage";
+    private const uint PdhFmtDouble = 0x00000200;
+    private const int PdhMoreData = unchecked((int)0x800007D2);
+    private readonly object _sync = new();
+    private IntPtr _query;
+    private IntPtr _counter;
+    private bool _primed;
+
+    public double? ReadUtilizationPercent()
+    {
+        lock (_sync)
+        {
+            try
+            {
+                if (!EnsureQuery())
+                {
+                    return null;
+                }
+
+                if (NativeMethods.PdhCollectQueryData(_query) != 0)
+                {
+                    Close();
+                    return null;
+                }
+
+                if (!_primed)
+                {
+                    _primed = true;
+                    return null;
+                }
+
+                return SumEngineUtilization();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_sync)
+        {
+            Close();
+        }
+    }
+
+    private bool EnsureQuery()
+    {
+        if (_query != IntPtr.Zero)
+        {
+            return true;
+        }
+
+        _primed = false;
+        if (NativeMethods.PdhOpenQuery(null, IntPtr.Zero, out IntPtr query) != 0)
+        {
+            return false;
+        }
+
+        _query = query;
+        if (NativeMethods.PdhAddEnglishCounter(_query, EngineCounterPath, IntPtr.Zero, out IntPtr counter) != 0)
+        {
+            Close();
+            return false;
+        }
+
+        _counter = counter;
+        return true;
+    }
+
+    private void Close()
+    {
+        if (_query != IntPtr.Zero)
+        {
+            NativeMethods.PdhCloseQuery(_query);
+            _query = IntPtr.Zero;
+        }
+
+        _counter = IntPtr.Zero;
+        _primed = false;
+    }
+
+    private double? SumEngineUtilization()
+    {
+        uint bufferSize = 0;
+        uint itemCount = 0;
+        if (NativeMethods.PdhGetFormattedCounterArray(
+                _counter, PdhFmtDouble, ref bufferSize, ref itemCount, IntPtr.Zero) != PdhMoreData ||
+            bufferSize == 0 || itemCount == 0)
+        {
+            return null;
+        }
+
+        IntPtr buffer = Marshal.AllocHGlobal(checked((int)bufferSize));
+        try
+        {
+            uint capacity = itemCount;
+            if (NativeMethods.PdhGetFormattedCounterArray(
+                    _counter, PdhFmtDouble, ref bufferSize, ref capacity, buffer) != 0 ||
+                capacity == 0)
+            {
+                return null;
+            }
+
+            double total = 0;
+            int valid = 0;
+            int stride = IntPtr.Size + 16;
+            for (uint index = 0; index < capacity; index++)
+            {
+                IntPtr item = IntPtr.Add(buffer, checked((int)(index * (uint)stride)));
+                if (Marshal.ReadInt32(item, IntPtr.Size) != 0)
+                {
+                    continue;
+                }
+
+                double value = BitConverter.Int64BitsToDouble(Marshal.ReadInt64(item, IntPtr.Size + 8));
+                if (!double.IsFinite(value))
+                {
+                    continue;
+                }
+
+                total += value;
+                valid++;
+            }
+
+            return valid == 0 ? null : Math.Clamp(total, 0d, 100d);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
 }
 
 internal sealed class AmdPackageTemperatureReader : IDisposable
@@ -11438,6 +11650,21 @@ internal static class NativeMethods
     [DllImport("gdi32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool DeleteObject(IntPtr objectHandle);
+
+    [DllImport("pdh.dll", CharSet = CharSet.Unicode)]
+    public static extern int PdhOpenQuery(string? dataSource, IntPtr userData, out IntPtr query);
+
+    [DllImport("pdh.dll", CharSet = CharSet.Unicode)]
+    public static extern int PdhAddEnglishCounter(IntPtr query, string counterPath, IntPtr userData, out IntPtr counter);
+
+    [DllImport("pdh.dll")]
+    public static extern int PdhCollectQueryData(IntPtr query);
+
+    [DllImport("pdh.dll")]
+    public static extern int PdhCloseQuery(IntPtr query);
+
+    [DllImport("pdh.dll")]
+    public static extern int PdhGetFormattedCounterArray(IntPtr counter, uint format, ref uint bufferSize, ref uint bufferCount, IntPtr buffer);
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
