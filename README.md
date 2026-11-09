@@ -28,7 +28,8 @@ the notification area so its context menu is always available.
   letters and sounds a warning on startup/recheck.
 - Hover over any tray icon for a quick details card. Provider cards show the
   available quota windows in a table with used/remaining percentages, time until
-  reset, and the reset time in local time. Monthly rows appear only when that
+  reset, and the reset time in local time. Codex and Claude rows also show the
+  whole days left until each reset next to the reset time. Monthly rows appear only when that
   provider reports a monthly window or monthly spend; Devin also shows its plan
   period end when the account status response includes it. The card opens after
   a short hover delay and does not take focus.

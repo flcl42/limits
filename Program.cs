@@ -2727,8 +2727,8 @@ internal sealed class TrayApplication : IDisposable
                 updated = _claudeUpdatedText;
                 if (_lastClaudeSnapshot is { } claude)
                 {
-                    rows.Add(CreateQuotaRow("5h limit", claude.FiveHourUsedPercent, 100d - claude.FiveHourUsedPercent, claude.FiveHourResetAt));
-                    rows.Add(CreateQuotaRow("7d limit", claude.SevenDayUsedPercent, 100d - claude.SevenDayUsedPercent, claude.SevenDayResetAt));
+                    rows.Add(CreateQuotaRow("5h limit", claude.FiveHourUsedPercent, 100d - claude.FiveHourUsedPercent, claude.FiveHourResetAt, includeDaysInReset: true));
+                    rows.Add(CreateQuotaRow("7d limit", claude.SevenDayUsedPercent, 100d - claude.SevenDayUsedPercent, claude.SevenDayResetAt, includeDaysInReset: true));
                 }
                 break;
 
@@ -2865,7 +2865,8 @@ internal sealed class TrayApplication : IDisposable
                 $"{prefix}{FormatLimitWindow(snapshot.PrimaryWindowMinutes)} limit",
                 snapshot.PrimaryUsedPercent,
                 100d - snapshot.PrimaryUsedPercent,
-                snapshot.PrimaryResetAt));
+                snapshot.PrimaryResetAt,
+                includeDaysInReset: true));
         }
 
         if (snapshot.SecondaryWindowMinutes > 0)
@@ -2874,7 +2875,8 @@ internal sealed class TrayApplication : IDisposable
                 $"{prefix}{FormatLimitWindow(snapshot.SecondaryWindowMinutes)} limit",
                 snapshot.SecondaryUsedPercent,
                 100d - snapshot.SecondaryUsedPercent,
-                snapshot.SecondaryResetAt));
+                snapshot.SecondaryResetAt,
+                includeDaysInReset: true));
         }
     }
 
@@ -2905,14 +2907,15 @@ internal sealed class TrayApplication : IDisposable
         string label,
         double? usedPercent,
         double? remainingPercent,
-        DateTimeOffset? resetAt)
+        DateTimeOffset? resetAt,
+        bool includeDaysInReset = false)
     {
         return new UsageBalloonRow(
             label,
             FormatUsagePercent(usedPercent),
             FormatUsagePercent(remainingPercent),
             FormatBalloonCountdown(resetAt),
-            FormatBalloonResetAt(resetAt));
+            includeDaysInReset ? FormatBalloonResetWithDays(resetAt) : FormatBalloonResetAt(resetAt));
     }
 
     private static void AddSpendRow(List<UsageBalloonRow> rows, string label, decimal? amount)
@@ -2962,6 +2965,24 @@ internal sealed class TrayApplication : IDisposable
             ? "MMM d · ddd h:mm tt"
             : "ddd h:mm tt";
         return localReset.ToString(format, CultureInfo.InvariantCulture);
+    }
+
+    private static string FormatBalloonResetWithDays(DateTimeOffset? resetAt)
+    {
+        string reset = FormatBalloonResetAt(resetAt);
+        if (resetAt is null)
+        {
+            return reset;
+        }
+
+        TimeSpan remaining = resetAt.Value - DateTimeOffset.Now;
+        if (remaining <= TimeSpan.Zero)
+        {
+            return reset;
+        }
+
+        int days = (int)Math.Floor(remaining.TotalDays);
+        return days > 0 ? $"{reset} · {days}d" : reset;
     }
 
     private static string FormatPlanEnd(DateTimeOffset? planEndAt)
