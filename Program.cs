@@ -77,6 +77,7 @@ internal sealed class TrayApplication : IDisposable
     private const uint ModelflareResultMessage = NativeMethods.WM_APP + 14;
     private const uint RatesResultMessage = NativeMethods.WM_APP + 15;
     private const uint GcalResultMessage = NativeMethods.WM_APP + 16;
+    private const uint CodexRedeemResultMessage = NativeMethods.WM_APP + 17;
     private const uint KimiTrayIconId = 3;
     private const uint DeepSeekTrayIconId = 4;
     private const uint DiskTrayIconId = 5;
@@ -105,6 +106,7 @@ internal sealed class TrayApplication : IDisposable
     private const uint CommandOpenTaskManager = 1009;
     private const uint CommandOpenDevinUsage = 1010;
     private const uint CommandOpenOpenRouterCredits = 1011;
+    private const uint CommandRedeemCodexReset = 1012;
     private const uint CommandToggleFirstTrayIcon = 1100;
     private const uint CommandToggleLastTrayIcon = CommandToggleFirstTrayIcon + (uint)TrayIconKind.OpenRouter;
     private const string ShutdownEventName = @"Local\Limits.Shutdown";
@@ -284,6 +286,9 @@ internal sealed class TrayApplication : IDisposable
     private GcalSnapshot? _lastGcalSnapshot;
     private volatile bool _codexRefreshInFlight;
     private volatile UsageReadResult? _pendingCodexResult;
+    private volatile bool _codexRedeemInFlight;
+    private volatile CodexResetConsumeResult? _pendingCodexRedeemResult;
+    private CodexResetCreditsSnapshot? _lastCodexResetCredits;
     private volatile bool _claudeRefreshInFlight;
     private volatile ClaudeUsageReadResult? _pendingClaudeResult;
     private volatile bool _kimiRefreshInFlight;
@@ -886,7 +891,7 @@ internal sealed class TrayApplication : IDisposable
 
         if (_lastCodexSnapshot is { } snapshot)
         {
-            _codexTooltip = BuildCodexTooltip(snapshot);
+            _codexTooltip = BuildCodexTooltip(snapshot, _lastCodexResetCredits);
             _codexStatusText = BuildCodexHeadline(snapshot);
             _codexDetailText = BuildCodexDetail(snapshot);
             _codexSparkUsageText = BuildSparkUsage(_lastCodexSparkSnapshot);
@@ -933,6 +938,11 @@ internal sealed class TrayApplication : IDisposable
             _lastCodexSparkSnapshot = result.SparkSnapshot;
         }
 
+        if (result.ResetCredits is not null)
+        {
+            _lastCodexResetCredits = result.ResetCredits;
+        }
+
         if (result.Snapshot is not null)
         {
             _lastCodexSnapshot = result.Snapshot;
@@ -955,6 +965,123 @@ internal sealed class TrayApplication : IDisposable
         }
 
         UpdateCodexDisplay();
+    }
+
+    private void RedeemCodexReset()
+    {
+        if (_codexRedeemInFlight)
+        {
+            return;
+        }
+
+        if (_lastModelflareSnapshot is not null)
+        {
+            return;
+        }
+
+        CodexResetCreditsSnapshot? resets = _lastCodexResetCredits;
+        if (resets is not { AvailableCount: > 0 })
+        {
+            NativeMethods.MessageBox(
+                _windowHandle,
+                "No banked Codex resets are available.",
+                "Codex reset",
+                NativeMethods.MB_OK | NativeMethods.MB_ICONINFORMATION);
+            return;
+        }
+
+        CodexResetCredit? credit = PickResetCreditForRedeem(resets);
+        string expiry = credit?.ExpiresAt is null
+            ? "no expiry shown"
+            : $"expires {FormatBalloonResetAt(credit.ExpiresAt)} ({FormatBalloonCountdown(credit.ExpiresAt)} left)";
+        string title = string.IsNullOrWhiteSpace(credit?.Title) ? "Banked reset" : credit!.Title.Trim();
+        int answer = NativeMethods.MessageBox(
+            _windowHandle,
+            $"Redeem 1 of {resets.AvailableCount} banked Codex reset(s)?\n\n{title} · {expiry}.\nCovered allowances below 100% return to 100%. This cannot be undone.",
+            "Redeem Codex reset",
+            NativeMethods.MB_YESNO | NativeMethods.MB_ICONWARNING);
+        if (answer != NativeMethods.IDYES)
+        {
+            return;
+        }
+
+        _codexRedeemInFlight = true;
+        string? creditId = credit?.Id;
+        IntPtr windowHandle = _windowHandle;
+
+        Task.Run(() =>
+        {
+            CodexResetConsumeResult result;
+            try
+            {
+                result = _codexUsageReader.ConsumeResetCredit(creditId);
+            }
+            catch (Exception exception)
+            {
+                result = new CodexResetConsumeResult("error", 0, exception.Message);
+            }
+
+            _pendingCodexRedeemResult = result;
+
+            if (windowHandle == IntPtr.Zero ||
+                !NativeMethods.PostMessage(windowHandle, CodexRedeemResultMessage, IntPtr.Zero, IntPtr.Zero))
+            {
+                _codexRedeemInFlight = false;
+            }
+        });
+    }
+
+    private void ApplyCodexRedeemResult()
+    {
+        CodexResetConsumeResult? result = _pendingCodexRedeemResult;
+        _pendingCodexRedeemResult = null;
+        _codexRedeemInFlight = false;
+
+        if (result is null)
+        {
+            return;
+        }
+
+        switch (result.Outcome)
+        {
+            case "reset":
+                NativeMethods.MessageBox(
+                    _windowHandle,
+                    $"Usage reset. {result.WindowsReset} window(s) refreshed.",
+                    "Codex reset",
+                    NativeMethods.MB_OK | NativeMethods.MB_ICONINFORMATION);
+                break;
+            case "alreadyRedeemed":
+                NativeMethods.MessageBox(
+                    _windowHandle,
+                    "That reset was already redeemed. Allowances refreshed.",
+                    "Codex reset",
+                    NativeMethods.MB_OK | NativeMethods.MB_ICONINFORMATION);
+                break;
+            case "nothingToReset":
+                NativeMethods.MessageBox(
+                    _windowHandle,
+                    "No eligible rate-limit window to reset. The banked reset was kept.",
+                    "Codex reset",
+                    NativeMethods.MB_OK | NativeMethods.MB_ICONINFORMATION);
+                break;
+            case "noCredit":
+                NativeMethods.MessageBox(
+                    _windowHandle,
+                    "No banked Codex resets are available.",
+                    "Codex reset",
+                    NativeMethods.MB_OK | NativeMethods.MB_ICONINFORMATION);
+                break;
+            default:
+                NativeMethods.MessageBox(
+                    _windowHandle,
+                    $"Reset request failed: {result.ErrorMessage ?? "unknown error"}",
+                    "Codex reset",
+                    NativeMethods.MB_OK | NativeMethods.MB_ICONERROR);
+                break;
+        }
+
+        RefreshUsage();
     }
 
     private void RefreshClaudeUsage()
@@ -1591,7 +1718,7 @@ internal sealed class TrayApplication : IDisposable
             ["version"] = 1,
             ["updatedAt"] = FormatCounterTimestamp(DateTimeOffset.UtcNow)
         };
-        root["codex"] = BuildCodexCounterJson(_lastCodexSnapshot, _lastCodexSparkSnapshot, _lastModelflareSnapshot);
+        root["codex"] = BuildCodexCounterJson(_lastCodexSnapshot, _lastCodexSparkSnapshot, _lastModelflareSnapshot, _lastCodexResetCredits);
         root["modelflare"] = BuildModelflareCounterJson(_lastModelflareSnapshot, _lastModelflareErrorMessage);
         root["claude"] = BuildClaudeCounterJson(_lastClaudeSnapshot);
         root["kimi"] = BuildKimiCounterJson(_lastKimiSnapshot);
@@ -1613,7 +1740,8 @@ internal sealed class TrayApplication : IDisposable
     private static JsonObject? BuildCodexCounterJson(
         CodexUsageSnapshot? snapshot,
         CodexUsageSnapshot? sparkSnapshot,
-        ModelflareBalanceSnapshot? modelflareSnapshot)
+        ModelflareBalanceSnapshot? modelflareSnapshot,
+        CodexResetCreditsSnapshot? resetCredits)
     {
         if (snapshot is null && modelflareSnapshot is null)
         {
@@ -1625,6 +1753,7 @@ internal sealed class TrayApplication : IDisposable
         {
             result = BuildCodexLimitCounterJson(snapshot);
             result["spark"] = sparkSnapshot is null ? null : BuildCodexLimitCounterJson(sparkSnapshot);
+            result["resets"] = BuildCodexResetsCounterJson(resetCredits);
         }
         else
         {
@@ -1636,6 +1765,32 @@ internal sealed class TrayApplication : IDisposable
 
         result["modelflare"] = modelflareSnapshot is null ? null : BuildModelflareCounterJson(modelflareSnapshot, null);
         return result;
+    }
+
+    private static JsonObject? BuildCodexResetsCounterJson(CodexResetCreditsSnapshot? resets)
+    {
+        if (resets is null)
+        {
+            return null;
+        }
+
+        JsonArray credits = [];
+        foreach (CodexResetCredit credit in resets.Credits.Where(IsAvailableResetCredit))
+        {
+            credits.Add(new JsonObject
+            {
+                ["title"] = credit.Title,
+                ["status"] = credit.Status,
+                ["grantedAt"] = FormatCounterTimestamp(credit.GrantedAt),
+                ["expiresAt"] = FormatCounterTimestamp(credit.ExpiresAt)
+            });
+        }
+
+        return new JsonObject
+        {
+            ["availableCount"] = resets.AvailableCount,
+            ["credits"] = credits
+        };
     }
 
     private static JsonObject? BuildModelflareCounterJson(
@@ -2576,6 +2731,11 @@ internal sealed class TrayApplication : IDisposable
                 PublishCounterState();
                 return IntPtr.Zero;
 
+            case CodexRedeemResultMessage:
+                ApplyCodexRedeemResult();
+                PublishCounterState();
+                return IntPtr.Zero;
+
             case HardwareResultMessage:
                 ApplyHardwareResult();
                 PublishCounterState();
@@ -2881,6 +3041,10 @@ internal sealed class TrayApplication : IDisposable
                     {
                         AddCodexRows(rows, spark, "Spark · ");
                     }
+                    if (_lastCodexResetCredits is { } codexResets)
+                    {
+                        AddCodexResetRows(rows, codexResets);
+                    }
                 }
                 break;
 
@@ -3042,6 +3206,54 @@ internal sealed class TrayApplication : IDisposable
                 snapshot.SecondaryResetAt,
                 includeDaysInReset: true));
         }
+    }
+
+    private static void AddCodexResetRows(List<UsageBalloonRow> rows, CodexResetCreditsSnapshot resets)
+    {
+        List<CodexResetCredit> available = resets.Credits
+            .Where(IsAvailableResetCredit)
+            .OrderBy(credit => credit.ExpiresAt ?? DateTimeOffset.MaxValue)
+            .ToList();
+        if (resets.AvailableCount <= 0 && available.Count == 0)
+        {
+            return;
+        }
+
+        CodexResetCredit? next = available.FirstOrDefault();
+        rows.Add(new UsageBalloonRow(
+            $"{resets.AvailableCount} banked reset{(resets.AvailableCount == 1 ? "" : "s")}",
+            "available",
+            "—",
+            FormatBalloonCountdown(next?.ExpiresAt),
+            FormatBalloonResetAt(next?.ExpiresAt)));
+        foreach (CodexResetCredit credit in available)
+        {
+            rows.Add(new UsageBalloonRow(
+                string.IsNullOrWhiteSpace(credit.Title) ? "Banked reset" : credit.Title.Trim(),
+                credit.Status ?? "available",
+                "—",
+                FormatBalloonCountdown(credit.ExpiresAt),
+                FormatBalloonResetAt(credit.ExpiresAt)));
+        }
+    }
+
+    private static bool IsAvailableResetCredit(CodexResetCredit credit)
+    {
+        if (!string.IsNullOrWhiteSpace(credit.Status) &&
+            !string.Equals(credit.Status, "available", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return credit.ExpiresAt is null || credit.ExpiresAt > DateTimeOffset.Now;
+    }
+
+    private static CodexResetCredit? PickResetCreditForRedeem(CodexResetCreditsSnapshot resets)
+    {
+        return resets.Credits
+            .Where(IsAvailableResetCredit)
+            .OrderBy(credit => credit.ExpiresAt ?? DateTimeOffset.MaxValue)
+            .FirstOrDefault();
     }
 
     private static void AddModelflareRows(List<UsageBalloonRow> rows, ModelflareBalanceSnapshot snapshot)
@@ -3806,6 +4018,14 @@ internal sealed class TrayApplication : IDisposable
             if (iconId == CodexTrayIconId)
             {
                 NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING | NativeMethods.MF_GRAYED, 0, LimitMenuText(_codexSparkUsageText));
+                if (_lastModelflareSnapshot is null && _lastCodexResetCredits is { AvailableCount: > 0 })
+                {
+                    NativeMethods.AppendMenu(
+                        menuHandle,
+                        NativeMethods.MF_STRING,
+                        CommandRedeemCodexReset,
+                        $"Redeem banked reset ({_lastCodexResetCredits.AvailableCount} available)...");
+                }
             }
             else if (iconId == KimiTrayIconId)
             {
@@ -3858,6 +4078,10 @@ internal sealed class TrayApplication : IDisposable
         {
             case CommandRefresh:
                 RefreshUsage();
+                break;
+
+            case CommandRedeemCodexReset:
+                RedeemCodexReset();
                 break;
 
             case CommandOpenCodexSessions:
@@ -4163,7 +4387,7 @@ internal sealed class TrayApplication : IDisposable
         return $"${amount.ToString("0.00", CultureInfo.InvariantCulture)}";
     }
 
-    private static string BuildCodexTooltip(CodexUsageSnapshot snapshot)
+    private static string BuildCodexTooltip(CodexUsageSnapshot snapshot, CodexResetCreditsSnapshot? resetCredits = null)
     {
         List<string> windows = [];
         if (snapshot.PrimaryWindowMinutes > 0)
@@ -4186,7 +4410,13 @@ internal sealed class TrayApplication : IDisposable
                 CodexUsageMath.GetWeeklyResetAt(snapshot)));
         }
 
-        return TruncateTooltip($"Codex: {string.Join(", ", windows)}");
+        string tooltip = $"Codex: {string.Join(", ", windows)}";
+        if (resetCredits is { AvailableCount: > 0 })
+        {
+            tooltip += $"; {resetCredits.AvailableCount} banked reset{(resetCredits.AvailableCount == 1 ? "" : "s")}";
+        }
+
+        return TruncateTooltip(tooltip);
     }
 
     private static string FormatCodexWindowTooltip(int windowMinutes, double usedPercent, DateTimeOffset? resetAt)
@@ -4853,11 +5083,30 @@ internal sealed record CodexUsageSnapshot(
     string? Model,
     string SourceFile);
 
-internal sealed record UsageReadResult(CodexUsageSnapshot? Snapshot, CodexUsageSnapshot? SparkSnapshot, string? ErrorMessage);
+internal sealed record UsageReadResult(CodexUsageSnapshot? Snapshot, CodexUsageSnapshot? SparkSnapshot, string? ErrorMessage, CodexResetCreditsSnapshot? ResetCredits = null);
+
+internal sealed record CodexResetCredit(
+    string? Id,
+    string? ResetType,
+    string? Status,
+    DateTimeOffset? GrantedAt,
+    DateTimeOffset? ExpiresAt,
+    string? Title,
+    string? Description);
+
+internal sealed record CodexResetCreditsSnapshot(
+    DateTimeOffset Timestamp,
+    int AvailableCount,
+    IReadOnlyList<CodexResetCredit> Credits,
+    string Source);
+
+internal sealed record CodexResetConsumeResult(string Outcome, int WindowsReset, string? ErrorMessage);
 
 internal sealed class CodexUsageReader
 {
     private const string UsageEndpoint = "https://chatgpt.com/backend-api/wham/usage";
+    private const string ResetCreditsEndpoint = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+    private const string ResetCreditsConsumeEndpoint = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
     private const int MaxFilesToScan = 32;
     private const int MaxTailBytesToRead = 4 * 1024 * 1024;
     private const int MaxExpandedTailBytesToRead = 64 * 1024 * 1024;
@@ -4920,12 +5169,175 @@ internal sealed class CodexUsageReader
             }
 
             UsageReadResult? parsed = ParseAccountUsageResponse(responseBody);
-            return parsed ?? new UsageReadResult(null, null, "Codex account usage response did not include a regular limit.");
+            if (parsed is null)
+            {
+                return new UsageReadResult(null, null, "Codex account usage response did not include a regular limit.");
+            }
+
+            return parsed with { ResetCredits = ReadResetCreditsSnapshot(credential) };
         }
         catch (Exception exception)
         {
             return new UsageReadResult(null, null, exception.Message);
         }
+    }
+
+    public CodexResetConsumeResult ConsumeResetCredit(string? creditId)
+    {
+        try
+        {
+            CodexCredential credential = ReadCredential();
+            string requestBody = new JsonObject
+            {
+                ["redeem_request_id"] = Guid.NewGuid().ToString("D"),
+                ["credit_id"] = creditId
+            }.ToJsonString();
+            using HttpRequestMessage request = new(HttpMethod.Post, ResetCreditsConsumeEndpoint)
+            {
+                Content = new StringContent(requestBody, Encoding.UTF8, "application/json")
+            };
+            request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {credential.AccessToken}");
+            request.Headers.TryAddWithoutValidation("ChatGPT-Account-Id", credential.AccountId);
+            request.Headers.TryAddWithoutValidation("Accept", "application/json");
+            request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.3");
+
+            using HttpResponseMessage response = HttpClient.Send(request);
+            string responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            if (!response.IsSuccessStatusCode)
+            {
+                return new CodexResetConsumeResult("error", 0, $"Reset request failed: HTTP {(int)response.StatusCode}");
+            }
+
+            using JsonDocument document = JsonDocument.Parse(responseBody);
+            JsonElement root = document.RootElement;
+            string outcome = root.TryGetProperty("code", out JsonElement codeElement) &&
+                             codeElement.ValueKind == JsonValueKind.String &&
+                             !string.IsNullOrWhiteSpace(codeElement.GetString())
+                ? codeElement.GetString()!
+                : "reset";
+            int windowsReset = root.TryGetProperty("windows_reset", out JsonElement windowsElement) &&
+                               windowsElement.TryGetInt32(out int windows)
+                ? windows
+                : 0;
+            return outcome switch
+            {
+                "reset" => new CodexResetConsumeResult("reset", windowsReset, null),
+                "alreadyRedeemed" => new CodexResetConsumeResult("alreadyRedeemed", windowsReset, null),
+                "nothingToReset" => new CodexResetConsumeResult("nothingToReset", windowsReset, null),
+                "noCredit" => new CodexResetConsumeResult("noCredit", windowsReset, null),
+                _ => new CodexResetConsumeResult("error", windowsReset, $"Unexpected reset outcome: {outcome}")
+            };
+        }
+        catch (Exception exception)
+        {
+            return new CodexResetConsumeResult("error", 0, exception.Message);
+        }
+    }
+
+    private CodexResetCreditsSnapshot? ReadResetCreditsSnapshot(CodexCredential credential)
+    {
+        // Best effort: banked resets are a bonus view, never fail the usage read for them.
+        try
+        {
+            using HttpRequestMessage request = new(HttpMethod.Get, ResetCreditsEndpoint);
+            request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {credential.AccessToken}");
+            request.Headers.TryAddWithoutValidation("ChatGPT-Account-Id", credential.AccountId);
+            request.Headers.TryAddWithoutValidation("Accept", "application/json");
+            request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.3");
+
+            using HttpResponseMessage response = HttpClient.Send(request);
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            string responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            return ParseResetCreditsResponse(responseBody);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static CodexResetCreditsSnapshot? ParseResetCreditsResponse(string responseBody)
+    {
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(responseBody);
+            JsonElement root = document.RootElement;
+            int availableCount = 0;
+            if (root.TryGetProperty("available_count", out JsonElement availableElement) &&
+                availableElement.ValueKind == JsonValueKind.Number)
+            {
+                availableCount = availableElement.TryGetInt32(out int available) ? Math.Max(0, available) : 0;
+            }
+
+            List<CodexResetCredit> credits = [];
+            if (root.TryGetProperty("credits", out JsonElement creditsElement) &&
+                creditsElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (JsonElement item in creditsElement.EnumerateArray())
+                {
+                    if (item.ValueKind != JsonValueKind.Object)
+                    {
+                        continue;
+                    }
+
+                    credits.Add(new CodexResetCredit(
+                        ReadOptionalString(item, "id"),
+                        ReadOptionalString(item, "reset_type"),
+                        ReadOptionalString(item, "status"),
+                        ReadOptionalTimestamp(item, "granted_at"),
+                        ReadOptionalTimestamp(item, "expires_at"),
+                        ReadOptionalString(item, "title"),
+                        ReadOptionalString(item, "description")));
+                }
+            }
+
+            return new CodexResetCreditsSnapshot(DateTimeOffset.Now, availableCount, credits, ResetCreditsEndpoint);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? ReadOptionalString(JsonElement parent, string propertyName)
+    {
+        return parent.TryGetProperty(propertyName, out JsonElement element) &&
+               element.ValueKind == JsonValueKind.String &&
+               !string.IsNullOrWhiteSpace(element.GetString())
+            ? element.GetString()
+            : null;
+    }
+
+    private static DateTimeOffset? ReadOptionalTimestamp(JsonElement parent, string propertyName)
+    {
+        if (!parent.TryGetProperty(propertyName, out JsonElement element))
+        {
+            return null;
+        }
+
+        if (element.ValueKind == JsonValueKind.String &&
+            DateTimeOffset.TryParse(element.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out DateTimeOffset parsed))
+        {
+            return parsed;
+        }
+
+        if (element.ValueKind == JsonValueKind.Number && element.TryGetInt64(out long seconds))
+        {
+            try
+            {
+                return DateTimeOffset.FromUnixTimeSeconds(seconds);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                return null;
+            }
+        }
+
+        return null;
     }
 
     private CodexCredential ReadCredential()
@@ -12660,9 +13072,12 @@ internal static class NativeMethods
     public const int TRANSPARENT = 1;
     public const uint MONITOR_DEFAULTTONEAREST = 0x00000002;
     public const uint MB_OK = 0x00000000;
+    public const uint MB_YESNO = 0x00000004;
     public const uint MB_ICONERROR = 0x00000010;
     public const uint MB_ICONINFORMATION = 0x00000040;
     public const uint MB_ICONWARNING = 0x00000030;
+    public const int IDYES = 6;
+    public const int IDNO = 7;
 
     public const uint BI_RGB = 0;
     public const uint DIB_RGB_COLORS = 0;

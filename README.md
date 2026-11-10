@@ -54,7 +54,16 @@ and Spark limits are read separately so concurrent sessions cannot replace the
 regular allowance with Spark's allowance. Local session files are used only as
 a fallback when the account endpoint is unavailable. Session `token_count`
 events without any rate-limit window are ignored, since Codex proxies such as
-Modelflare report those as null.
+Modelflare report those as null. Banked rate-limit resets are read from
+`GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits` with the
+same credentials; the tray tooltip and the details-card table show the available
+count with each credit's title and expiry. The Codex tray icon's context menu
+offers `Redeem banked reset...` while at least one reset is available: after a
+confirmation dialog it calls
+`POST https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume`
+with a fresh idempotency key for the oldest-expiring available credit, then
+refreshes usage. The credit is spent only if an eligible window is reset;
+`nothingToReset` and `noCredit` outcomes keep the banked balance.
 
 When `%USERPROFILE%\.codex\auth.json` contains an `OPENAI_API_KEY` (API-key
 mode, e.g. Modelflare) the Codex tray icon switches to dollar-based billing:
@@ -70,7 +79,9 @@ only as a bearer credential and is never displayed or included in the payload.
 Claude status is read from Claude Code's OAuth usage metadata endpoint. An
 expired access token is refreshed with the stored refresh token, and the last
 valid usage remains visible during transient refresh failures. The app does not
-invoke `claude -p /usage`.
+invoke `claude -p /usage`. Claude limit resets (e.g. promo grants) have no
+public API and can only be redeemed on the Claude website, so they are not
+shown here.
 
 Kimi quota status is read from the Kimi Code usage endpoint with the local Kimi
 OAuth token or `KIMI_API_KEY`. Kimi local
