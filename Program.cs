@@ -4165,12 +4165,34 @@ internal sealed class TrayApplication : IDisposable
 
     private static string BuildCodexTooltip(CodexUsageSnapshot snapshot)
     {
-        int weeklyRemaining = CodexUsageMath.GetWeeklyRemainingPercent(snapshot);
-        int weeklyWindow = CodexUsageMath.GetWeeklyWindowMinutes(snapshot);
+        List<string> windows = [];
+        if (snapshot.PrimaryWindowMinutes > 0)
+        {
+            windows.Add(FormatCodexWindowTooltip(
+                snapshot.PrimaryWindowMinutes, snapshot.PrimaryUsedPercent, snapshot.PrimaryResetAt));
+        }
+        if (snapshot.SecondaryWindowMinutes > 0 &&
+            (snapshot.SecondaryWindowMinutes != snapshot.PrimaryWindowMinutes ||
+             snapshot.SecondaryResetAt != snapshot.PrimaryResetAt))
+        {
+            windows.Add(FormatCodexWindowTooltip(
+                snapshot.SecondaryWindowMinutes, snapshot.SecondaryUsedPercent, snapshot.SecondaryResetAt));
+        }
+        if (windows.Count == 0)
+        {
+            windows.Add(FormatCodexWindowTooltip(
+                CodexUsageMath.GetWeeklyWindowMinutes(snapshot),
+                100 - CodexUsageMath.GetWeeklyRemainingPercent(snapshot),
+                CodexUsageMath.GetWeeklyResetAt(snapshot)));
+        }
 
-        return TruncateTooltip(
-            $"Codex: {FormatWindow(weeklyWindow)} left {weeklyRemaining}%, " +
-            FormatResetCountdown(CodexUsageMath.GetWeeklyResetAt(snapshot)));
+        return TruncateTooltip($"Codex: {string.Join(", ", windows)}");
+    }
+
+    private static string FormatCodexWindowTooltip(int windowMinutes, double usedPercent, DateTimeOffset? resetAt)
+    {
+        return $"{FormatWindow(windowMinutes)} left {CodexUsageMath.GetRemainingPercent(usedPercent)}% " +
+               $"(reset {FormatTooltipReset(resetAt)})";
     }
 
     private static string BuildCodexHeadline(CodexUsageSnapshot snapshot)
@@ -4212,8 +4234,8 @@ internal sealed class TrayApplication : IDisposable
         int sevenDayRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.SevenDayUsedPercent);
 
         return TruncateTooltip(
-            $"Claude: 5h left {fiveHourRemaining}%, 7d left {sevenDayRemaining}%, " +
-            FormatResetCountdown(snapshot.SevenDayResetAt));
+            $"Claude: 5h left {fiveHourRemaining}% (reset {FormatTooltipReset(snapshot.FiveHourResetAt)}), " +
+            $"7d left {sevenDayRemaining}% (reset {FormatTooltipReset(snapshot.SevenDayResetAt)})");
     }
 
     private static string BuildClaudeStaleTooltip(ClaudeUsageSnapshot snapshot)
@@ -4690,6 +4712,33 @@ internal sealed class TrayApplication : IDisposable
 
         int minutes = Math.Max(1, (int)Math.Ceiling(remaining.TotalMinutes));
         return $"reset in {minutes}m";
+    }
+
+    private static string FormatTooltipReset(DateTimeOffset? resetAt)
+    {
+        if (resetAt is null)
+        {
+            return "?";
+        }
+
+        TimeSpan remaining = resetAt.Value - DateTimeOffset.Now;
+        if (remaining <= TimeSpan.Zero)
+        {
+            return "due";
+        }
+
+        int days = (int)Math.Floor(remaining.TotalDays);
+        if (days > 0)
+        {
+            return $"{days}d";
+        }
+
+        if (remaining.Hours > 0)
+        {
+            return $"{remaining.Hours}h";
+        }
+
+        return $"{Math.Max(1, (int)Math.Ceiling(remaining.TotalMinutes))}m";
     }
 
     private static string FormatUsagePercent(double value)
