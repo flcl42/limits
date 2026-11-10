@@ -130,7 +130,7 @@ page to `ws://127.0.0.1:31001/ws` (or `ws://localhost:31001/ws`) to receive the
 current counter document immediately and after each refresh. The root URL
 `http://127.0.0.1:31001/` returns the WebSocket URL. Messages are JSON with
 `type: "limits.counters"`, `version: 1`, an `updatedAt` timestamp, and nullable
-`codex`, `claude`, `kimi`, `deepSeek`, `devin`, `openRouter`, `unet`,
+`codex`, `claude`, `kimi`, `deepSeek`, `devin`, `openRouter`, `unet`, `rates`,
 `openCode`, `hardware`, and `disk` objects. The `devin` object includes
 `planName`, nullable `planEndAt`, `daily`, and `weekly`; each window has `usedPercent`,
 `remainingPercent`, and `resetAt`. The `openRouter` object includes
@@ -149,6 +149,15 @@ Windows-DPAPI-encrypted passwords. The WebSocket `unet` object contains an
 `accounts` array with `username`, `balance`, `currency`, `isAvailable`, and a
 safe `error` field; passwords and session data are never included. Balances are
 refreshed with the regular background refresh.
+
+Currency rates are read from official keyless JSON APIs: USD/BYN today and
+tomorrow from the National Bank (`https://api.nbrb.by/exrates/rates/dynamics/431`),
+and ETH/USD from Kraken (`/0/public/Ticker?pair=ETHUSD`) with Coinbase spot as
+fallback. NBRB is re-fetched at most once every 6 hours, ETH at most once every
+5 minutes; cached values are served in between. The WebSocket `rates` object
+contains `usdBynToday`, `usdBynTodayDate`, `usdBynTomorrow` (null until NBRB
+publishes it), `usdBynTomorrowDate`, `ethUsd`, `ethSource`, `nbrbFetchedAt`,
+and `ethFetchedAt`.
 
 The disk icon's context menu opens disk settings while the warning is visible.
 When all disks are healthy, open settings with
