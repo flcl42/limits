@@ -159,6 +159,18 @@ contains `usdBynToday`, `usdBynTodayDate`, `usdBynTomorrow` (null until NBRB
 publishes it), `usdBynTomorrowDate`, `ethUsd`, `ethSource`, `nbrbFetchedAt`,
 and `ethFetchedAt`.
 
+Today's Google Calendar events come from the account's private iCal feed.
+Put the secret URL (Google Calendar → Settings → Integrate calendar →
+Secret address in iCal format) into `%LOCALAPPDATA%\limits\google-ical.json`
+as `{ "icalUrl": "https://..." }`. The feed is re-fetched at most once every
+15 minutes (immediately on URL change) and parsed locally: timed and all-day
+events, `DAILY`/`WEEKLY`/`MONTHLY`/`YEARLY` recurrences with `INTERVAL`,
+`COUNT`, `UNTIL`, `BYDAY`/`BYMONTHDAY`, `EXDATE`/`RDATE`, and `TZID` time
+zones (Minsk wall time; unknown zones fall back to Minsk). `RECURRENCE-ID`
+exceptions are ignored. The WebSocket `gcal` object contains `configured`,
+`date`, an `events` array with `title`, `start`/`end` (`HH:mm`, null for
+all-day), and `allDay`, plus `fetchedAt` and a safe `error` field.
+
 The disk icon's context menu opens disk settings while the warning is visible.
 When all disks are healthy, open settings with
 `C:\Programs\limits.exe --disk-settings`. Select any detected drives and set an
