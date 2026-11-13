@@ -58,7 +58,7 @@ internal enum TrayIconKind
     OpenRouter
 }
 
-internal sealed class TrayApplication : IDisposable
+internal sealed partial class TrayApplication : IDisposable
 {
     private const uint CodexTrayIconId = 1;
     private const uint ClaudeTrayIconId = 2;
@@ -76,6 +76,17 @@ internal sealed class TrayApplication : IDisposable
     private const uint OpenRouterResultMessage = NativeMethods.WM_APP + 13;
     private const uint ModelflareResultMessage = NativeMethods.WM_APP + 14;
     private const uint CodexRedeemResultMessage = NativeMethods.WM_APP + 17;
+    private const uint ExtraFeedResultMessage = NativeMethods.WM_APP + 15;
+
+    // Personal-feed extension points. Master declares and calls them; the flcl
+    // branch implements them in Providers/*.cs. Unimplemented partial calls
+    // evaporate at compile time, so master stays fully unaware of personal code.
+    // See Providers/README.md for the contract.
+    partial void RefreshExtraFeeds();
+    partial void ApplyExtraFeedResults();
+    partial void PublishExtraCounters(JsonObject root);
+    partial void NotifyClaudeSnapshotChanged(ClaudeUsageSnapshot? snapshot);
+    partial void NotifyDiskSnapshotChanged();
     private const uint KimiTrayIconId = 3;
     private const uint DeepSeekTrayIconId = 4;
     private const uint DiskTrayIconId = 5;
@@ -562,6 +573,7 @@ internal sealed class TrayApplication : IDisposable
         RefreshDevinUsage();
         RefreshOpenRouterBalance();
         RefreshHardware();
+        RefreshExtraFeeds();
     }
 
     private void RefreshDiskSpace()
@@ -624,6 +636,7 @@ internal sealed class TrayApplication : IDisposable
             HideDiskTrayIcon();
         }
         AlertDiskLimits(result);
+        NotifyDiskSnapshotChanged();
     }
 
     private void RefreshCodexUsage()
@@ -1008,6 +1021,7 @@ internal sealed class TrayApplication : IDisposable
                 UpdateClaudeTrayIcon(
                     TrayIconRenderer.CreateClaudeIcon(lastSnapshot),
                     TrayIconRenderer.GetClaudeIconKey(lastSnapshot));
+                NotifyClaudeSnapshotChanged(lastSnapshot);
                 return;
             }
 
@@ -1017,6 +1031,7 @@ internal sealed class TrayApplication : IDisposable
             _claudeUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
             _claudeSourceText = _claudeUsageReader.CredentialsPath;
             UpdateClaudeTrayIcon(TrayIconRenderer.CreateClaudeUnavailableIcon(), TrayIconRenderer.ClaudeUnavailableIconKey);
+            NotifyClaudeSnapshotChanged(null);
             return;
         }
 
@@ -1028,6 +1043,7 @@ internal sealed class TrayApplication : IDisposable
         _claudeUpdatedText = $"Seen {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
         _claudeSourceText = snapshot.SourceFile;
         UpdateClaudeTrayIcon(TrayIconRenderer.CreateClaudeIcon(snapshot), TrayIconRenderer.GetClaudeIconKey(snapshot));
+        NotifyClaudeSnapshotChanged(snapshot);
     }
 
     private void RefreshKimiUsage()
@@ -1575,6 +1591,7 @@ internal sealed class TrayApplication : IDisposable
         root["openRouter"] = BuildOpenRouterCounterJson(_lastOpenRouterSnapshot);
         root["hardware"] = BuildHardwareCounterJson(_lastHardwareSnapshot);
         root["disk"] = BuildDiskCounterJson(_lastDiskSnapshot);
+        PublishExtraCounters(root);
         return root.ToJsonString();
     }
 
@@ -2475,6 +2492,11 @@ internal sealed class TrayApplication : IDisposable
 
             case CodexRedeemResultMessage:
                 ApplyCodexRedeemResult();
+                PublishCounterState();
+                return IntPtr.Zero;
+
+            case ExtraFeedResultMessage:
+                ApplyExtraFeedResults();
                 PublishCounterState();
                 return IntPtr.Zero;
 
