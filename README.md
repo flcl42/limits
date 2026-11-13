@@ -149,7 +149,7 @@ page to `ws://127.0.0.1:31001/ws` (or `ws://localhost:31001/ws`) to receive the
 current counter document immediately and after each refresh. The root URL
 `http://127.0.0.1:31001/` returns the WebSocket URL. Messages are JSON with
 `type: "limits.counters"`, `version: 1`, an `updatedAt` timestamp, and nullable
-`codex`, `claude`, `kimi`, `deepSeek`, `devin`, `openRouter`, `unet`, `rates`,
+`codex`, `claude`, `kimi`, `deepSeek`, `devin`, `openRouter`,
 `openCode`, `hardware`, and `disk` objects. The `devin` object includes
 `planName`, nullable `planEndAt`, `daily`, and `weekly`; each window has `usedPercent`,
 `remainingPercent`, and `resetAt`. The `openRouter` object includes
@@ -161,35 +161,6 @@ The `hardware` object includes `cpuUsagePercent`,
 `gpuTemperatureC`, `ramTotalBytes`, `ramAvailableBytes`, `ramUsedBytes`,
 `vramTotalBytes`, `vramAvailableBytes`, and `vramUsedBytes`.
 
-UNET balances are read from `https://my.unet.by/login` using the credentials in
-`%LOCALAPPDATA%\limits\unet-credentials.json`. Create or replace that file with
-`.\configure-unet.ps1`; it prompts for up to two accounts and stores only
-Windows-DPAPI-encrypted passwords. The WebSocket `unet` object contains an
-`accounts` array with `username`, `balance`, `currency`, `isAvailable`, and a
-safe `error` field; passwords and session data are never included. Balances are
-refreshed with the regular background refresh.
-
-Currency rates are read from official keyless JSON APIs: USD/BYN today and
-tomorrow from the National Bank (`https://api.nbrb.by/exrates/rates/dynamics/431`),
-and ETH/USD from Kraken (`/0/public/Ticker?pair=ETHUSD`) with Coinbase spot as
-fallback. NBRB is re-fetched at most once every 6 hours, ETH at most once every
-5 minutes; cached values are served in between. The WebSocket `rates` object
-contains `usdBynToday`, `usdBynTodayDate`, `usdBynTomorrow` (null until NBRB
-publishes it), `usdBynTomorrowDate`, `ethUsd`, `ethSource`, `nbrbFetchedAt`,
-and `ethFetchedAt`.
-
-Today's Google Calendar events come from the account's private iCal feed.
-Put the secret URL (Google Calendar → Settings → Integrate calendar →
-Secret address in iCal format) into `%LOCALAPPDATA%\limits\google-ical.json`
-as `{ "icalUrl": "https://..." }`. The feed is re-fetched at most once every
-15 minutes (immediately on URL change) and parsed locally: timed and all-day
-events, `DAILY`/`WEEKLY`/`MONTHLY`/`YEARLY` recurrences with `INTERVAL`,
-`COUNT`, `UNTIL`, `BYDAY`/`BYMONTHDAY`, `EXDATE`/`RDATE`, and `TZID` time
-zones (Minsk wall time; unknown zones fall back to Minsk). `RECURRENCE-ID`
-exceptions are ignored. The WebSocket `gcal` object contains `configured`,
-`date`, an `events` array with `title`, `start`/`end` (`HH:mm`, null for
-all-day), and `allDay`, plus `fetchedAt` and a safe `error` field.
-
 The disk icon's context menu opens disk settings while the warning is visible.
 When all disks are healthy, open settings with
 `C:\Programs\limits.exe --disk-settings`. Select any detected drives and set an
@@ -197,8 +168,11 @@ individual red limit in GB of free space. The settings are stored in
 `%LOCALAPPDATA%\limits\settings.json`; the default selection is C: and D: at
 5 GB. A selected drive at or below its limit is shown as a red drive letter on
 the icon and sounds a Windows warning. The same drive is not sounded more than
-once per minute. The limits watchdog uses the same selected drives and limits
-when it runs the pause/resume batch files.
+once per minute.
+
+Branches: `master` holds the common features documented above. Personal-only
+integrations (UNET ISP balance, NBRB BYN rates, private calendar feed,
+pause/resume batch watchdog) live in the `flcl` branch.
 
 The app uses raw Win32 tray APIs and does not depend on the Windows Desktop framework.
 
