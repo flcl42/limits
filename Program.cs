@@ -208,17 +208,6 @@ internal sealed partial class TrayApplication : IDisposable
     private string? _memoryIconKey;
     private string? _devinIconKey;
     private string? _openRouterIconKey;
-    private string? _codexAppliedTooltip;
-    private string? _claudeAppliedTooltip;
-    private string? _kimiAppliedTooltip;
-    private string? _deepSeekAppliedTooltip;
-    private string? _diskAppliedTooltip;
-    private string? _openCodeAppliedTooltip;
-    private string? _temperatureAppliedTooltip;
-    private string? _memoryAppliedTooltip;
-    private string? _devinAppliedTooltip;
-    private string? _openRouterAppliedTooltip;
-    private string _codexTooltip = "limits";
     private string _codexStatusText = "Loading Codex usage...";
     private string _codexDetailText = "Reading Codex account usage.";
     private string _codexSparkUsageText = "Spark usage: loading...";
@@ -229,50 +218,41 @@ internal sealed partial class TrayApplication : IDisposable
     private string? _lastCodexErrorMessage;
     private ModelflareBalanceSnapshot? _lastModelflareSnapshot;
     private string? _lastModelflareErrorMessage;
-    private string _claudeTooltip = "limits";
     private string _claudeStatusText = "Loading Claude usage...";
     private string _claudeDetailText = "Reading Claude OAuth usage.";
     private string _claudeUpdatedText = string.Empty;
     private string _claudeSourceText = string.Empty;
     private ClaudeUsageSnapshot? _lastClaudeSnapshot;
-    private string _kimiTooltip = "limits";
     private string _kimiStatusText = "Loading Kimi usage...";
     private string _kimiDetailText = "Reading Kimi Code quota.";
     private string _kimiTokenUsageText = "Kimi tokens: loading...";
     private string _kimiUpdatedText = string.Empty;
     private string _kimiSourceText = string.Empty;
     private KimiUsageSnapshot? _lastKimiSnapshot;
-    private string _deepSeekTooltip = "limits";
     private string _deepSeekStatusText = "Loading DeepSeek balance...";
     private string _deepSeekDetailText = "Reading DeepCode configuration.";
     private string _deepSeekUpdatedText = string.Empty;
     private string _deepSeekSourceText = string.Empty;
-    private string _diskTooltip = "limits";
     private string _diskStatusText = "Loading disk space...";
     private string _diskDetailText = "Reading selected disk space limits.";
     private string _diskUpdatedText = string.Empty;
     private string _diskSourceText = string.Empty;
-    private string _openCodeTooltip = "limits";
     private string _openCodeStatusText = "Loading OpenCode Go quota...";
     private string _openCodeDetailText = "Reading OpenCode token statistics and Go quota.";
     private string _openCodeUpdatedText = string.Empty;
     private string _openCodeSourceText = string.Empty;
-    private string _temperatureTooltip = "limits";
     private string _temperatureStatusText = "Loading CPU/GPU temperature...";
     private string _temperatureDetailText = "Reading hardware temperature sensors.";
     private string _temperatureUpdatedText = string.Empty;
     private string _temperatureSourceText = string.Empty;
-    private string _memoryTooltip = "limits";
     private string _memoryStatusText = "Loading CPU/GPU/RAM/VRAM usage...";
     private string _memoryDetailText = "Reading CPU, GPU, RAM, and VRAM utilization.";
     private string _memoryUpdatedText = string.Empty;
     private string _memorySourceText = string.Empty;
-    private string _devinTooltip = "limits";
     private string _devinStatusText = "Loading Devin quota...";
     private string _devinDetailText = "Reading Devin daily and weekly quota.";
     private string _devinUpdatedText = string.Empty;
     private string _devinSourceText = string.Empty;
-    private string _openRouterTooltip = "limits";
     private string _openRouterStatusText = "Loading OpenRouter balance...";
     private string _openRouterDetailText = "Reading OpenRouter credits and key limit.";
     private string _openRouterUpdatedText = string.Empty;
@@ -620,7 +600,6 @@ internal sealed partial class TrayApplication : IDisposable
         }
 
         _lastDiskSnapshot = result;
-        _diskTooltip = BuildDiskTooltip(result);
         _diskStatusText = BuildDiskHeadline(result);
         _diskDetailText = BuildDiskDetail(result);
         _diskUpdatedText = $"Checked {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss}";
@@ -737,7 +716,6 @@ internal sealed partial class TrayApplication : IDisposable
     {
         if (_lastModelflareSnapshot is { } modelflare)
         {
-            _codexTooltip = BuildModelflareTooltip(modelflare);
             _codexStatusText = BuildModelflareHeadline(modelflare);
             _codexDetailText = BuildModelflareDetail(modelflare);
             _codexSparkUsageText = "Modelflare: dollar-based billing (no rate limits)";
@@ -751,7 +729,6 @@ internal sealed partial class TrayApplication : IDisposable
 
         if (_lastCodexSnapshot is { } snapshot)
         {
-            _codexTooltip = BuildCodexTooltip(snapshot, _lastCodexResetCredits);
             _codexStatusText = BuildCodexHeadline(snapshot);
             _codexDetailText = BuildCodexDetail(snapshot);
             _codexSparkUsageText = BuildSparkUsage(_lastCodexSparkSnapshot);
@@ -771,7 +748,6 @@ internal sealed partial class TrayApplication : IDisposable
                 : $"{error} {_lastModelflareErrorMessage}";
         }
 
-        _codexTooltip = "Codex: usage unavailable";
         _codexStatusText = "No Codex usage data found";
         _codexDetailText = error ?? "No token_count events were found.";
         _codexSparkUsageText = BuildSparkUsage(_lastCodexSparkSnapshot);
@@ -813,7 +789,6 @@ internal sealed partial class TrayApplication : IDisposable
             _lastCodexErrorMessage = result.ErrorMessage ?? "No token_count events were found.";
             if (_lastCodexSnapshot is null && _lastModelflareSnapshot is null)
             {
-                _codexTooltip = "Codex: usage unavailable";
                 _codexStatusText = "No Codex usage data found";
                 _codexDetailText = _lastCodexErrorMessage;
                 _codexSparkUsageText = BuildSparkUsage(result.SparkSnapshot);
@@ -1013,7 +988,6 @@ internal sealed partial class TrayApplication : IDisposable
         {
             if (_lastClaudeSnapshot is { } lastSnapshot)
             {
-                _claudeTooltip = BuildClaudeStaleTooltip(lastSnapshot);
                 _claudeStatusText = $"{BuildClaudeHeadline(lastSnapshot)} - refresh failed";
                 _claudeDetailText = result.ErrorMessage ?? "Claude usage refresh failed.";
                 _claudeUpdatedText = $"Last good {lastSnapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
@@ -1025,7 +999,6 @@ internal sealed partial class TrayApplication : IDisposable
                 return;
             }
 
-            _claudeTooltip = "Claude: usage unavailable";
             _claudeStatusText = "No Claude usage data found";
             _claudeDetailText = result.ErrorMessage ?? "Claude usage limits were not found.";
             _claudeUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
@@ -1037,7 +1010,6 @@ internal sealed partial class TrayApplication : IDisposable
 
         ClaudeUsageSnapshot snapshot = result.Snapshot;
         _lastClaudeSnapshot = snapshot;
-        _claudeTooltip = BuildClaudeTooltip(snapshot);
         _claudeStatusText = BuildClaudeHeadline(snapshot);
         _claudeDetailText = BuildClaudeDetail(snapshot);
         _claudeUpdatedText = $"Seen {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
@@ -1093,7 +1065,6 @@ internal sealed partial class TrayApplication : IDisposable
         {
             if (_lastKimiSnapshot is { } lastSnapshot)
             {
-                _kimiTooltip = BuildKimiStaleTooltip(lastSnapshot);
                 _kimiStatusText = $"{BuildKimiHeadline(lastSnapshot)} - refresh failed";
                 _kimiDetailText = result.ErrorMessage ?? "Kimi Code quota refresh failed.";
                 _kimiTokenUsageText = BuildKimiTokenUsage(lastSnapshot);
@@ -1103,7 +1074,6 @@ internal sealed partial class TrayApplication : IDisposable
                 return;
             }
 
-            _kimiTooltip = BuildKimiUnavailableTooltip(result.ErrorMessage);
             _kimiStatusText = "No Kimi usage data found";
             _kimiDetailText = result.ErrorMessage ?? "Kimi Code quota was not found.";
             _kimiTokenUsageText = "Kimi tokens: unavailable";
@@ -1115,7 +1085,6 @@ internal sealed partial class TrayApplication : IDisposable
 
         KimiUsageSnapshot snapshot = result.Snapshot;
         _lastKimiSnapshot = snapshot;
-        _kimiTooltip = BuildKimiTooltip(snapshot);
         _kimiStatusText = BuildKimiHeadline(snapshot);
         _kimiDetailText = BuildKimiDetail(snapshot);
         _kimiTokenUsageText = BuildKimiTokenUsage(snapshot);
@@ -1171,7 +1140,6 @@ internal sealed partial class TrayApplication : IDisposable
         {
             if (_lastDeepSeekSnapshot is { } lastSnapshot)
             {
-                _deepSeekTooltip = $"{BuildDeepSeekTooltip(lastSnapshot)} (last known)";
                 _deepSeekStatusText = $"{BuildDeepSeekHeadline(lastSnapshot)} - refresh failed";
                 _deepSeekDetailText = result.ErrorMessage ?? "DeepSeek balance refresh failed.";
                 _deepSeekUpdatedText = $"Last seen {lastSnapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}; checked {DateTimeOffset.Now:HH:mm:ss}";
@@ -1182,7 +1150,6 @@ internal sealed partial class TrayApplication : IDisposable
                 return;
             }
 
-            _deepSeekTooltip = BuildDeepSeekUnavailableTooltip(result.ErrorMessage);
             _deepSeekStatusText = "No DeepSeek balance data found";
             _deepSeekDetailText = result.ErrorMessage ?? "DeepCode configuration was not found.";
             _deepSeekUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
@@ -1195,7 +1162,6 @@ internal sealed partial class TrayApplication : IDisposable
 
         DeepSeekBalanceSnapshot snapshot = result.Snapshot;
         _lastDeepSeekSnapshot = snapshot;
-        _deepSeekTooltip = BuildDeepSeekTooltip(snapshot);
         _deepSeekStatusText = BuildDeepSeekHeadline(snapshot);
         _deepSeekDetailText = BuildDeepSeekDetail(snapshot);
         _deepSeekUpdatedText = $"Seen {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
@@ -1267,7 +1233,6 @@ internal sealed partial class TrayApplication : IDisposable
         {
             if (goSnapshot is not null)
             {
-                _openCodeTooltip = BuildOpenCodeGoTooltip(goSnapshot, isStale: result.GoUsage is null);
                 _openCodeStatusText = BuildOpenCodeGoHeadline(goSnapshot);
                 _openCodeDetailText = result.ErrorMessage is null
                     ? BuildOpenCodeGoDetail(goSnapshot)
@@ -1280,7 +1245,6 @@ internal sealed partial class TrayApplication : IDisposable
                 return;
             }
 
-            _openCodeTooltip = BuildOpenCodeUnavailableTooltip(result.ErrorMessage);
             _openCodeStatusText = "No OpenCode usage data found";
             _openCodeDetailText = result.ErrorMessage ?? "OpenCode statistics were not found.";
             _openCodeUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
@@ -1293,7 +1257,6 @@ internal sealed partial class TrayApplication : IDisposable
 
         OpenCodeUsageSnapshot snapshot = result.Snapshot;
         _lastOpenCodeSnapshot = snapshot;
-        _openCodeTooltip = BuildOpenCodeTooltip(snapshot, goSnapshot, _openCodeGoUsageError);
         _openCodeStatusText = BuildOpenCodeHeadline(snapshot, goSnapshot);
         _openCodeDetailText = BuildOpenCodeDetail(snapshot, goSnapshot, _openCodeGoUsageError);
         _openCodeUpdatedText = $"Checked {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
@@ -1359,7 +1322,6 @@ internal sealed partial class TrayApplication : IDisposable
         {
             if (_lastDevinSnapshot is { } lastSnapshot)
             {
-                _devinTooltip = BuildDevinTooltip(lastSnapshot, isStale: true);
                 _devinStatusText = $"{BuildDevinHeadline(lastSnapshot)} - refresh failed";
                 _devinDetailText = result.ErrorMessage ?? "Devin quota refresh failed.";
                 _devinUpdatedText = $"Last known {lastSnapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
@@ -1370,7 +1332,6 @@ internal sealed partial class TrayApplication : IDisposable
                 return;
             }
 
-            _devinTooltip = BuildDevinUnavailableTooltip(result.ErrorMessage);
             _devinStatusText = "No Devin quota data found";
             _devinDetailText = result.ErrorMessage ?? "Devin daily and weekly quota was not found.";
             _devinUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
@@ -1383,7 +1344,6 @@ internal sealed partial class TrayApplication : IDisposable
 
         DevinUsageSnapshot snapshot = result.Snapshot;
         _lastDevinSnapshot = snapshot;
-        _devinTooltip = BuildDevinTooltip(snapshot, isStale: false);
         _devinStatusText = BuildDevinHeadline(snapshot);
         _devinDetailText = BuildDevinDetail(snapshot);
         _devinUpdatedText = $"Seen {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
@@ -1440,7 +1400,6 @@ internal sealed partial class TrayApplication : IDisposable
         {
             if (_lastOpenRouterSnapshot is { } lastSnapshot)
             {
-                _openRouterTooltip = $"{BuildOpenRouterTooltip(lastSnapshot)} (last known)";
                 _openRouterStatusText = $"{BuildOpenRouterHeadline(lastSnapshot)} - refresh failed";
                 _openRouterDetailText = result.ErrorMessage ?? "OpenRouter balance refresh failed.";
                 _openRouterUpdatedText = $"Last known {lastSnapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
@@ -1451,7 +1410,6 @@ internal sealed partial class TrayApplication : IDisposable
                 return;
             }
 
-            _openRouterTooltip = BuildOpenRouterUnavailableTooltip(result.ErrorMessage);
             _openRouterStatusText = "No OpenRouter balance data found";
             _openRouterDetailText = result.ErrorMessage ?? "OpenRouter credits were not found.";
             _openRouterUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
@@ -1464,7 +1422,6 @@ internal sealed partial class TrayApplication : IDisposable
 
         OpenRouterBalanceSnapshot snapshot = result.Snapshot;
         _lastOpenRouterSnapshot = snapshot;
-        _openRouterTooltip = BuildOpenRouterTooltip(snapshot);
         _openRouterStatusText = BuildOpenRouterHeadline(snapshot);
         _openRouterDetailText = BuildOpenRouterDetail(snapshot);
         _openRouterUpdatedText = $"Seen {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
@@ -1526,12 +1483,10 @@ internal sealed partial class TrayApplication : IDisposable
         if (result.Snapshot is null)
         {
             string error = result.ErrorMessage ?? "Hardware readings were not available.";
-            _temperatureTooltip = "Temperature: unavailable";
             _temperatureStatusText = "CPU/GPU temperature unavailable";
             _temperatureDetailText = error;
             _temperatureUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
             _temperatureSourceText = _hardwareMonitor.SourceDescription;
-            _memoryTooltip = "Usage: unavailable";
             _memoryStatusText = "CPU/GPU/RAM/VRAM usage unavailable";
             _memoryDetailText = error;
             _memoryUpdatedText = _temperatureUpdatedText;
@@ -1547,12 +1502,10 @@ internal sealed partial class TrayApplication : IDisposable
 
         HardwareSnapshot snapshot = result.Snapshot;
         _lastHardwareSnapshot = snapshot;
-        _temperatureTooltip = BuildTemperatureTooltip(snapshot);
         _temperatureStatusText = BuildTemperatureHeadline(snapshot);
         _temperatureDetailText = BuildTemperatureDetail(snapshot);
         _temperatureUpdatedText = $"Checked {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
         _temperatureSourceText = snapshot.SourceDescription;
-        _memoryTooltip = BuildUsageTooltip(snapshot);
         _memoryStatusText = BuildUsageHeadline(snapshot);
         _memoryDetailText = BuildUsageDetail(snapshot);
         _memoryUpdatedText = _temperatureUpdatedText;
@@ -2014,8 +1967,7 @@ internal sealed partial class TrayApplication : IDisposable
                 newIconHandle,
                 ref _codexIconHandle,
                 ref _codexTrayIconAdded,
-                ref _codexIconKey,
-                ref _codexAppliedTooltip);
+                ref _codexIconKey);
             return;
         }
 
@@ -2025,9 +1977,7 @@ internal sealed partial class TrayApplication : IDisposable
             ref _codexIconHandle,
             ref _codexTrayIconAdded,
             ref _codexIconKey,
-            ref _codexAppliedTooltip,
-            iconKey,
-            _codexTooltip);
+            iconKey);
     }
 
     private void UpdateClaudeTrayIcon(IntPtr newIconHandle, string iconKey)
@@ -2039,8 +1989,7 @@ internal sealed partial class TrayApplication : IDisposable
                 newIconHandle,
                 ref _claudeIconHandle,
                 ref _claudeTrayIconAdded,
-                ref _claudeIconKey,
-                ref _claudeAppliedTooltip);
+                ref _claudeIconKey);
             return;
         }
 
@@ -2050,9 +1999,7 @@ internal sealed partial class TrayApplication : IDisposable
             ref _claudeIconHandle,
             ref _claudeTrayIconAdded,
             ref _claudeIconKey,
-            ref _claudeAppliedTooltip,
-            iconKey,
-            _claudeTooltip);
+            iconKey);
     }
 
     private void UpdateKimiTrayIcon(IntPtr newIconHandle, string iconKey)
@@ -2064,8 +2011,7 @@ internal sealed partial class TrayApplication : IDisposable
                 newIconHandle,
                 ref _kimiIconHandle,
                 ref _kimiTrayIconAdded,
-                ref _kimiIconKey,
-                ref _kimiAppliedTooltip);
+                ref _kimiIconKey);
             return;
         }
 
@@ -2075,9 +2021,7 @@ internal sealed partial class TrayApplication : IDisposable
             ref _kimiIconHandle,
             ref _kimiTrayIconAdded,
             ref _kimiIconKey,
-            ref _kimiAppliedTooltip,
-            iconKey,
-            _kimiTooltip);
+            iconKey);
     }
 
     private void UpdateDeepSeekTrayIcon(IntPtr newIconHandle, string iconKey)
@@ -2089,8 +2033,7 @@ internal sealed partial class TrayApplication : IDisposable
                 newIconHandle,
                 ref _deepSeekIconHandle,
                 ref _deepSeekTrayIconAdded,
-                ref _deepSeekIconKey,
-                ref _deepSeekAppliedTooltip);
+                ref _deepSeekIconKey);
             return;
         }
 
@@ -2100,9 +2043,7 @@ internal sealed partial class TrayApplication : IDisposable
             ref _deepSeekIconHandle,
             ref _deepSeekTrayIconAdded,
             ref _deepSeekIconKey,
-            ref _deepSeekAppliedTooltip,
-            iconKey,
-            _deepSeekTooltip);
+            iconKey);
     }
 
     private void UpdateDiskTrayIcon(IntPtr newIconHandle, string iconKey)
@@ -2124,9 +2065,7 @@ internal sealed partial class TrayApplication : IDisposable
             ref _diskIconHandle,
             ref _diskTrayIconAdded,
             ref _diskIconKey,
-            ref _diskAppliedTooltip,
-            iconKey,
-            _diskTooltip);
+            iconKey);
     }
 
     private void HideDiskTrayIcon()
@@ -2134,7 +2073,6 @@ internal sealed partial class TrayApplication : IDisposable
         RemoveTrayIcon(DiskTrayIconId, ref _diskTrayIconAdded);
         DestroyIconHandle(ref _diskIconHandle);
         _diskIconKey = null;
-        _diskAppliedTooltip = null;
     }
 
     private void UpdateOpenCodeTrayIcon(IntPtr newIconHandle, string iconKey)
@@ -2146,8 +2084,7 @@ internal sealed partial class TrayApplication : IDisposable
                 newIconHandle,
                 ref _openCodeIconHandle,
                 ref _openCodeTrayIconAdded,
-                ref _openCodeIconKey,
-                ref _openCodeAppliedTooltip);
+                ref _openCodeIconKey);
             return;
         }
 
@@ -2157,9 +2094,7 @@ internal sealed partial class TrayApplication : IDisposable
             ref _openCodeIconHandle,
             ref _openCodeTrayIconAdded,
             ref _openCodeIconKey,
-            ref _openCodeAppliedTooltip,
-            iconKey,
-            _openCodeTooltip);
+            iconKey);
     }
 
     private void UpdateDevinTrayIcon(IntPtr newIconHandle, string iconKey)
@@ -2171,8 +2106,7 @@ internal sealed partial class TrayApplication : IDisposable
                 newIconHandle,
                 ref _devinIconHandle,
                 ref _devinTrayIconAdded,
-                ref _devinIconKey,
-                ref _devinAppliedTooltip);
+                ref _devinIconKey);
             return;
         }
 
@@ -2182,9 +2116,7 @@ internal sealed partial class TrayApplication : IDisposable
             ref _devinIconHandle,
             ref _devinTrayIconAdded,
             ref _devinIconKey,
-            ref _devinAppliedTooltip,
-            iconKey,
-            _devinTooltip);
+            iconKey);
     }
 
     private void UpdateOpenRouterTrayIcon(IntPtr newIconHandle, string iconKey)
@@ -2196,8 +2128,7 @@ internal sealed partial class TrayApplication : IDisposable
                 newIconHandle,
                 ref _openRouterIconHandle,
                 ref _openRouterTrayIconAdded,
-                ref _openRouterIconKey,
-                ref _openRouterAppliedTooltip);
+                ref _openRouterIconKey);
             return;
         }
 
@@ -2207,9 +2138,7 @@ internal sealed partial class TrayApplication : IDisposable
             ref _openRouterIconHandle,
             ref _openRouterTrayIconAdded,
             ref _openRouterIconKey,
-            ref _openRouterAppliedTooltip,
-            iconKey,
-            _openRouterTooltip);
+            iconKey);
     }
 
     private void UpdateTemperatureTrayIcon(IntPtr newIconHandle, string iconKey)
@@ -2221,8 +2150,7 @@ internal sealed partial class TrayApplication : IDisposable
                 newIconHandle,
                 ref _temperatureIconHandle,
                 ref _temperatureTrayIconAdded,
-                ref _temperatureIconKey,
-                ref _temperatureAppliedTooltip);
+                ref _temperatureIconKey);
             return;
         }
 
@@ -2232,9 +2160,7 @@ internal sealed partial class TrayApplication : IDisposable
             ref _temperatureIconHandle,
             ref _temperatureTrayIconAdded,
             ref _temperatureIconKey,
-            ref _temperatureAppliedTooltip,
-            iconKey,
-            _temperatureTooltip);
+            iconKey);
     }
 
     private void UpdateMemoryTrayIcon(IntPtr newIconHandle, string iconKey)
@@ -2246,8 +2172,7 @@ internal sealed partial class TrayApplication : IDisposable
                 newIconHandle,
                 ref _memoryIconHandle,
                 ref _memoryTrayIconAdded,
-                ref _memoryIconKey,
-                ref _memoryAppliedTooltip);
+                ref _memoryIconKey);
             return;
         }
 
@@ -2257,9 +2182,7 @@ internal sealed partial class TrayApplication : IDisposable
             ref _memoryIconHandle,
             ref _memoryTrayIconAdded,
             ref _memoryIconKey,
-            ref _memoryAppliedTooltip,
-            iconKey,
-            _memoryTooltip);
+            iconKey);
     }
 
     private void SuppressTrayIcon(
@@ -2267,8 +2190,7 @@ internal sealed partial class TrayApplication : IDisposable
         IntPtr newIconHandle,
         ref IntPtr iconHandle,
         ref bool trayIconAdded,
-        ref string? currentIconKey,
-        ref string? currentTooltip)
+        ref string? currentIconKey)
     {
         if (newIconHandle != IntPtr.Zero)
         {
@@ -2278,7 +2200,6 @@ internal sealed partial class TrayApplication : IDisposable
         RemoveTrayIcon(iconId, ref trayIconAdded);
         DestroyIconHandle(ref iconHandle);
         currentIconKey = null;
-        currentTooltip = null;
     }
 
     private void UpdateTrayIcon(
@@ -2287,9 +2208,7 @@ internal sealed partial class TrayApplication : IDisposable
         ref IntPtr iconHandle,
         ref bool trayIconAdded,
         ref string? currentIconKey,
-        ref string? currentTooltip,
-        string newIconKey,
-        string tooltip)
+        string newIconKey)
     {
         if (newIconHandle == IntPtr.Zero)
         {
@@ -2297,8 +2216,7 @@ internal sealed partial class TrayApplication : IDisposable
         }
 
         bool iconUnchanged = trayIconAdded && string.Equals(currentIconKey, newIconKey, StringComparison.Ordinal);
-        bool tooltipUnchanged = string.Equals(currentTooltip, tooltip, StringComparison.Ordinal);
-        if (iconUnchanged && tooltipUnchanged)
+        if (iconUnchanged)
         {
             NativeMethods.DestroyIcon(newIconHandle);
             return;
@@ -2316,9 +2234,7 @@ internal sealed partial class TrayApplication : IDisposable
             currentIconKey = newIconKey;
         }
 
-        currentTooltip = tooltip;
-
-        NativeMethods.NOTIFYICONDATA data = CreateNotifyIconData(iconId, iconHandle, tooltip);
+        NativeMethods.NOTIFYICONDATA data = CreateNotifyIconData(iconId, iconHandle);
         uint message;
         if (trayIconAdded)
         {
@@ -2359,17 +2275,17 @@ internal sealed partial class TrayApplication : IDisposable
         }
     }
 
-    private NativeMethods.NOTIFYICONDATA CreateNotifyIconData(uint iconId, IntPtr iconHandle, string tooltip)
+    private NativeMethods.NOTIFYICONDATA CreateNotifyIconData(uint iconId, IntPtr iconHandle)
     {
         return new NativeMethods.NOTIFYICONDATA
         {
             cbSize = (uint)Marshal.SizeOf<NativeMethods.NOTIFYICONDATA>(),
             hWnd = _windowHandle,
             uID = iconId,
-            uFlags = NativeMethods.NIF_MESSAGE | NativeMethods.NIF_ICON | NativeMethods.NIF_TIP | NativeMethods.NIF_GUID,
+            uFlags = NativeMethods.NIF_MESSAGE | NativeMethods.NIF_ICON | NativeMethods.NIF_GUID,
             uCallbackMessage = TrayCallbackMessage,
             hIcon = iconHandle,
-            szTip = TruncateTooltip(tooltip),
+            szTip = string.Empty,
             szInfo = string.Empty,
             szInfoTitle = string.Empty,
             guidItem = GetTrayIconGuid(iconId)
@@ -3479,16 +3395,6 @@ internal sealed partial class TrayApplication : IDisposable
         _memoryIconKey = null;
         _devinIconKey = null;
         _openRouterIconKey = null;
-        _codexAppliedTooltip = null;
-        _claudeAppliedTooltip = null;
-        _kimiAppliedTooltip = null;
-        _deepSeekAppliedTooltip = null;
-        _diskAppliedTooltip = null;
-        _openCodeAppliedTooltip = null;
-        _temperatureAppliedTooltip = null;
-        _memoryAppliedTooltip = null;
-        _devinAppliedTooltip = null;
-        _openRouterAppliedTooltip = null;
 
         RefreshVisibleTrayIcons();
         RefreshUsage();
@@ -4167,12 +4073,6 @@ internal sealed partial class TrayApplication : IDisposable
         }
     }
 
-    private static string BuildModelflareTooltip(ModelflareBalanceSnapshot snapshot)
-    {
-        return TruncateTooltip(
-            $"Codex (Modelflare): {FormatModelflareAmount(snapshot.TotalAvailable)} left");
-    }
-
     private static string BuildModelflareHeadline(ModelflareBalanceSnapshot snapshot)
     {
         return $"Modelflare: {FormatModelflareAmount(snapshot.TotalAvailable)} left " +
@@ -4195,44 +4095,6 @@ internal sealed partial class TrayApplication : IDisposable
     private static string FormatModelflareAmount(decimal amount)
     {
         return $"${amount.ToString("0.00", CultureInfo.InvariantCulture)}";
-    }
-
-    private static string BuildCodexTooltip(CodexUsageSnapshot snapshot, CodexResetCreditsSnapshot? resetCredits = null)
-    {
-        List<string> windows = [];
-        if (snapshot.PrimaryWindowMinutes > 0)
-        {
-            windows.Add(FormatCodexWindowTooltip(
-                snapshot.PrimaryWindowMinutes, snapshot.PrimaryUsedPercent, snapshot.PrimaryResetAt));
-        }
-        if (snapshot.SecondaryWindowMinutes > 0 &&
-            (snapshot.SecondaryWindowMinutes != snapshot.PrimaryWindowMinutes ||
-             snapshot.SecondaryResetAt != snapshot.PrimaryResetAt))
-        {
-            windows.Add(FormatCodexWindowTooltip(
-                snapshot.SecondaryWindowMinutes, snapshot.SecondaryUsedPercent, snapshot.SecondaryResetAt));
-        }
-        if (windows.Count == 0)
-        {
-            windows.Add(FormatCodexWindowTooltip(
-                CodexUsageMath.GetWeeklyWindowMinutes(snapshot),
-                100 - CodexUsageMath.GetWeeklyRemainingPercent(snapshot),
-                CodexUsageMath.GetWeeklyResetAt(snapshot)));
-        }
-
-        string tooltip = $"Codex: {string.Join(", ", windows)}";
-        if (resetCredits is { AvailableCount: > 0 })
-        {
-            tooltip += $"; {resetCredits.AvailableCount} banked reset{(resetCredits.AvailableCount == 1 ? "" : "s")}";
-        }
-
-        return TruncateTooltip(tooltip);
-    }
-
-    private static string FormatCodexWindowTooltip(int windowMinutes, double usedPercent, DateTimeOffset? resetAt)
-    {
-        return $"{FormatWindow(windowMinutes)} left {CodexUsageMath.GetRemainingPercent(usedPercent)}% " +
-               $"(reset {FormatTooltipReset(resetAt)})";
     }
 
     private static string BuildCodexHeadline(CodexUsageSnapshot snapshot)
@@ -4268,36 +4130,6 @@ internal sealed partial class TrayApplication : IDisposable
                $"({FormatResetCountdown(CodexUsageMath.GetWeeklyResetAt(sparkSnapshot))}), Spark seen {sparkSeen}";
     }
 
-    private static string BuildClaudeTooltip(ClaudeUsageSnapshot snapshot)
-    {
-        int fiveHourRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.FiveHourUsedPercent);
-        int sevenDayRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.SevenDayUsedPercent);
-
-        string tooltip =
-            $"Claude: 5h left {fiveHourRemaining}% (reset {FormatTooltipReset(snapshot.FiveHourResetAt)}), " +
-            $"7d left {sevenDayRemaining}% (reset {FormatTooltipReset(snapshot.SevenDayResetAt)})";
-        if (snapshot.ResetCredits is { AvailableCount: > 0 } resets)
-        {
-            tooltip += $"; {resets.AvailableCount} reset{(resets.AvailableCount == 1 ? "" : "s")}";
-        }
-
-        return TruncateTooltip(tooltip);
-    }
-
-    private static string BuildClaudeStaleTooltip(ClaudeUsageSnapshot snapshot)
-    {
-        int fiveHourRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.FiveHourUsedPercent);
-        int sevenDayRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.SevenDayUsedPercent);
-
-        string tooltip = $"Claude: 5h left {fiveHourRemaining}%, 7d left {sevenDayRemaining}% (last known)";
-        if (snapshot.ResetCredits is { AvailableCount: > 0 } staleResets)
-        {
-            tooltip += $"; {staleResets.AvailableCount} reset{(staleResets.AvailableCount == 1 ? "" : "s")}";
-        }
-
-        return TruncateTooltip(tooltip);
-    }
-
     private static string BuildClaudeHeadline(ClaudeUsageSnapshot snapshot)
     {
         int fiveHourRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.FiveHourUsedPercent);
@@ -4317,31 +4149,6 @@ internal sealed partial class TrayApplication : IDisposable
             : snapshot.SevenDayResetAt.Value.ToLocalTime().ToString("MMM dd HH:mm", CultureInfo.InvariantCulture);
 
         return $"Reset 5h {fiveHourReset}, 7d {sevenDayReset}";
-    }
-
-    private static string BuildKimiTooltip(KimiUsageSnapshot snapshot)
-    {
-        return TruncateTooltip(
-            $"Kimi: 5h left {FormatUsagePercent(snapshot.FiveHourRemainingPercent)}, " +
-            $"7d left {FormatUsagePercent(snapshot.SevenDayRemainingPercent)}, " +
-            FormatResetCountdown(snapshot.SevenDayResetAt));
-    }
-
-    private static string BuildKimiStaleTooltip(KimiUsageSnapshot snapshot)
-    {
-        return TruncateTooltip(
-            $"Kimi: 5h left {FormatUsagePercent(snapshot.FiveHourRemainingPercent)}, " +
-            $"7d left {FormatUsagePercent(snapshot.SevenDayRemainingPercent)} (last known)");
-    }
-
-    private static string BuildKimiUnavailableTooltip(string? errorMessage)
-    {
-        if (string.IsNullOrWhiteSpace(errorMessage))
-        {
-            return "Kimi: usage unavailable";
-        }
-
-        return TruncateTooltip($"Kimi: usage unavailable ({errorMessage})");
     }
 
     private static string BuildKimiHeadline(KimiUsageSnapshot snapshot)
@@ -4376,21 +4183,6 @@ internal sealed partial class TrayApplication : IDisposable
                $"cached read {FormatCompactTokens(snapshot.CachedReadTokens)}";
     }
 
-    private static string BuildDeepSeekTooltip(DeepSeekBalanceSnapshot snapshot)
-    {
-        return TruncateTooltip($"DeepSeek: {FormatDeepSeekBalance(snapshot.TotalBalance)} left via DeepCode");
-    }
-
-    private static string BuildDeepSeekUnavailableTooltip(string? errorMessage)
-    {
-        if (string.IsNullOrWhiteSpace(errorMessage))
-        {
-            return "DeepSeek: balance unavailable";
-        }
-
-        return TruncateTooltip($"DeepSeek: balance unavailable ({errorMessage})");
-    }
-
     private static string BuildDeepSeekHeadline(DeepSeekBalanceSnapshot snapshot)
     {
         string availability = snapshot.IsAvailable ? "available" : "unavailable for API calls";
@@ -4401,34 +4193,6 @@ internal sealed partial class TrayApplication : IDisposable
     {
         return $"Topped up {FormatDeepSeekBalance(snapshot.ToppedUpBalance)}, " +
                $"granted {FormatDeepSeekBalance(snapshot.GrantedBalance)}";
-    }
-
-    private static string BuildOpenCodeTooltip(
-        OpenCodeUsageSnapshot snapshot,
-        OpenCodeGoUsageSnapshot? goSnapshot,
-        string? goUsageError)
-    {
-        string localText =
-            $"OpenCode: {FormatCompactTokens(snapshot.TotalTokens)} tokens today, " +
-            $"{snapshot.SessionCount} {(snapshot.SessionCount == 1 ? "session" : "sessions")}";
-        if (goSnapshot is null)
-        {
-            return TruncateTooltip(FormatOpenCodeGoError(localText, goUsageError));
-        }
-
-        return TruncateTooltip(
-            $"{localText}; {BuildOpenCodeGoSummary(goSnapshot)}" +
-            (string.IsNullOrWhiteSpace(goUsageError) ? string.Empty : " (last known Go quota)"));
-    }
-
-    private static string BuildOpenCodeUnavailableTooltip(string? errorMessage)
-    {
-        if (string.IsNullOrWhiteSpace(errorMessage))
-        {
-            return "OpenCode: usage unavailable";
-        }
-
-        return TruncateTooltip($"OpenCode: usage unavailable ({errorMessage})");
     }
 
     private static string BuildOpenCodeHeadline(
@@ -4455,13 +4219,6 @@ internal sealed partial class TrayApplication : IDisposable
             : $"{localText}; {BuildOpenCodeGoSummary(goSnapshot)}";
     }
 
-    private static string BuildOpenCodeGoTooltip(OpenCodeGoUsageSnapshot snapshot, bool isStale)
-    {
-        return TruncateTooltip(
-            $"OpenCode Go: {BuildOpenCodeGoSummary(snapshot)}" +
-            (isStale ? " (last known)" : string.Empty));
-    }
-
     private static string BuildOpenCodeGoHeadline(OpenCodeGoUsageSnapshot snapshot)
     {
         return $"OpenCode Go: {BuildOpenCodeGoSummary(snapshot)}";
@@ -4486,20 +4243,6 @@ internal sealed partial class TrayApplication : IDisposable
         return string.IsNullOrWhiteSpace(goUsageError)
             ? text
             : $"{text}; {goUsageError}";
-    }
-
-    private static string BuildOpenRouterTooltip(OpenRouterBalanceSnapshot snapshot)
-    {
-        return TruncateTooltip(
-            $"OpenRouter: {FormatOpenRouterAmount(snapshot.SpendableBalance)} left" +
-            (snapshot.UsageDaily is { } daily ? $", {FormatOpenRouterAmount(daily)} today" : string.Empty));
-    }
-
-    private static string BuildOpenRouterUnavailableTooltip(string? errorMessage)
-    {
-        return string.IsNullOrWhiteSpace(errorMessage)
-            ? "OpenRouter: balance unavailable"
-            : TruncateTooltip($"OpenRouter: balance unavailable ({errorMessage})");
     }
 
     private static string BuildOpenRouterHeadline(OpenRouterBalanceSnapshot snapshot)
@@ -4548,21 +4291,6 @@ internal sealed partial class TrayApplication : IDisposable
             : "?";
     }
 
-    private static string BuildDevinTooltip(DevinUsageSnapshot snapshot, bool isStale)
-    {
-        return TruncateTooltip(
-            $"{GetDevinPlanTitle(snapshot.PlanName)}: daily {FormatUsagePercent(snapshot.DailyRemainingPercent)} left, " +
-            $"weekly {FormatUsagePercent(snapshot.WeeklyRemainingPercent)} left" +
-            (isStale ? " (last known)" : string.Empty));
-    }
-
-    private static string BuildDevinUnavailableTooltip(string? errorMessage)
-    {
-        return string.IsNullOrWhiteSpace(errorMessage)
-            ? "Devin: quota unavailable"
-            : TruncateTooltip($"Devin: quota unavailable ({errorMessage})");
-    }
-
     private static string BuildDevinHeadline(DevinUsageSnapshot snapshot)
     {
         return $"{GetDevinPlanTitle(snapshot.PlanName)}: daily {FormatUsagePercent(snapshot.DailyRemainingPercent)} left | " +
@@ -4573,13 +4301,6 @@ internal sealed partial class TrayApplication : IDisposable
     {
         return $"Daily {FormatResetCountdown(snapshot.DailyResetAt)}, " +
                $"weekly {FormatResetCountdown(snapshot.WeeklyResetAt)}";
-    }
-
-    private static string BuildTemperatureTooltip(HardwareSnapshot snapshot)
-    {
-        return TruncateTooltip(
-            $"Temperature: CPU {FormatTemperature(snapshot.CpuTemperatureC)}, " +
-            $"GPU {FormatTemperature(snapshot.GpuTemperatureC)}");
     }
 
     private static string BuildTemperatureHeadline(HardwareSnapshot snapshot)
@@ -4593,15 +4314,6 @@ internal sealed partial class TrayApplication : IDisposable
         string gpuName = string.IsNullOrWhiteSpace(snapshot.GpuName) ? "GPU" : snapshot.GpuName;
         return $"CPU package {FormatTemperature(snapshot.CpuTemperatureC)}; " +
                $"{gpuName} {FormatTemperature(snapshot.GpuTemperatureC)}";
-    }
-
-    private static string BuildUsageTooltip(HardwareSnapshot snapshot)
-    {
-        return TruncateTooltip(
-            $"Usage: CPU {FormatUsagePercent(snapshot.CpuUsagePercent)}, " +
-            $"GPU {FormatUsagePercent(snapshot.GpuUsagePercent)}, " +
-            $"RAM {FormatUsagePercent(snapshot.RamUsagePercent)}, " +
-            $"VRAM {FormatUsagePercent(snapshot.VramUsagePercent)}");
     }
 
     private static string BuildUsageHeadline(HardwareSnapshot snapshot)
@@ -4667,16 +4379,6 @@ internal sealed partial class TrayApplication : IDisposable
             _lastDiskAlertAt[drive.DriveLetter] = now;
             NativeMethods.MessageBeep(NativeMethods.MB_ICONWARNING);
         }
-    }
-
-    private static string BuildDiskTooltip(DiskSpaceSnapshot snapshot)
-    {
-        if (!snapshot.HasSelectedDrives)
-        {
-            return "Disk: no disks selected";
-        }
-
-        return TruncateTooltip($"Disk: {snapshot.Summary}");
     }
 
     private static string BuildDiskHeadline(DiskSpaceSnapshot snapshot)
@@ -4765,33 +4467,6 @@ internal sealed partial class TrayApplication : IDisposable
         return $"reset in {minutes}m";
     }
 
-    private static string FormatTooltipReset(DateTimeOffset? resetAt)
-    {
-        if (resetAt is null)
-        {
-            return "?";
-        }
-
-        TimeSpan remaining = resetAt.Value - DateTimeOffset.Now;
-        if (remaining <= TimeSpan.Zero)
-        {
-            return "due";
-        }
-
-        int days = (int)Math.Floor(remaining.TotalDays);
-        if (days > 0)
-        {
-            return $"{days}d";
-        }
-
-        if (remaining.Hours > 0)
-        {
-            return $"{remaining.Hours}h";
-        }
-
-        return $"{Math.Max(1, (int)Math.Ceiling(remaining.TotalMinutes))}m";
-    }
-
     private static string FormatUsagePercent(double value)
     {
         return $"{Math.Clamp(value, 0d, 100d):0.#}%";
@@ -4814,11 +4489,6 @@ internal sealed partial class TrayApplication : IDisposable
         }
 
         return tokens.ToString(CultureInfo.InvariantCulture);
-    }
-
-    private static string TruncateTooltip(string value)
-    {
-        return value.Length <= 127 ? value : value[..127];
     }
 
     private static string LimitMenuText(string value)
