@@ -72,9 +72,12 @@ internal sealed class TrayApplication : IDisposable
     private const uint OpenDiskSettingsMessage = NativeMethods.WM_APP + 8;
     private const uint OpenCodeResultMessage = NativeMethods.WM_APP + 9;
     private const uint HardwareResultMessage = NativeMethods.WM_APP + 10;
+    private const uint UnetResultMessage = NativeMethods.WM_APP + 11;
     private const uint DevinResultMessage = NativeMethods.WM_APP + 12;
     private const uint OpenRouterResultMessage = NativeMethods.WM_APP + 13;
     private const uint ModelflareResultMessage = NativeMethods.WM_APP + 14;
+    private const uint RatesResultMessage = NativeMethods.WM_APP + 15;
+    private const uint GcalResultMessage = NativeMethods.WM_APP + 16;
     private const uint CodexRedeemResultMessage = NativeMethods.WM_APP + 17;
     private const uint KimiTrayIconId = 3;
     private const uint DeepSeekTrayIconId = 4;
@@ -142,14 +145,18 @@ internal sealed class TrayApplication : IDisposable
     private readonly ClaudeUsageReader _claudeUsageReader = new();
     private readonly KimiUsageReader _kimiUsageReader = new();
     private readonly DeepSeekBalanceReader _deepSeekBalanceReader = new();
+    private readonly UnetBalanceReader _unetBalanceReader = new();
     private readonly OpenCodeUsageReader _openCodeUsageReader = new();
     private readonly DevinUsageReader _devinUsageReader = new();
     private readonly OpenRouterBalanceReader _openRouterBalanceReader = new();
     private readonly ModelflareBalanceReader _modelflareBalanceReader = new();
+    private readonly RatesReader _ratesReader = new();
+    private readonly GcalReader _gcalReader = new();
     private readonly HardwareMonitor _hardwareMonitor = new();
     private readonly DiskMonitor _diskMonitor = new();
     private readonly TrayIconSettingsStore _trayIconSettingsStore = new();
     private readonly CounterWebSocketServer _counterWebSocketServer = new();
+    private readonly LimitWatchdog _limitWatchdog;
     private readonly string _windowClassName = $"limits.{Environment.ProcessId}";
     private readonly string _usageBalloonWindowClassName = $"limits.usage-balloon.{Environment.ProcessId}";
     private readonly EventWaitHandle _shutdownEvent;
@@ -275,6 +282,9 @@ internal sealed class TrayApplication : IDisposable
     private OpenRouterBalanceSnapshot? _lastOpenRouterSnapshot;
     private HardwareSnapshot? _lastHardwareSnapshot;
     private IReadOnlyList<RamProcessUsage> _lastTopRamProcesses = [];
+    private UnetBalanceSnapshot? _lastUnetSnapshot;
+    private RatesSnapshot? _lastRatesSnapshot;
+    private GcalSnapshot? _lastGcalSnapshot;
     private volatile bool _codexRefreshInFlight;
     private volatile UsageReadResult? _pendingCodexResult;
     private volatile bool _codexRedeemInFlight;
@@ -286,6 +296,8 @@ internal sealed class TrayApplication : IDisposable
     private volatile KimiUsageReadResult? _pendingKimiResult;
     private volatile bool _deepSeekRefreshInFlight;
     private volatile DeepSeekBalanceReadResult? _pendingDeepSeekResult;
+    private volatile bool _unetRefreshInFlight;
+    private volatile UnetBalanceReadResult? _pendingUnetResult;
     private volatile DiskSpaceSnapshot? _pendingDiskResult;
     private volatile bool _openCodeRefreshInFlight;
     private volatile OpenCodeUsageReadResult? _pendingOpenCodeResult;
@@ -297,6 +309,11 @@ internal sealed class TrayApplication : IDisposable
     private volatile OpenRouterBalanceReadResult? _pendingOpenRouterResult;
     private volatile bool _modelflareRefreshInFlight;
     private volatile ModelflareBalanceReadResult? _pendingModelflareResult;
+    private volatile bool _ratesRefreshInFlight;
+    private volatile RatesReadResult? _pendingRatesResult;
+    private volatile bool _gcalRefreshInFlight;
+    private volatile GcalReadResult? _pendingGcalResult;
+    private volatile bool _limitWatchdogInFlight;
     private volatile bool _diskRefreshInFlight;
     private readonly Dictionary<string, DateTimeOffset> _lastDiskAlertAt = new(StringComparer.OrdinalIgnoreCase);
     private DiskSettingsWindow? _diskSettingsWindow;
@@ -344,6 +361,7 @@ internal sealed class TrayApplication : IDisposable
             executeOnlyOnce: false);
         _taskbarCreatedMessage = NativeMethods.RegisterWindowMessage("TaskbarCreated");
         _trayIconSettings = _trayIconSettingsStore.Load();
+        _limitWatchdog = new LimitWatchdog(_diskMonitor);
     }
 
     public static int RequestShutdown()
@@ -557,11 +575,146 @@ internal sealed class TrayApplication : IDisposable
         RefreshClaudeUsage();
         RefreshKimiUsage();
         RefreshDeepSeekBalance();
+        RefreshUnetBalances();
         RefreshDiskSpace();
         RefreshOpenCodeUsage();
         RefreshDevinUsage();
         RefreshOpenRouterBalance();
+        RefreshRates();
+        RefreshGcal();
         RefreshHardware();
+    }
+
+    private void RefreshUnetBalances()
+    {
+        if (_unetRefreshInFlight)
+        {
+            return;
+        }
+
+        _unetRefreshInFlight = true;
+        IntPtr windowHandle = _windowHandle;
+
+        Task.Run(() =>
+        {
+            UnetBalanceReadResult result;
+            try
+            {
+                result = _unetBalanceReader.ReadLatestSnapshot();
+            }
+            catch (Exception)
+            {
+                result = new UnetBalanceReadResult(null, "UNET balance refresh failed.");
+            }
+
+            _pendingUnetResult = result;
+
+            if (windowHandle == IntPtr.Zero ||
+                !NativeMethods.PostMessage(windowHandle, UnetResultMessage, IntPtr.Zero, IntPtr.Zero))
+            {
+                _unetRefreshInFlight = false;
+            }
+        });
+    }
+
+    private void ApplyUnetResult()
+    {
+        UnetBalanceReadResult? result = _pendingUnetResult;
+        _pendingUnetResult = null;
+        _unetRefreshInFlight = false;
+
+        if (result is not null)
+        {
+            _lastUnetSnapshot = result.Snapshot;
+        }
+    }
+
+    private void RefreshRates()
+    {
+        if (_ratesRefreshInFlight)
+        {
+            return;
+        }
+
+        _ratesRefreshInFlight = true;
+        IntPtr windowHandle = _windowHandle;
+
+        Task.Run(() =>
+        {
+            RatesReadResult result;
+            try
+            {
+                result = _ratesReader.ReadLatestSnapshot();
+            }
+            catch (Exception)
+            {
+                result = new RatesReadResult(null, "Rates refresh failed.");
+            }
+
+            _pendingRatesResult = result;
+
+            if (windowHandle == IntPtr.Zero ||
+                !NativeMethods.PostMessage(windowHandle, RatesResultMessage, IntPtr.Zero, IntPtr.Zero))
+            {
+                _ratesRefreshInFlight = false;
+            }
+        });
+    }
+
+    private void ApplyRatesResult()
+    {
+        RatesReadResult? result = _pendingRatesResult;
+        _pendingRatesResult = null;
+        _ratesRefreshInFlight = false;
+
+        if (result is not null)
+        {
+            _lastRatesSnapshot = result.Snapshot;
+        }
+    }
+
+    private void RefreshGcal()
+    {
+        if (_gcalRefreshInFlight)
+        {
+            return;
+        }
+
+        _gcalRefreshInFlight = true;
+        IntPtr windowHandle = _windowHandle;
+
+        Task.Run(() =>
+        {
+            GcalReadResult result;
+            try
+            {
+                result = _gcalReader.ReadLatestSnapshot();
+            }
+            catch (Exception)
+            {
+                result = new GcalReadResult(null, "Calendar refresh failed.");
+            }
+
+            _pendingGcalResult = result;
+
+            if (windowHandle == IntPtr.Zero ||
+                !NativeMethods.PostMessage(windowHandle, GcalResultMessage, IntPtr.Zero, IntPtr.Zero))
+            {
+                _gcalRefreshInFlight = false;
+            }
+        });
+    }
+
+    private void ApplyGcalResult()
+    {
+        GcalReadResult? result = _pendingGcalResult;
+        _pendingGcalResult = null;
+        _gcalRefreshInFlight = false;
+
+        if (result is not null)
+        {
+            _lastGcalSnapshot = result.Snapshot;
+        }
     }
 
     private void RefreshDiskSpace()
@@ -624,6 +777,7 @@ internal sealed class TrayApplication : IDisposable
             HideDiskTrayIcon();
         }
         AlertDiskLimits(result);
+        RunLimitWatchdog(_lastClaudeSnapshot);
     }
 
     private void RefreshCodexUsage()
@@ -1008,6 +1162,7 @@ internal sealed class TrayApplication : IDisposable
                 UpdateClaudeTrayIcon(
                     TrayIconRenderer.CreateClaudeIcon(lastSnapshot),
                     TrayIconRenderer.GetClaudeIconKey(lastSnapshot));
+                RunLimitWatchdog(lastSnapshot);
                 return;
             }
 
@@ -1017,6 +1172,7 @@ internal sealed class TrayApplication : IDisposable
             _claudeUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
             _claudeSourceText = _claudeUsageReader.CredentialsPath;
             UpdateClaudeTrayIcon(TrayIconRenderer.CreateClaudeUnavailableIcon(), TrayIconRenderer.ClaudeUnavailableIconKey);
+            RunLimitWatchdog(null);
             return;
         }
 
@@ -1028,6 +1184,7 @@ internal sealed class TrayApplication : IDisposable
         _claudeUpdatedText = $"Seen {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
         _claudeSourceText = snapshot.SourceFile;
         UpdateClaudeTrayIcon(TrayIconRenderer.CreateClaudeIcon(snapshot), TrayIconRenderer.GetClaudeIconKey(snapshot));
+        RunLimitWatchdog(snapshot);
     }
 
     private void RefreshKimiUsage()
@@ -1567,6 +1724,9 @@ internal sealed class TrayApplication : IDisposable
         root["claude"] = BuildClaudeCounterJson(_lastClaudeSnapshot);
         root["kimi"] = BuildKimiCounterJson(_lastKimiSnapshot);
         root["deepSeek"] = BuildDeepSeekCounterJson(_lastDeepSeekSnapshot);
+        root["unet"] = BuildUnetCounterJson(_lastUnetSnapshot);
+        root["rates"] = BuildRatesCounterJson(_lastRatesSnapshot);
+        root["gcal"] = BuildGcalCounterJson(_lastGcalSnapshot);
         root["openCode"] = BuildOpenCodeCounterJson(
             _lastOpenCodeSnapshot,
             _lastOpenCodeGoSnapshot,
@@ -1761,6 +1921,87 @@ internal sealed class TrayApplication : IDisposable
             ["toppedUpBalance"] = snapshot.ToppedUpBalance,
             ["isAvailable"] = snapshot.IsAvailable,
             ["timestamp"] = FormatCounterTimestamp(snapshot.Timestamp)
+        };
+    }
+
+    private static JsonObject? BuildUnetCounterJson(UnetBalanceSnapshot? snapshot)
+    {
+        if (snapshot is null)
+        {
+            return null;
+        }
+
+        JsonArray accounts = new();
+        foreach (UnetAccountBalance account in snapshot.Accounts)
+        {
+            JsonObject accountJson = new()
+            {
+                ["username"] = account.Username,
+                ["currency"] = account.Currency,
+                ["isAvailable"] = account.IsAvailable,
+                ["error"] = account.Error
+            };
+            SetNullableDecimal(accountJson, "balance", account.Balance);
+            accounts.Add((JsonNode)accountJson);
+        }
+
+        return new JsonObject
+        {
+            ["timestamp"] = FormatCounterTimestamp(snapshot.Timestamp),
+            ["isAvailable"] = snapshot.Accounts.Any(account => account.IsAvailable),
+            ["accounts"] = accounts
+        };
+    }
+
+    private static JsonObject? BuildRatesCounterJson(RatesSnapshot? snapshot)
+    {
+        if (snapshot is null)
+        {
+            return null;
+        }
+
+        JsonObject result = new()
+        {
+            ["timestamp"] = FormatCounterTimestamp(snapshot.Timestamp),
+            ["usdBynTodayDate"] = snapshot.UsdBynTodayDate,
+            ["usdBynTomorrowDate"] = snapshot.UsdBynTomorrowDate,
+            ["ethSource"] = snapshot.EthSource,
+            ["nbrbFetchedAt"] = FormatCounterTimestamp(snapshot.NbrbFetchedAt),
+            ["ethFetchedAt"] = FormatCounterTimestamp(snapshot.EthFetchedAt)
+        };
+        SetNullableDecimal(result, "usdBynToday", snapshot.UsdBynToday);
+        SetNullableDecimal(result, "usdBynTomorrow", snapshot.UsdBynTomorrow);
+        SetNullableDecimal(result, "ethUsd", snapshot.EthUsd);
+        return result;
+    }
+
+    private static JsonObject? BuildGcalCounterJson(GcalSnapshot? snapshot)
+    {
+        if (snapshot is null)
+        {
+            return null;
+        }
+
+        JsonArray events = [];
+        foreach (GcalEvent calendarEvent in snapshot.Events)
+        {
+            events.Add((JsonNode)new JsonObject
+            {
+                ["title"] = calendarEvent.Title,
+                ["start"] = calendarEvent.Start,
+                ["end"] = calendarEvent.End,
+                ["allDay"] = calendarEvent.AllDay
+            });
+        }
+
+        return new JsonObject
+        {
+            ["timestamp"] = FormatCounterTimestamp(snapshot.Timestamp),
+            ["configured"] = snapshot.Configured,
+            ["date"] = snapshot.Date,
+            ["events"] = events,
+            ["fetchedAt"] = FormatCounterTimestamp(snapshot.FetchedAt),
+            ["error"] = snapshot.Error
         };
     }
 
@@ -1971,6 +2212,13 @@ internal sealed class TrayApplication : IDisposable
             : null;
     }
 
+    private static void SetNullableDecimal(JsonObject target, string propertyName, decimal? value)
+    {
+        target[propertyName] = value is { } number
+            ? JsonValue.Create(number)
+            : null;
+    }
+
     private static void SetNullableLong(JsonObject target, string propertyName, long? value)
     {
         target[propertyName] = value is { } number
@@ -1986,6 +2234,27 @@ internal sealed class TrayApplication : IDisposable
         }
 
         return total - Math.Clamp(available, 0, total);
+    }
+
+    private void RunLimitWatchdog(ClaudeUsageSnapshot? snapshot)
+    {
+        if (_limitWatchdogInFlight)
+        {
+            return;
+        }
+
+        _limitWatchdogInFlight = true;
+        Task.Run(() =>
+        {
+            try
+            {
+                _limitWatchdog.Check(snapshot);
+            }
+            finally
+            {
+                _limitWatchdogInFlight = false;
+            }
+        });
     }
 
     private void UpdateCodexTrayIcon(IntPtr newIconHandle, string iconKey)
@@ -2448,6 +2717,11 @@ internal sealed class TrayApplication : IDisposable
                 PublishCounterState();
                 return IntPtr.Zero;
 
+            case UnetResultMessage:
+                ApplyUnetResult();
+                PublishCounterState();
+                return IntPtr.Zero;
+
             case DiskResultMessage:
                 ApplyDiskResult();
                 PublishCounterState();
@@ -2470,6 +2744,16 @@ internal sealed class TrayApplication : IDisposable
 
             case ModelflareResultMessage:
                 ApplyModelflareResult();
+                PublishCounterState();
+                return IntPtr.Zero;
+
+            case RatesResultMessage:
+                ApplyRatesResult();
+                PublishCounterState();
+                return IntPtr.Zero;
+
+            case GcalResultMessage:
+                ApplyGcalResult();
                 PublishCounterState();
                 return IntPtr.Zero;
 
@@ -7556,6 +7840,1543 @@ internal sealed record OpenCodeUsageReadResult(
     string? GoUsageError,
     string? ErrorMessage);
 
+internal sealed record UnetAccountBalance(
+    string Username,
+    decimal? Balance,
+    string Currency,
+    bool IsAvailable,
+    string? Error);
+
+internal sealed record UnetBalanceSnapshot(
+    IReadOnlyList<UnetAccountBalance> Accounts,
+    DateTimeOffset Timestamp);
+
+internal sealed record UnetBalanceReadResult(UnetBalanceSnapshot? Snapshot, string? ErrorMessage);
+
+internal sealed record RatesSnapshot(
+    decimal? UsdBynToday,
+    string? UsdBynTodayDate,
+    decimal? UsdBynTomorrow,
+    string? UsdBynTomorrowDate,
+    decimal? EthUsd,
+    string? EthSource,
+    DateTimeOffset NbrbFetchedAt,
+    DateTimeOffset EthFetchedAt,
+    DateTimeOffset Timestamp);
+
+internal sealed record RatesReadResult(RatesSnapshot? Snapshot, string? ErrorMessage);
+
+internal sealed class RatesReader
+{
+    private static readonly TimeSpan NbrbCacheTtl = TimeSpan.FromHours(6);
+    private static readonly TimeSpan EthCacheTtl = TimeSpan.FromMinutes(5);
+    private static readonly HttpClient HttpClient = new()
+    {
+        Timeout = TimeSpan.FromSeconds(20)
+    };
+    private const int NbrbUsdCode = 431;
+
+    private readonly object _cacheLock = new();
+    private decimal? _usdToday;
+    private string? _usdTodayDate;
+    private decimal? _usdTomorrow;
+    private string? _usdTomorrowDate;
+    private DateTimeOffset _nbrbFetchedAt = DateTimeOffset.MinValue;
+    private decimal? _ethUsd;
+    private string? _ethSource;
+    private DateTimeOffset _ethFetchedAt = DateTimeOffset.MinValue;
+
+    public RatesReadResult ReadLatestSnapshot()
+    {
+        List<string> errors = [];
+        bool nbrbStale;
+        bool ethStale;
+        lock (_cacheLock)
+        {
+            nbrbStale = DateTimeOffset.UtcNow - _nbrbFetchedAt >= NbrbCacheTtl;
+            ethStale = DateTimeOffset.UtcNow - _ethFetchedAt >= EthCacheTtl;
+        }
+
+        if (nbrbStale)
+        {
+            try
+            {
+                (decimal today, string todayDate, decimal? tomorrow, string? tomorrowDate) = ReadNbrbUsd();
+                lock (_cacheLock)
+                {
+                    _usdToday = today;
+                    _usdTodayDate = todayDate;
+                    _usdTomorrow = tomorrow;
+                    _usdTomorrowDate = tomorrowDate;
+                    _nbrbFetchedAt = DateTimeOffset.UtcNow;
+                }
+            }
+            catch (Exception exception) when (IsRatesFailure(exception))
+            {
+                errors.Add(GetSafeErrorMessage(exception));
+            }
+        }
+
+        if (ethStale)
+        {
+            try
+            {
+                (decimal price, string source) = ReadEthUsd();
+                lock (_cacheLock)
+                {
+                    _ethUsd = price;
+                    _ethSource = source;
+                    _ethFetchedAt = DateTimeOffset.UtcNow;
+                }
+            }
+            catch (Exception exception) when (IsRatesFailure(exception))
+            {
+                errors.Add(GetSafeErrorMessage(exception));
+            }
+        }
+
+        lock (_cacheLock)
+        {
+            if (_usdToday is null && _ethUsd is null)
+            {
+                return new RatesReadResult(null, errors.Count > 0 ? string.Join(" ", errors) : "Rates are unavailable.");
+            }
+
+            return new RatesReadResult(
+                new RatesSnapshot(
+                    _usdToday,
+                    _usdTodayDate,
+                    _usdTomorrow,
+                    _usdTomorrowDate,
+                    _ethUsd,
+                    _ethSource,
+                    _nbrbFetchedAt,
+                    _ethFetchedAt,
+                    DateTimeOffset.UtcNow),
+                errors.Count > 0 ? string.Join(" ", errors) : null);
+        }
+    }
+
+    private static DateOnly GetMinskDate()
+    {
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        try
+        {
+            TimeZoneInfo minsk = TimeZoneInfo.FindSystemTimeZoneById("Belarus Standard Time");
+            return DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(now, minsk).DateTime);
+        }
+        catch (TimeZoneNotFoundException)
+        {
+            return DateOnly.FromDateTime(now.UtcDateTime.AddHours(3));
+        }
+        catch (InvalidTimeZoneException)
+        {
+            return DateOnly.FromDateTime(now.UtcDateTime.AddHours(3));
+        }
+    }
+
+    private static (decimal today, string todayDate, decimal? tomorrow, string? tomorrowDate) ReadNbrbUsd()
+    {
+        DateOnly minskToday = GetMinskDate();
+        DateOnly start = minskToday.AddDays(-3);
+        DateOnly end = minskToday.AddDays(1);
+        string url = $"https://api.nbrb.by/exrates/rates/dynamics/{NbrbUsdCode}?startdate={start:yyyy-MM-dd}&enddate={end:yyyy-MM-dd}";
+
+        using HttpRequestMessage request = new(HttpMethod.Get, url);
+        request.Headers.Accept.ParseAdd("application/json");
+        request.Headers.UserAgent.ParseAdd("limits/1.3");
+        using HttpResponseMessage response = HttpClient.Send(request);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new HttpRequestException($"NBRB dynamics returned HTTP {(int)response.StatusCode}.");
+        }
+
+        string body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        using JsonDocument document = JsonDocument.Parse(body);
+        if (document.RootElement.ValueKind != JsonValueKind.Array)
+        {
+            throw new JsonException("NBRB dynamics response was not an array.");
+        }
+
+        List<(DateOnly date, decimal rate)> entries = [];
+        foreach (JsonElement element in document.RootElement.EnumerateArray())
+        {
+            if (!element.TryGetProperty("Date", out JsonElement dateElement) ||
+                !element.TryGetProperty("Cur_OfficialRate", out JsonElement rateElement))
+            {
+                continue;
+            }
+
+            if (!DateTime.TryParse(
+                    dateElement.GetString(),
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                    out DateTime parsedDate))
+            {
+                continue;
+            }
+
+            decimal rate;
+            try
+            {
+                rate = rateElement.GetDecimal();
+            }
+            catch (FormatException)
+            {
+                continue;
+            }
+            catch (InvalidOperationException)
+            {
+                continue;
+            }
+
+            entries.Add((DateOnly.FromDateTime(parsedDate), rate));
+        }
+
+        entries.Sort(static (left, right) => left.date.CompareTo(right.date));
+
+        DateOnly tomorrowDate = minskToday.AddDays(1);
+        (DateOnly date, decimal rate)? todayEntry = null;
+        (DateOnly date, decimal rate)? tomorrowEntry = null;
+        foreach ((DateOnly date, decimal rate) entry in entries)
+        {
+            if (entry.date <= minskToday)
+            {
+                todayEntry = entry;
+            }
+
+            if (entry.date == tomorrowDate)
+            {
+                tomorrowEntry = entry;
+            }
+        }
+
+        if (todayEntry is null)
+        {
+            throw new InvalidOperationException("NBRB dynamics contained no USD rate for today.");
+        }
+
+        return (
+            todayEntry.Value.rate,
+            todayEntry.Value.date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+            tomorrowEntry.HasValue ? tomorrowEntry.Value.rate : null,
+            tomorrowEntry.HasValue ? tomorrowEntry.Value.date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) : null);
+    }
+
+    private static (decimal price, string source) ReadEthUsd()
+    {
+        try
+        {
+            return (ReadKrakenEth(), "kraken");
+        }
+        catch (Exception exception) when (IsRatesFailure(exception))
+        {
+            return (ReadCoinbaseEth(), "coinbase");
+        }
+    }
+
+    private static decimal ReadKrakenEth()
+    {
+        using HttpRequestMessage request = new(HttpMethod.Get, "https://api.kraken.com/0/public/Ticker?pair=ETHUSD");
+        request.Headers.Accept.ParseAdd("application/json");
+        request.Headers.UserAgent.ParseAdd("limits/1.3");
+        using HttpResponseMessage response = HttpClient.Send(request);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new HttpRequestException($"Kraken ticker returned HTTP {(int)response.StatusCode}.");
+        }
+
+        string body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        using JsonDocument document = JsonDocument.Parse(body);
+        JsonElement root = document.RootElement;
+        if (root.TryGetProperty("error", out JsonElement errorElement) &&
+            errorElement.ValueKind == JsonValueKind.Array &&
+            errorElement.GetArrayLength() > 0)
+        {
+            throw new InvalidOperationException("Kraken ticker returned an error.");
+        }
+
+        if (!root.TryGetProperty("result", out JsonElement result) ||
+            !result.TryGetProperty("XETHZUSD", out JsonElement pair) ||
+            !pair.TryGetProperty("c", out JsonElement close) ||
+            close.ValueKind != JsonValueKind.Array)
+        {
+            throw new JsonException("Kraken ticker response was unexpected.");
+        }
+
+        foreach (JsonElement item in close.EnumerateArray())
+        {
+            if (item.ValueKind == JsonValueKind.String &&
+                decimal.TryParse(item.GetString(), NumberStyles.Any, CultureInfo.InvariantCulture, out decimal price))
+            {
+                return price;
+            }
+
+            if (item.ValueKind == JsonValueKind.Number && item.TryGetDecimal(out decimal numericPrice))
+            {
+                return numericPrice;
+            }
+        }
+
+        throw new InvalidOperationException("Kraken ticker contained no ETH price.");
+    }
+
+    private static decimal ReadCoinbaseEth()
+    {
+        using HttpRequestMessage request = new(HttpMethod.Get, "https://api.coinbase.com/v2/prices/ETH-USD/spot");
+        request.Headers.Accept.ParseAdd("application/json");
+        request.Headers.UserAgent.ParseAdd("limits/1.3");
+        using HttpResponseMessage response = HttpClient.Send(request);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new HttpRequestException($"Coinbase spot returned HTTP {(int)response.StatusCode}.");
+        }
+
+        string body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        using JsonDocument document = JsonDocument.Parse(body);
+        if (!document.RootElement.TryGetProperty("data", out JsonElement data) ||
+            !data.TryGetProperty("amount", out JsonElement amount) ||
+            amount.ValueKind != JsonValueKind.String ||
+            !decimal.TryParse(amount.GetString(), NumberStyles.Any, CultureInfo.InvariantCulture, out decimal price))
+        {
+            throw new JsonException("Coinbase spot response was unexpected.");
+        }
+
+        return price;
+    }
+
+    private static bool IsRatesFailure(Exception exception)
+    {
+        return exception is
+            HttpRequestException or
+            TaskCanceledException or
+            IOException or
+            JsonException or
+            InvalidOperationException or
+            FormatException;
+    }
+
+    private static string GetSafeErrorMessage(Exception exception)
+    {
+        return exception switch
+        {
+            TaskCanceledException => "Rates request timed out.",
+            HttpRequestException => "Rates HTTP request failed.",
+            _ => "Rates response parsing failed."
+        };
+    }
+}
+
+internal sealed record GcalEvent(string Title, string? Start, string? End, bool AllDay);
+
+internal sealed record GcalSnapshot(
+    bool Configured,
+    string Date,
+    IReadOnlyList<GcalEvent> Events,
+    DateTimeOffset FetchedAt,
+    DateTimeOffset Timestamp,
+    string? Error);
+
+internal sealed record GcalReadResult(GcalSnapshot? Snapshot, string? ErrorMessage);
+
+internal sealed class GcalReader
+{
+    private static readonly TimeSpan CacheTtl = TimeSpan.FromMinutes(15);
+    private static readonly HttpClient HttpClient = new()
+    {
+        Timeout = TimeSpan.FromSeconds(20)
+    };
+
+    private readonly object _cacheLock = new();
+    private string? _lastUrl;
+    private string? _lastBody;
+    private DateTimeOffset _fetchedAt = DateTimeOffset.MinValue;
+    private string? _fetchError;
+
+    public string ConfigPath { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "limits",
+        "google-ical.json");
+
+    public GcalReadResult ReadLatestSnapshot()
+    {
+        string? url = ReadConfiguredUrl();
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return new GcalReadResult(
+                new GcalSnapshot(false, GcalParser.MinskTodayString(), [], DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, null),
+                null);
+        }
+
+        lock (_cacheLock)
+        {
+            if (!string.Equals(_lastUrl, url, StringComparison.Ordinal) ||
+                _lastBody is null ||
+                DateTimeOffset.UtcNow - _fetchedAt >= CacheTtl)
+            {
+                try
+                {
+                    _lastBody = Fetch(url);
+                    _lastUrl = url;
+                    _fetchedAt = DateTimeOffset.UtcNow;
+                    _fetchError = null;
+                }
+                catch (Exception exception) when (IsGcalFailure(exception))
+                {
+                    _fetchError = GetSafeErrorMessage(exception);
+                    if (_lastBody is null || !string.Equals(_lastUrl, url, StringComparison.Ordinal))
+                    {
+                        return new GcalReadResult(
+                            new GcalSnapshot(true, GcalParser.MinskTodayString(), [], DateTimeOffset.MinValue, DateTimeOffset.UtcNow, _fetchError),
+                            _fetchError);
+                    }
+                }
+            }
+
+            try
+            {
+                (string date, List<GcalEvent> events) = GcalParser.ExtractToday(_lastBody!);
+                return new GcalReadResult(
+                    new GcalSnapshot(true, date, events, _fetchedAt, DateTimeOffset.UtcNow, _fetchError),
+                    _fetchError);
+            }
+            catch (Exception exception) when (IsGcalFailure(exception))
+            {
+                string error = GetSafeErrorMessage(exception);
+                return new GcalReadResult(
+                    new GcalSnapshot(true, GcalParser.MinskTodayString(), [], _fetchedAt, DateTimeOffset.UtcNow, error),
+                    error);
+            }
+        }
+    }
+
+    private string? ReadConfiguredUrl()
+    {
+        try
+        {
+            if (!File.Exists(ConfigPath))
+            {
+                return null;
+            }
+
+            using JsonDocument document = JsonDocument.Parse(File.ReadAllText(ConfigPath));
+            if (document.RootElement.ValueKind != JsonValueKind.Object ||
+                !document.RootElement.TryGetProperty("icalUrl", out JsonElement urlElement) ||
+                urlElement.ValueKind != JsonValueKind.String)
+            {
+                return null;
+            }
+
+            string? value = urlElement.GetString();
+            return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static string Fetch(string url)
+    {
+        using HttpRequestMessage request = new(HttpMethod.Get, url);
+        request.Headers.Accept.ParseAdd("text/calendar");
+        request.Headers.UserAgent.ParseAdd("limits/1.3");
+        using HttpResponseMessage response = HttpClient.Send(request);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new HttpRequestException($"Calendar feed returned HTTP {(int)response.StatusCode}.");
+        }
+
+        return response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+    }
+
+    private static bool IsGcalFailure(Exception exception)
+    {
+        return exception is
+            HttpRequestException or
+            TaskCanceledException or
+            IOException or
+            JsonException or
+            InvalidOperationException or
+            FormatException;
+    }
+
+    private static string GetSafeErrorMessage(Exception exception)
+    {
+        return exception switch
+        {
+            TaskCanceledException => "Calendar request timed out.",
+            HttpRequestException => "Calendar HTTP request failed.",
+            _ => "Calendar feed parsing failed."
+        };
+    }
+}
+
+internal static class GcalParser
+{
+    private static readonly TimeSpan MinskOffset = TimeSpan.FromHours(3);
+    private static readonly StringComparer OrdinalIgnore = StringComparer.OrdinalIgnoreCase;
+
+    public static string MinskTodayString() => MinskToday().ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+
+    private static DateOnly MinskToday() => DateOnly.FromDateTime(DateTimeOffset.UtcNow.UtcDateTime.Add(MinskOffset));
+
+    public static (string date, List<GcalEvent> events) ExtractToday(string ics)
+    {
+        DateOnly today = MinskToday();
+        List<Dictionary<string, List<(string parameters, string value)>>> vevents = ParseVevents(ics);
+        List<(GcalEvent ev, DateTime sortKey, bool allDayFirst)> found = [];
+
+        foreach (Dictionary<string, List<(string parameters, string value)>> props in vevents)
+        {
+            try
+            {
+                foreach ((GcalEvent ev, DateTime sortKey, bool allDayFirst) occurrence in ExpandEvent(props, today))
+                {
+                    found.Add(occurrence);
+                }
+            }
+            catch (Exception exception) when (exception is FormatException or InvalidOperationException or ArgumentOutOfRangeException)
+            {
+                continue;
+            }
+        }
+
+        found.Sort(static (left, right) =>
+        {
+            int order = right.allDayFirst.CompareTo(left.allDayFirst);
+            if (order != 0)
+            {
+                return order;
+            }
+
+            order = left.sortKey.CompareTo(right.sortKey);
+            return order != 0 ? order : string.Compare(left.ev.Title, right.ev.Title, StringComparison.OrdinalIgnoreCase);
+        });
+
+        return (today.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), found.Select(item => item.ev).ToList());
+    }
+
+    private static List<Dictionary<string, List<(string parameters, string value)>>> ParseVevents(string ics)
+    {
+        List<string> lines = [];
+        StringBuilder? current = null;
+        foreach (string raw in ics.Split(['\r', '\n']))
+        {
+            if (raw.Length == 0)
+            {
+                continue;
+            }
+
+            if (raw[0] == ' ' || raw[0] == '\t')
+            {
+                current?.Append(raw.Substring(1));
+                continue;
+            }
+
+            if (current is not null)
+            {
+                lines.Add(current.ToString());
+            }
+
+            current = new StringBuilder(raw);
+        }
+
+        if (current is not null)
+        {
+            lines.Add(current.ToString());
+        }
+
+        List<Dictionary<string, List<(string parameters, string value)>>> events = [];
+        Dictionary<string, List<(string parameters, string value)>>? ev = null;
+        foreach (string line in lines)
+        {
+            int colon = line.IndexOf(':');
+            if (colon < 0)
+            {
+                continue;
+            }
+
+            string head = line.Substring(0, colon);
+            string value = line.Substring(colon + 1);
+            string[] headParts = head.Split(';');
+            string name = headParts[0].Trim().ToUpperInvariant();
+            string parameters = headParts.Length > 1 ? string.Join(";", headParts.Skip(1)) : string.Empty;
+
+            if (name == "BEGIN" && value.Trim().Equals("VEVENT", StringComparison.OrdinalIgnoreCase))
+            {
+                ev = new Dictionary<string, List<(string parameters, string value)>>(OrdinalIgnore);
+            }
+            else if (name == "END" && value.Trim().Equals("VEVENT", StringComparison.OrdinalIgnoreCase))
+            {
+                if (ev is not null)
+                {
+                    events.Add(ev);
+                }
+
+                ev = null;
+            }
+            else if (ev is not null)
+            {
+                if (!ev.TryGetValue(name, out List<(string parameters, string value)>? list))
+                {
+                    list = [];
+                    ev[name] = list;
+                }
+
+                list.Add((parameters, value));
+            }
+        }
+
+        return events;
+    }
+
+    private static List<(GcalEvent ev, DateTime sortKey, bool allDayFirst)> ExpandEvent(
+        Dictionary<string, List<(string parameters, string value)>> props,
+        DateOnly today)
+    {
+        List<(GcalEvent ev, DateTime sortKey, bool allDayFirst)> result = [];
+        if (IsCancelled(props))
+        {
+            return result;
+        }
+
+        string title = Unescape(GetFirst(props, "SUMMARY") ?? "(no title)");
+        (bool isDate, DateTime start) startMoment = ParseMoment(
+            GetFirst(props, "DTSTART") ?? throw new InvalidOperationException("VEVENT has no DTSTART."),
+            GetFirstParameters(props, "DTSTART"));
+        DateTime endMoment = startMoment.start;
+        string? dtend = GetFirst(props, "DTEND");
+        if (dtend is not null)
+        {
+            endMoment = ParseMoment(dtend, GetFirstParameters(props, "DTEND")).wall;
+        }
+        else
+        {
+            string? duration = GetFirst(props, "DURATION");
+            if (duration is not null)
+            {
+                endMoment = startMoment.start.Add(ParseDuration(duration));
+            }
+        }
+
+        HashSet<string> exdates = ReadExdates(props, startMoment.isDate);
+        string? rrule = GetFirst(props, "RRULE");
+        Dictionary<string, string>? rule = rrule is null ? null : ParseRule(rrule);
+        bool supportedRule = rule is not null && IsSupportedRule(rule);
+        List<(DateTime start, DateTime end)> candidates = [];
+
+        if (rule is null || !supportedRule)
+        {
+            candidates.Add((startMoment.start, endMoment));
+        }
+        else
+        {
+            candidates.AddRange(ExpandRecurrence(startMoment.start, endMoment, startMoment.isDate, rule, today));
+        }
+
+        foreach ((string parameters, string value) rdate in GetAll(props, "RDATE"))
+        {
+            try
+            {
+                (bool _, DateTime wall) moment = ParseMoment(rdate.value, rdate.parameters);
+                candidates.Add((moment.wall, moment.wall + (endMoment - startMoment.start)));
+            }
+            catch (Exception exception) when (exception is FormatException or InvalidOperationException or ArgumentOutOfRangeException)
+            {
+                continue;
+            }
+        }
+
+        foreach ((DateTime start, DateTime end) candidate in candidates)
+        {
+            if (!OverlapsToday(candidate.start, candidate.end, startMoment.isDate, today))
+            {
+                continue;
+            }
+
+            if (exdates.Contains(ExdateKey(candidate.start, startMoment.isDate)))
+            {
+                continue;
+            }
+
+            result.Add((FormatEvent(title, candidate.start, candidate.end, startMoment.isDate), candidate.start, startMoment.isDate));
+        }
+
+        return result;
+    }
+
+    private static bool IsCancelled(Dictionary<string, List<(string parameters, string value)>> props)
+    {
+        string? status = GetFirst(props, "STATUS");
+        return status is not null && status.Trim().Equals("CANCELLED", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? GetFirst(Dictionary<string, List<(string parameters, string value)>> props, string name)
+    {
+        return props.TryGetValue(name, out List<(string parameters, string value)>? list) && list.Count > 0
+            ? list[0].value
+            : null;
+    }
+
+    private static string GetFirstParameters(Dictionary<string, List<(string parameters, string value)>> props, string name)
+    {
+        return props.TryGetValue(name, out List<(string parameters, string value)>? list) && list.Count > 0
+            ? list[0].parameters
+            : string.Empty;
+    }
+
+    private static List<(string parameters, string value)> GetAll(Dictionary<string, List<(string parameters, string value)>> props, string name)
+    {
+        return props.TryGetValue(name, out List<(string parameters, string value)>? list) ? list : [];
+    }
+
+    private static string Unescape(string value)
+    {
+        return value.Replace("\\n", "\n").Replace("\\N", "\n").Replace("\\,", ",").Replace("\\;", ";").Replace("\\\\", "\\");
+    }
+
+    private static string? GetParam(string parameters, string key)
+    {
+        foreach (string part in parameters.Split(';'))
+        {
+            int equals = part.IndexOf('=');
+            if (equals > 0 && part.Substring(0, equals).Trim().Equals(key, StringComparison.OrdinalIgnoreCase))
+            {
+                return part.Substring(equals + 1).Trim().Trim('"');
+            }
+        }
+
+        return null;
+    }
+
+    private static (bool isDate, DateTime wall) ParseMoment(string value, string parameters)
+    {
+        string text = value.Trim();
+        bool valueIsDate = (GetParam(parameters, "VALUE") ?? string.Empty).Equals("DATE", StringComparison.OrdinalIgnoreCase);
+        if (valueIsDate || (text.Length == 8 && !text.Contains('T')))
+        {
+            DateOnly date = DateOnly.ParseExact(text, "yyyyMMdd", CultureInfo.InvariantCulture);
+            return (true, date.ToDateTime(TimeOnly.MinValue));
+        }
+
+        bool utc = text.EndsWith('Z') || text.EndsWith('z');
+        if (utc)
+        {
+            text = text.Substring(0, text.Length - 1);
+        }
+
+        DateTime wall = DateTime.ParseExact(text, "yyyyMMdd'T'HHmmss", CultureInfo.InvariantCulture, DateTimeStyles.None);
+        if (utc)
+        {
+            return (false, wall.Add(MinskOffset));
+        }
+
+        string? tzid = GetParam(parameters, "TZID");
+        return (false, tzid is null ? wall : ConvertToMinsk(wall, tzid));
+    }
+
+    private static DateTime ConvertToMinsk(DateTime wall, string tzid)
+    {
+        if (tzid.Equals("UTC", StringComparison.OrdinalIgnoreCase) ||
+            tzid.Equals("GMT", StringComparison.OrdinalIgnoreCase) ||
+            tzid.Equals("Etc/UTC", StringComparison.OrdinalIgnoreCase))
+        {
+            return wall.Add(MinskOffset);
+        }
+
+        try
+        {
+            TimeZoneInfo zone = TimeZoneInfo.FindSystemTimeZoneById(tzid);
+            return TimeZoneInfo.ConvertTimeToUtc(DateTime.SpecifyKind(wall, DateTimeKind.Unspecified), zone).Add(MinskOffset);
+        }
+        catch (Exception exception) when (exception is TimeZoneNotFoundException or InvalidTimeZoneException or ArgumentException)
+        {
+            return wall;
+        }
+    }
+
+    private static TimeSpan ParseDuration(string value)
+    {
+        string text = value.Trim();
+        bool negative = text.StartsWith('-');
+        text = text.TrimStart('-', '+');
+        if (!text.StartsWith('P'))
+        {
+            throw new FormatException("Unsupported DURATION format.");
+        }
+
+        text = text.Substring(1);
+        int days = 0;
+        int hours = 0;
+        int minutes = 0;
+        int seconds = 0;
+        int tIndex = text.IndexOf('T');
+        string datePart = tIndex < 0 ? text : text.Substring(0, tIndex);
+        string timePart = tIndex < 0 ? string.Empty : text.Substring(tIndex + 1);
+
+        int dIndex = datePart.IndexOf('D');
+        if (dIndex >= 0)
+        {
+            days = int.Parse(datePart.Substring(0, dIndex), CultureInfo.InvariantCulture);
+        }
+
+        foreach ((char designator, Action<int> assign) in new (char, Action<int>)[]
+                 {
+                     ('H', v => hours = v),
+                     ('M', v => minutes = v),
+                     ('S', v => seconds = v)
+                 })
+        {
+            int index = timePart.IndexOf(designator);
+            if (index < 0)
+            {
+                continue;
+            }
+
+            int start = index;
+            while (start > 0 && char.IsDigit(timePart[start - 1]))
+            {
+                start -= 1;
+            }
+
+            assign(int.Parse(timePart.Substring(start, index - start), CultureInfo.InvariantCulture));
+            timePart = timePart.Substring(0, start) + timePart.Substring(index + 1);
+        }
+
+        TimeSpan span = new(days, hours, minutes, seconds);
+        return negative ? -span : span;
+    }
+
+    private static Dictionary<string, string> ParseRule(string rrule)
+    {
+        Dictionary<string, string> rule = new(OrdinalIgnore);
+        foreach (string part in rrule.Split(';'))
+        {
+            int equals = part.IndexOf('=');
+            if (equals > 0)
+            {
+                rule[part.Substring(0, equals).Trim().ToUpperInvariant()] = part.Substring(equals + 1).Trim();
+            }
+        }
+
+        return rule;
+    }
+
+    private static bool IsSupportedRule(Dictionary<string, string> rule)
+    {
+        if (!rule.TryGetValue("FREQ", out string? freq))
+        {
+            return false;
+        }
+
+        return freq.ToUpperInvariant() switch
+        {
+            "DAILY" => true,
+            "WEEKLY" => true,
+            "MONTHLY" => !rule.ContainsKey("BYDAY"),
+            "YEARLY" => !rule.ContainsKey("BYDAY") && !rule.ContainsKey("BYMONTH") &&
+                        !rule.ContainsKey("BYMONTHDAY") && !rule.ContainsKey("BYYEARDAY") &&
+                        !rule.ContainsKey("BYWEEKNO"),
+            _ => false
+        };
+    }
+
+    private static int GetInt(Dictionary<string, string> rule, string key, int fallback)
+    {
+        return rule.TryGetValue(key, out string? raw) &&
+               int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed) && parsed > 0
+            ? parsed
+            : fallback;
+    }
+
+    private static int? GetCount(Dictionary<string, string> rule)
+    {
+        return rule.TryGetValue("COUNT", out string? raw) &&
+               int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed) && parsed > 0
+            ? parsed
+            : null;
+    }
+
+    private static DateTime? GetUntil(Dictionary<string, string> rule)
+    {
+        if (!rule.TryGetValue("UNTIL", out string? raw) || string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        try
+        {
+            (bool isDate, DateTime wall) moment = ParseMoment(raw, string.Empty);
+            return moment.isDate ? moment.wall.AddDays(1).AddTicks(-1) : moment.wall;
+        }
+        catch (Exception exception) when (exception is FormatException or InvalidOperationException or ArgumentOutOfRangeException)
+        {
+            return null;
+        }
+    }
+
+    private static List<DayOfWeek> ParseByDay(Dictionary<string, string> rule, DayOfWeek fallback)
+    {
+        List<DayOfWeek> days = [];
+        if (!rule.TryGetValue("BYDAY", out string? raw) || string.IsNullOrWhiteSpace(raw))
+        {
+            return [fallback];
+        }
+
+        foreach (string token in raw.Split(','))
+        {
+            string day = new string(token.Trim().ToUpperInvariant().Where(char.IsLetter).ToArray());
+            DayOfWeek? parsed = day switch
+            {
+                "MO" => DayOfWeek.Monday,
+                "TU" => DayOfWeek.Tuesday,
+                "WE" => DayOfWeek.Wednesday,
+                "TH" => DayOfWeek.Thursday,
+                "FR" => DayOfWeek.Friday,
+                "SA" => DayOfWeek.Saturday,
+                "SU" => DayOfWeek.Sunday,
+                _ => null
+            };
+
+            if (parsed is not null && !days.Contains(parsed.Value))
+            {
+                days.Add(parsed.Value);
+            }
+        }
+
+        if (days.Count == 0)
+        {
+            return [fallback];
+        }
+
+        days.Sort(static (left, right) => DayOrder(left).CompareTo(DayOrder(right)));
+        return days;
+    }
+
+    private static int DayOrder(DayOfWeek day) => ((int)day - (int)DayOfWeek.Monday + 7) % 7;
+
+    private static DateOnly MondayOf(DateOnly date) => date.AddDays(-DayOrder(date.DayOfWeek));
+
+    private static HashSet<string> ReadExdates(Dictionary<string, List<(string parameters, string value)>> props, bool allDay)
+    {
+        HashSet<string> exdates = new(StringComparer.Ordinal);
+        foreach ((string parameters, string value) exdate in GetAll(props, "EXDATE"))
+        {
+            foreach (string token in exdate.value.Split(','))
+            {
+                if (string.IsNullOrWhiteSpace(token))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    (bool _, DateTime wall) moment = ParseMoment(token, exdate.parameters);
+                    exdates.Add(ExdateKey(moment.wall, allDay));
+                }
+                catch (Exception exception) when (exception is FormatException or InvalidOperationException or ArgumentOutOfRangeException)
+                {
+                    continue;
+                }
+            }
+        }
+
+        return exdates;
+    }
+
+    private static string ExdateKey(DateTime wall, bool allDay)
+    {
+        return allDay
+            ? wall.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
+            : wall.ToString("yyyy-MM-ddTHH:mm", CultureInfo.InvariantCulture);
+    }
+
+    private static List<(DateTime start, DateTime end)> ExpandRecurrence(
+        DateTime startWall,
+        DateTime endWall,
+        bool allDay,
+        Dictionary<string, string> rule,
+        DateOnly today)
+    {
+        List<(DateTime start, DateTime end)> result = [];
+        TimeSpan duration = endWall - startWall;
+        string freq = rule["FREQ"].ToUpperInvariant();
+        int interval = GetInt(rule, "INTERVAL", 1);
+        int? count = GetCount(rule);
+        DateTime? until = GetUntil(rule);
+        int emitted = 0;
+        int guard = 0;
+
+        bool accept(DateTime candidate)
+        {
+            if (candidate < startWall)
+            {
+                return false;
+            }
+
+            if (until is not null && candidate > until.Value)
+            {
+                return false;
+            }
+
+            emitted += 1;
+            return DateOnly.FromDateTime(candidate) == today;
+        }
+
+        if (freq == "DAILY")
+        {
+            DateTime cursor = startWall;
+            while (guard++ < 5000)
+            {
+                if (DateOnly.FromDateTime(cursor) > today)
+                {
+                    break;
+                }
+
+                if (accept(cursor))
+                {
+                    result.Add((cursor, cursor + duration));
+                }
+
+                if (count is not null && emitted >= count)
+                {
+                    break;
+                }
+
+                cursor = cursor.AddDays(interval);
+            }
+
+            return result;
+        }
+
+        if (freq == "WEEKLY")
+        {
+            List<DayOfWeek> days = ParseByDay(rule, startWall.DayOfWeek);
+            DateOnly anchorMonday = MondayOf(DateOnly.FromDateTime(startWall));
+            int week = 0;
+            while (guard++ < 2600)
+            {
+                DateOnly weekMonday = anchorMonday.AddDays(week * 7 * interval);
+                if (weekMonday > today)
+                {
+                    break;
+                }
+
+                foreach (DayOfWeek day in days)
+                {
+                    DateTime candidate = weekMonday.AddDays(DayOrder(day)).ToDateTime(TimeOnly.FromTimeSpan(startWall.TimeOfDay));
+                    if (candidate < startWall)
+                    {
+                        continue;
+                    }
+
+                    if (until is not null && candidate > until.Value)
+                    {
+                        return result;
+                    }
+
+                    if (accept(candidate))
+                    {
+                        result.Add((candidate, candidate + duration));
+                    }
+
+                    if (count is not null && emitted >= count)
+                    {
+                        return result;
+                    }
+                }
+
+                week += 1;
+            }
+
+            return result;
+        }
+
+        if (freq == "MONTHLY")
+        {
+            List<int> monthDays = [];
+            if (rule.TryGetValue("BYMONTHDAY", out string? rawDays))
+            {
+                foreach (string token in rawDays.Split(','))
+                {
+                    if (int.TryParse(token.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int day))
+                    {
+                        monthDays.Add(day);
+                    }
+                }
+            }
+
+            if (monthDays.Count == 0)
+            {
+                monthDays.Add(startWall.Day);
+            }
+
+            int month = 0;
+            while (guard++ < 1200)
+            {
+                DateTime anchor = startWall.AddMonths(month * interval);
+                DateOnly anchorMonth = new(anchor.Year, anchor.Month, 1);
+                if (anchorMonth > today)
+                {
+                    break;
+                }
+
+                int daysInMonth = DateTime.DaysInMonth(anchor.Year, anchor.Month);
+                foreach (int monthDay in monthDays.Distinct().OrderBy(static day => day))
+                {
+                    int day = monthDay > 0 ? monthDay : daysInMonth + monthDay + 1;
+                    if (day < 1 || day > daysInMonth)
+                    {
+                        continue;
+                    }
+
+                    DateTime candidate = new(anchor.Year, anchor.Month, day, startWall.Hour, startWall.Minute, startWall.Second);
+                    if (candidate < startWall)
+                    {
+                        continue;
+                    }
+
+                    if (until is not null && candidate > until.Value)
+                    {
+                        return result;
+                    }
+
+                    if (accept(candidate))
+                    {
+                        result.Add((candidate, candidate + duration));
+                    }
+
+                    if (count is not null && emitted >= count)
+                    {
+                        return result;
+                    }
+                }
+
+                month += 1;
+            }
+
+            return result;
+        }
+
+        if (freq == "YEARLY")
+        {
+            int year = 0;
+            while (guard++ < 200)
+            {
+                DateTime candidate;
+                try
+                {
+                    int daysInMonth = DateTime.DaysInMonth(startWall.Year + year * interval, startWall.Month);
+                    candidate = new DateTime(
+                        startWall.Year + year * interval,
+                        startWall.Month,
+                        Math.Min(startWall.Day, daysInMonth),
+                        startWall.Hour,
+                        startWall.Minute,
+                        startWall.Second);
+                }
+                catch (ArgumentOutOfRangeException)
+                {
+                    break;
+                }
+
+                if (DateOnly.FromDateTime(candidate) > today)
+                {
+                    break;
+                }
+
+                if (accept(candidate))
+                {
+                    result.Add((candidate, candidate + duration));
+                }
+
+                if (count is not null && emitted >= count)
+                {
+                    break;
+                }
+
+                year += 1;
+            }
+
+            return result;
+        }
+
+        return result;
+    }
+
+    private static bool OverlapsToday(DateTime start, DateTime end, bool allDay, DateOnly today)
+    {
+        if (allDay)
+        {
+            DateOnly startDate = DateOnly.FromDateTime(start);
+            DateOnly endDate = DateOnly.FromDateTime(end);
+            if (endDate <= startDate)
+            {
+                return startDate == today;
+            }
+
+            return startDate <= today && today < endDate;
+        }
+
+        return DateOnly.FromDateTime(start) <= today && today <= DateOnly.FromDateTime(end);
+    }
+
+    private static GcalEvent FormatEvent(string title, DateTime start, DateTime end, bool allDay)
+    {
+        if (allDay)
+        {
+            return new GcalEvent(title, null, null, true);
+        }
+
+        return new GcalEvent(
+            title,
+            start.ToString("HH:mm", CultureInfo.InvariantCulture),
+            end > start ? end.ToString("HH:mm", CultureInfo.InvariantCulture) : null,
+            false);
+    }
+}
+
+internal sealed record UnetCredential(string Username, string Password);
+
+internal sealed class UnetCredentialStore
+{
+    public string CredentialsPath { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "limits",
+        "unet-credentials.json");
+
+    public IReadOnlyList<UnetCredential> Load()
+    {
+        if (!File.Exists(CredentialsPath))
+        {
+            return [];
+        }
+
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(File.ReadAllText(CredentialsPath));
+            if (document.RootElement.ValueKind != JsonValueKind.Object ||
+                !document.RootElement.TryGetProperty("accounts", out JsonElement accountsElement) ||
+                accountsElement.ValueKind != JsonValueKind.Array)
+            {
+                return [];
+            }
+
+            List<UnetCredential> credentials = [];
+            foreach (JsonElement accountElement in accountsElement.EnumerateArray())
+            {
+                string? username = ReadString(accountElement, "username");
+                string? protectedPassword = ReadString(accountElement, "passwordProtected");
+                if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(protectedPassword))
+                {
+                    continue;
+                }
+
+                byte[] encryptedPassword = Convert.FromBase64String(protectedPassword);
+                try
+                {
+                    byte[] clearPassword = ProtectedData.Unprotect(
+                        encryptedPassword,
+                        optionalEntropy: null,
+                        DataProtectionScope.CurrentUser);
+                    try
+                    {
+                        string password = Encoding.UTF8.GetString(clearPassword);
+                        if (!string.IsNullOrWhiteSpace(password))
+                        {
+                            credentials.Add(new UnetCredential(username.Trim(), password));
+                        }
+                    }
+                    finally
+                    {
+                        CryptographicOperations.ZeroMemory(clearPassword);
+                    }
+                }
+                finally
+                {
+                    CryptographicOperations.ZeroMemory(encryptedPassword);
+                }
+            }
+
+            return credentials;
+        }
+        catch (Exception exception) when (exception is
+            IOException or
+            UnauthorizedAccessException or
+            JsonException or
+            FormatException or
+            CryptographicException)
+        {
+            throw new InvalidOperationException("UNET credential storage could not be read.", exception);
+        }
+    }
+
+    private static string? ReadString(JsonElement parent, string propertyName)
+    {
+        if (!parent.TryGetProperty(propertyName, out JsonElement value) ||
+            value.ValueKind != JsonValueKind.String)
+        {
+            return null;
+        }
+
+        return value.GetString();
+    }
+}
+
+internal sealed class UnetBalanceReader
+{
+    private static readonly Uri LoginUri = new("https://my.unet.by/login");
+    private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);
+    private const string Currency = "BYN";
+    private readonly UnetCredentialStore _credentialStore = new();
+
+    public string CredentialsPath => _credentialStore.CredentialsPath;
+
+    public UnetBalanceReadResult ReadLatestSnapshot()
+    {
+        try
+        {
+            IReadOnlyList<UnetCredential> credentials = _credentialStore.Load();
+            if (credentials.Count == 0)
+            {
+                throw new InvalidOperationException($"No UNET credentials were found at {CredentialsPath}.");
+            }
+
+            List<UnetAccountBalance> accounts = [];
+            foreach (UnetCredential credential in credentials)
+            {
+                try
+                {
+                    decimal balance = ReadAccountBalance(credential);
+                    accounts.Add(new UnetAccountBalance(credential.Username, balance, Currency, true, null));
+                }
+                catch (Exception exception) when (IsAccountReadFailure(exception))
+                {
+                    accounts.Add(new UnetAccountBalance(
+                        credential.Username,
+                        null,
+                        Currency,
+                        false,
+                        GetSafeErrorMessage(exception)));
+                }
+            }
+
+            return new UnetBalanceReadResult(
+                new UnetBalanceSnapshot(accounts, DateTimeOffset.UtcNow),
+                null);
+        }
+        catch (Exception exception) when (exception is
+            HttpRequestException or
+            TaskCanceledException or
+            IOException or
+            JsonException or
+            InvalidOperationException or
+            UnauthorizedAccessException or
+            FormatException or
+            CryptographicException)
+        {
+            return new UnetBalanceReadResult(null, GetSafeErrorMessage(exception));
+        }
+    }
+
+    private static decimal ReadAccountBalance(UnetCredential credential)
+    {
+        using HttpClientHandler handler = new()
+        {
+            AllowAutoRedirect = true,
+            UseCookies = true,
+            CookieContainer = new CookieContainer()
+        };
+        using HttpClient client = new(handler)
+        {
+            Timeout = RequestTimeout
+        };
+        client.DefaultRequestHeaders.Accept.ParseAdd("text/html,application/xhtml+xml");
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("limits/1.3");
+
+        using HttpRequestMessage pageRequest = new(HttpMethod.Get, LoginUri);
+        using HttpResponseMessage pageResponse = client.Send(pageRequest);
+        if (!pageResponse.IsSuccessStatusCode)
+        {
+            throw new HttpRequestException($"UNET login page returned HTTP {(int)pageResponse.StatusCode}.");
+        }
+
+        string loginHtml = pageResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        string csrfToken = ReadInputValue(loginHtml, "_csrf_token")
+            ?? throw new InvalidOperationException("UNET login form did not include a CSRF token.");
+
+        using FormUrlEncodedContent form = new(new Dictionary<string, string>
+        {
+            ["username"] = credential.Username,
+            ["password"] = credential.Password,
+            ["_csrf_token"] = csrfToken
+        });
+        using HttpRequestMessage loginRequest = new(HttpMethod.Post, LoginUri)
+        {
+            Content = form
+        };
+        loginRequest.Headers.Referrer = LoginUri;
+
+        using HttpResponseMessage accountResponse = client.Send(loginRequest);
+        if (!accountResponse.IsSuccessStatusCode)
+        {
+            throw new HttpRequestException($"UNET login returned HTTP {(int)accountResponse.StatusCode}.");
+        }
+
+        string accountHtml = accountResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        return ParseBalance(accountHtml);
+    }
+
+    private static decimal ParseBalance(string html)
+    {
+        int balanceLabelIndex = html.IndexOf("Текущий баланс", StringComparison.OrdinalIgnoreCase);
+        if (balanceLabelIndex < 0)
+        {
+            throw new InvalidOperationException("UNET login was not accepted or the balance row changed.");
+        }
+
+        int rowEnd = html.IndexOf("</tr>", balanceLabelIndex, StringComparison.OrdinalIgnoreCase);
+        int spanStart = html.IndexOf("<span", balanceLabelIndex, StringComparison.OrdinalIgnoreCase);
+        if (rowEnd < 0 || spanStart < 0 || spanStart >= rowEnd)
+        {
+            throw new InvalidOperationException("UNET balance value was not found.");
+        }
+
+        int spanEnd = html.IndexOf('>', spanStart);
+        if (spanEnd < 0 || spanEnd >= rowEnd)
+        {
+            throw new InvalidOperationException("UNET balance value was not found.");
+        }
+
+        string? balanceText = ReadAttribute(html[spanStart..(spanEnd + 1)], "title");
+        if (decimal.TryParse(balanceText, NumberStyles.Number, CultureInfo.InvariantCulture, out decimal balance))
+        {
+            return balance;
+        }
+
+        throw new InvalidOperationException("UNET balance value was invalid.");
+    }
+
+    private static string? ReadInputValue(string html, string inputName)
+    {
+        int searchIndex = 0;
+        while (searchIndex < html.Length)
+        {
+            int inputStart = html.IndexOf("<input", searchIndex, StringComparison.OrdinalIgnoreCase);
+            if (inputStart < 0)
+            {
+                return null;
+            }
+
+            int inputEnd = html.IndexOf('>', inputStart);
+            if (inputEnd < 0)
+            {
+                return null;
+            }
+
+            string inputTag = html[inputStart..(inputEnd + 1)];
+            if (string.Equals(ReadAttribute(inputTag, "name"), inputName, StringComparison.OrdinalIgnoreCase))
+            {
+                return ReadAttribute(inputTag, "value");
+            }
+
+            searchIndex = inputEnd + 1;
+        }
+
+        return null;
+    }
+
+    private static string? ReadAttribute(string tag, string attributeName)
+    {
+        int searchIndex = 0;
+        while (searchIndex < tag.Length)
+        {
+            int attributeStart = tag.IndexOf(attributeName, searchIndex, StringComparison.OrdinalIgnoreCase);
+            if (attributeStart < 0)
+            {
+                return null;
+            }
+
+            int attributeEnd = attributeStart + attributeName.Length;
+            bool validStart = attributeStart == 0 || !IsAttributeNameCharacter(tag[attributeStart - 1]);
+            bool validEnd = attributeEnd >= tag.Length || !IsAttributeNameCharacter(tag[attributeEnd]);
+            if (!validStart || !validEnd)
+            {
+                searchIndex = attributeEnd;
+                continue;
+            }
+
+            int equalsIndex = attributeEnd;
+            while (equalsIndex < tag.Length && char.IsWhiteSpace(tag[equalsIndex]))
+            {
+                equalsIndex++;
+            }
+
+            if (equalsIndex >= tag.Length || tag[equalsIndex] != '=')
+            {
+                searchIndex = attributeEnd;
+                continue;
+            }
+
+            int valueStart = equalsIndex + 1;
+            while (valueStart < tag.Length && char.IsWhiteSpace(tag[valueStart]))
+            {
+                valueStart++;
+            }
+
+            if (valueStart >= tag.Length)
+            {
+                return null;
+            }
+
+            char quote = tag[valueStart];
+            if (quote is '"' or '\'')
+            {
+                int valueEnd = tag.IndexOf(quote, valueStart + 1);
+                return valueEnd < 0
+                    ? null
+                    : WebUtility.HtmlDecode(tag[(valueStart + 1)..valueEnd]);
+            }
+
+            int unquotedEnd = valueStart;
+            while (unquotedEnd < tag.Length && !char.IsWhiteSpace(tag[unquotedEnd]) && tag[unquotedEnd] != '>')
+            {
+                unquotedEnd++;
+            }
+
+            return WebUtility.HtmlDecode(tag[valueStart..unquotedEnd]);
+        }
+
+        return null;
+    }
+
+    private static bool IsAttributeNameCharacter(char value)
+    {
+        return char.IsLetterOrDigit(value) || value is '_' or '-' or ':';
+    }
+
+    private static bool IsAccountReadFailure(Exception exception)
+    {
+        return exception is
+            HttpRequestException or
+            TaskCanceledException or
+            IOException or
+            InvalidOperationException or
+            FormatException;
+    }
+
+    private static string GetSafeErrorMessage(Exception exception)
+    {
+        return exception switch
+        {
+            TaskCanceledException => "UNET request timed out.",
+            HttpRequestException => "UNET HTTP request failed.",
+            _ => "UNET login or balance parsing failed."
+        };
+    }
+}
+
 internal sealed record DevinUsageSnapshot(
     DateTimeOffset Timestamp,
     string? PlanName,
@@ -9903,6 +11724,143 @@ internal sealed record DiskSpaceSnapshot(IReadOnlyList<DiskSpaceStatus> Drives, 
 
         return $"{letters[..2]}+";
     }
+}
+
+internal sealed class LimitWatchdog
+{
+    private const double ThresholdRemainingPercent = 5.0d;
+
+    private static readonly string PauseBatchPath =
+        @"C:\Users\flcl\Desktop\Pause Strategy Hunt.bat";
+
+    private static readonly string RunBatchPath =
+        @"C:\Users\flcl\Desktop\Run Strategy Hunt.bat";
+
+    private static readonly string AppDataPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "limits");
+
+    private static readonly string LogPath = Path.Combine(AppDataPath, "limits.log");
+    private readonly DiskMonitor _diskMonitor;
+    private string _state = "unknown";
+
+    public LimitWatchdog(DiskMonitor diskMonitor)
+    {
+        _diskMonitor = diskMonitor;
+    }
+
+    public void Check(ClaudeUsageSnapshot? snapshot)
+    {
+        Directory.CreateDirectory(AppDataPath);
+
+        string state = _state;
+        LimitUsage? usage = snapshot is null ? null : LimitUsage.FromSnapshot(snapshot);
+        DiskSpaceSnapshot disk = _diskMonitor.ReadSnapshot();
+
+        if (usage is null && !disk.HasLowDisk)
+        {
+            Log($"No action: state={state}, Claude usage unavailable, disk {disk.Summary}.");
+            return;
+        }
+
+        bool usageBelowLimit = usage is not null &&
+            (usage.FiveHourRemainingPercent < ThresholdRemainingPercent ||
+             usage.WeeklyRemainingPercent < ThresholdRemainingPercent);
+        bool belowLimit = usageBelowLimit || disk.HasLowDisk;
+
+        bool usageAvailableAgain = usage is not null &&
+            usage.FiveHourRemainingPercent > ThresholdRemainingPercent &&
+            usage.WeeklyRemainingPercent > ThresholdRemainingPercent;
+        bool availableAgain = usageAvailableAgain && !disk.HasLowDisk;
+
+        if (belowLimit && !string.Equals(state, "paused", StringComparison.OrdinalIgnoreCase))
+        {
+            Log(
+                $"Below threshold: {FormatUsage(usage)}, disk {disk.Summary}. " +
+                "Starting pause batch.");
+            StartBatch(PauseBatchPath);
+            _state = "paused";
+            return;
+        }
+
+        if (availableAgain && string.Equals(state, "paused", StringComparison.OrdinalIgnoreCase))
+        {
+            Log(
+                $"Usage and disk available again: {FormatUsage(usage)}, disk {disk.Summary}. " +
+                "Starting run batch.");
+            StartBatch(RunBatchPath);
+            _state = "running";
+            return;
+        }
+
+        if (string.Equals(state, "unknown", StringComparison.OrdinalIgnoreCase) && availableAgain)
+        {
+            _state = "running";
+        }
+
+        Log($"No action: state={state}, {FormatUsage(usage)}, disk {disk.Summary}.");
+    }
+
+    private static void StartBatch(string batchPath)
+    {
+        if (!File.Exists(batchPath))
+        {
+            Log($"Missing batch file: {batchPath}");
+            return;
+        }
+
+        ProcessStartInfo startInfo = new()
+        {
+            FileName = "cmd.exe",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = Path.GetDirectoryName(batchPath) ?? AppContext.BaseDirectory
+        };
+        startInfo.ArgumentList.Add("/d");
+        startInfo.ArgumentList.Add("/c");
+        startInfo.ArgumentList.Add("call");
+        startInfo.ArgumentList.Add(batchPath);
+
+        Process? process = Process.Start(startInfo);
+        Log($"Started '{batchPath}' pid={process?.Id.ToString(CultureInfo.InvariantCulture) ?? "unknown"}.");
+    }
+
+    private static void Log(string message)
+    {
+        try
+        {
+            Directory.CreateDirectory(AppDataPath);
+            File.AppendAllText(LogPath, $"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz} {message}{Environment.NewLine}");
+        }
+        catch
+        {
+            // Logging must not bring down the tray app.
+        }
+    }
+
+    private static string FormatUsage(LimitUsage? usage)
+    {
+        return usage is null
+            ? "Claude usage unavailable"
+            : $"5h left {usage.FiveHourRemainingPercent:0.##}%, weekly left {usage.WeeklyRemainingPercent:0.##}%";
+    }
+
+    private sealed record LimitUsage(
+        double FiveHourRemainingPercent,
+        double WeeklyRemainingPercent,
+        DateTimeOffset? FiveHourResetAt,
+        DateTimeOffset? WeeklyResetAt)
+    {
+        public static LimitUsage FromSnapshot(ClaudeUsageSnapshot snapshot)
+        {
+            return new LimitUsage(
+                ClaudeUsageMath.GetRemainingPercent(snapshot.FiveHourUsedPercent),
+                ClaudeUsageMath.GetRemainingPercent(snapshot.SevenDayUsedPercent),
+                snapshot.FiveHourResetAt,
+                snapshot.SevenDayResetAt);
+        }
+    }
+
 }
 
 internal sealed class CounterWebSocketServer : IDisposable
