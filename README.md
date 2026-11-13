@@ -1,10 +1,10 @@
 # limits
 
-![limits tray counters](docs/counters.png)
+![limits Claude card](docs/counters.png)
 
-*Live tray counters on this machine (left to right): Codex weekly remaining,
-OpenCode Go quotas, Claude 5h/weekly remaining, CPU/GPU load bars. Unconfigured
-providers show `?`, the disk icon appears only while a selected drive is low.*
+*Claude usage card (1:1): quota windows on top, banked limit resets in a
+separate table with title and expiry. The native tray tooltip is disabled —
+hovering an icon shows only this card.*
 
 Windows background monitor for Codex, Claude, Kimi, DeepSeek, Devin, OpenCode,
 OpenRouter, and hardware health. The CPU/GPU load-bars icon is always present in
