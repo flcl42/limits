@@ -31,7 +31,9 @@ the notification area so its context menu is always available.
   reset, and the reset time in local time. Codex and Claude rows also show the
   whole days left until each reset next to the reset time. Monthly rows appear only when that
   provider reports a monthly window or monthly spend; Devin also shows its plan
-  period end when the account status response includes it. The card opens after
+  period end when the account status response includes it. Manual/banked resets
+  (Codex banked resets, Claude limit resets) appear in a separate bottom table
+  with just title and expiry, never mixed into the quota-window rows. The card opens after
   a short hover delay and does not take focus.
 - The CPU/GPU/RAM usage details card lists the five largest resident-RAM
   processes, with process name, PID, and working-set size. The list refreshes
@@ -56,8 +58,9 @@ a fallback when the account endpoint is unavailable. Session `token_count`
 events without any rate-limit window are ignored, since Codex proxies such as
 Modelflare report those as null. Banked rate-limit resets are read from
 `GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits` with the
-same credentials; the tray tooltip and the details-card table show the available
-count with each credit's title and expiry. The Codex tray icon's context menu
+same credentials; the tray tooltip shows the available
+count and the details card lists each credit in its own manual-resets table with
+title and expiry. The Codex tray icon's context menu
 offers `Redeem banked reset...` while at least one reset is available: after a
 confirmation dialog it calls
 `POST https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume`
@@ -76,12 +79,17 @@ the tooltip/menu show granted/used/available amounts, and the WebSocket feed
 exposes them under `modelflare` and inside `codex.modelflare`. The key is used
 only as a bearer credential and is never displayed or included in the payload.
 
-Claude status is read from Claude Code's OAuth usage metadata endpoint. An
-expired access token is refreshed with the stored refresh token, and the last
-valid usage remains visible during transient refresh failures. The app does not
-invoke `claude -p /usage`. Claude limit resets (e.g. promo grants) have no
-public API and can only be redeemed on the Claude website, so they are not
-shown here.
+Claude status is read from Claude Code's OAuth usage metadata endpoint
+(`GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1` with
+`anthropic-beta: oauth-2025-04-20`). An expired access token is refreshed with
+the stored refresh token, and the last valid usage remains visible during
+transient refresh failures. A 400/403 to the `cedar_ember=1` query retries once
+without it so usage windows still load. The app does not invoke
+`claude -p /usage`. Claude limit resets ("Reset for free" in
+Settings > Usage) are read from the `cedar_ember` block of the same response;
+the tray tooltip shows the available count and the details card lists each reset
+in its own manual-resets table with title and expiry. The app never redeems a
+reset; use Claude on the web or desktop instead.
 
 Kimi quota status is read from the Kimi Code usage endpoint with the local Kimi
 OAuth token or `KIMI_API_KEY`. Kimi local

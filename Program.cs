@@ -7,6 +7,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 namespace Limits;
@@ -1848,11 +1849,36 @@ internal sealed class TrayApplication : IDisposable
             ["fiveHourResetAt"] = FormatCounterTimestamp(snapshot.FiveHourResetAt),
             ["sevenDayResetAt"] = FormatCounterTimestamp(snapshot.SevenDayResetAt),
             ["fiveHourRemainingPercent"] = ClaudeUsageMath.GetRemainingPercent(snapshot.FiveHourUsedPercent),
-            ["sevenDayRemainingPercent"] = ClaudeUsageMath.GetRemainingPercent(snapshot.SevenDayUsedPercent)
+            ["sevenDayRemainingPercent"] = ClaudeUsageMath.GetRemainingPercent(snapshot.SevenDayUsedPercent),
+            ["resets"] = BuildClaudeResetsCounterJson(snapshot.ResetCredits)
         };
         SetPercent(result, "fiveHourUsedPercent", snapshot.FiveHourUsedPercent);
         SetPercent(result, "sevenDayUsedPercent", snapshot.SevenDayUsedPercent);
         return result;
+    }
+
+    private static JsonObject? BuildClaudeResetsCounterJson(ClaudeResetCreditsSnapshot? resets)
+    {
+        if (resets is null)
+        {
+            return null;
+        }
+
+        JsonArray credits = [];
+        foreach (ClaudeResetEntry entry in resets.Entries)
+        {
+            credits.Add(new JsonObject
+            {
+                ["title"] = entry.Title,
+                ["expiresAt"] = FormatCounterTimestamp(entry.ExpiresAt)
+            });
+        }
+
+        return new JsonObject
+        {
+            ["availableCount"] = resets.AvailableCount,
+            ["credits"] = credits
+        };
     }
 
     private static JsonObject? BuildKimiCounterJson(KimiUsageSnapshot? snapshot)
@@ -2865,9 +2891,10 @@ internal sealed class TrayApplication : IDisposable
 
         UsageBalloonContent content = BuildUsageBalloonContent(iconId);
         int rowCount = content.Rows.Count;
+        int resetCount = content.ManualResets?.Count ?? 0;
         int processCount = content.TopRamProcesses.Count;
         const int width = 620;
-        int height = 210 + (rowCount * 25) + (string.IsNullOrWhiteSpace(content.SecondaryDetail) ? 0 : 22);
+        int height = 210 + (rowCount * 25) + (resetCount > 0 ? 32 + (resetCount * 25) : 0) + (string.IsNullOrWhiteSpace(content.SecondaryDetail) ? 0 : 22);
         if (processCount > 0)
         {
             height = Math.Max(height, 154 + (rowCount * 25) + (processCount * 23));
@@ -3013,6 +3040,7 @@ internal sealed class TrayApplication : IDisposable
     private UsageBalloonContent BuildUsageBalloonContent(uint iconId)
     {
         List<UsageBalloonRow> rows = [];
+        List<ManualResetRow> manualResets = [];
         string title;
         string summary;
         string detail;
@@ -3043,7 +3071,7 @@ internal sealed class TrayApplication : IDisposable
                     }
                     if (_lastCodexResetCredits is { } codexResets)
                     {
-                        AddCodexResetRows(rows, codexResets);
+                        manualResets.AddRange(GetCodexManualResets(codexResets));
                     }
                 }
                 break;
@@ -3057,6 +3085,10 @@ internal sealed class TrayApplication : IDisposable
                 {
                     rows.Add(CreateQuotaRow("5h limit", claude.FiveHourUsedPercent, 100d - claude.FiveHourUsedPercent, claude.FiveHourResetAt, includeDaysInReset: true));
                     rows.Add(CreateQuotaRow("7d limit", claude.SevenDayUsedPercent, 100d - claude.SevenDayUsedPercent, claude.SevenDayResetAt, includeDaysInReset: true));
+                    if (claude.ResetCredits is { } claudeResets)
+                    {
+                        manualResets.AddRange(GetClaudeManualResets(claudeResets));
+                    }
                 }
                 break;
 
@@ -3176,7 +3208,7 @@ internal sealed class TrayApplication : IDisposable
         IReadOnlyList<RamProcessUsage> topRamProcesses = iconId == MemoryTrayIconId
             ? _lastTopRamProcesses
             : [];
-        return new UsageBalloonContent(title, summary, detail, secondaryDetail, updated, rows, topRamProcesses);
+        return new UsageBalloonContent(title, summary, detail, secondaryDetail, updated, rows, topRamProcesses, manualResets);
     }
 
     private static bool IsUsageProviderIcon(uint iconId)
@@ -3208,7 +3240,7 @@ internal sealed class TrayApplication : IDisposable
         }
     }
 
-    private static void AddCodexResetRows(List<UsageBalloonRow> rows, CodexResetCreditsSnapshot resets)
+    private static IReadOnlyList<ManualResetRow> GetCodexManualResets(CodexResetCreditsSnapshot resets)
     {
         List<CodexResetCredit> available = resets.Credits
             .Where(IsAvailableResetCredit)
@@ -3216,25 +3248,23 @@ internal sealed class TrayApplication : IDisposable
             .ToList();
         if (resets.AvailableCount <= 0 && available.Count == 0)
         {
-            return;
+            return [];
         }
 
-        CodexResetCredit? next = available.FirstOrDefault();
-        rows.Add(new UsageBalloonRow(
-            $"{resets.AvailableCount} banked reset{(resets.AvailableCount == 1 ? "" : "s")}",
-            "available",
-            "—",
-            FormatBalloonCountdown(next?.ExpiresAt),
-            FormatBalloonResetAt(next?.ExpiresAt)));
-        foreach (CodexResetCredit credit in available)
-        {
-            rows.Add(new UsageBalloonRow(
+        return available
+            .Select(credit => new ManualResetRow(
                 string.IsNullOrWhiteSpace(credit.Title) ? "Banked reset" : credit.Title.Trim(),
-                credit.Status ?? "available",
-                "—",
-                FormatBalloonCountdown(credit.ExpiresAt),
-                FormatBalloonResetAt(credit.ExpiresAt)));
-        }
+                credit.ExpiresAt))
+            .ToList();
+    }
+
+    private static IReadOnlyList<ManualResetRow> GetClaudeManualResets(ClaudeResetCreditsSnapshot resets)
+    {
+        return resets.Entries
+            .Where(entry => entry.ExpiresAt is null || entry.ExpiresAt > DateTimeOffset.Now)
+            .OrderBy(entry => entry.ExpiresAt ?? DateTimeOffset.MaxValue)
+            .Select(entry => new ManualResetRow(entry.Title, entry.ExpiresAt))
+            .ToList();
     }
 
     private static bool IsAvailableResetCredit(CodexResetCredit credit)
@@ -3523,6 +3553,43 @@ internal sealed class TrayApplication : IDisposable
                     }
                 }
 
+                if ((content.ManualResets?.Count ?? 0) > 0)
+                {
+                    NativeMethods.RECT separator = new()
+                    {
+                        Left = x,
+                        Top = y + 1,
+                        Right = clientRect.Right - 18,
+                        Bottom = y + 2
+                    };
+                    NativeMethods.FillRect(deviceContext, ref separator, borderBrush);
+                    y += 10;
+
+                    int resetTitleX = x;
+                    int resetExpiresX = x + 370;
+                    int resetTitleWidth = 366;
+                    int resetExpiresWidth = width - 370;
+                    DrawBalloonText(deviceContext, "MANUAL RESET", resetTitleX, y, resetTitleWidth, 18,
+                        ColorRef(134, 145, 160), NativeMethods.DT_LEFT | NativeMethods.DT_SINGLELINE | NativeMethods.DT_VCENTER | NativeMethods.DT_END_ELLIPSIS,
+                        bodyFont);
+                    DrawBalloonText(deviceContext, "EXPIRES AT · LOCAL", resetExpiresX, y, resetExpiresWidth, 18,
+                        ColorRef(134, 145, 160), NativeMethods.DT_RIGHT | NativeMethods.DT_SINGLELINE | NativeMethods.DT_VCENTER | NativeMethods.DT_END_ELLIPSIS,
+                        bodyFont);
+
+                    y += 22;
+                    foreach (ManualResetRow reset in content.ManualResets!)
+                    {
+                        DrawBalloonText(deviceContext, reset.Title, resetTitleX, y, resetTitleWidth, 20,
+                            ColorRef(231, 234, 239), NativeMethods.DT_LEFT | NativeMethods.DT_SINGLELINE | NativeMethods.DT_VCENTER | NativeMethods.DT_END_ELLIPSIS,
+                            bodyFont);
+                        DrawBalloonText(deviceContext, FormatBalloonResetAt(reset.ExpiresAt), resetExpiresX, y, resetExpiresWidth, 20,
+                            ColorRef(231, 234, 239), NativeMethods.DT_RIGHT | NativeMethods.DT_SINGLELINE | NativeMethods.DT_VCENTER | NativeMethods.DT_END_ELLIPSIS,
+                            bodyFont);
+
+                        y += 25;
+                    }
+                }
+
                 if (content.TopRamProcesses.Count > 0)
                 {
                     NativeMethods.RECT separator = new()
@@ -3638,7 +3705,12 @@ internal sealed class TrayApplication : IDisposable
         string SecondaryDetail,
         string Updated,
         IReadOnlyList<UsageBalloonRow> Rows,
-        IReadOnlyList<RamProcessUsage> TopRamProcesses);
+        IReadOnlyList<RamProcessUsage> TopRamProcesses,
+        IReadOnlyList<ManualResetRow>? ManualResets = null);
+
+    private sealed record ManualResetRow(
+        string Title,
+        DateTimeOffset? ExpiresAt);
 
     private sealed record UsageBalloonRow(
         string Limit,
@@ -4463,9 +4535,15 @@ internal sealed class TrayApplication : IDisposable
         int fiveHourRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.FiveHourUsedPercent);
         int sevenDayRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.SevenDayUsedPercent);
 
-        return TruncateTooltip(
+        string tooltip =
             $"Claude: 5h left {fiveHourRemaining}% (reset {FormatTooltipReset(snapshot.FiveHourResetAt)}), " +
-            $"7d left {sevenDayRemaining}% (reset {FormatTooltipReset(snapshot.SevenDayResetAt)})");
+            $"7d left {sevenDayRemaining}% (reset {FormatTooltipReset(snapshot.SevenDayResetAt)})";
+        if (snapshot.ResetCredits is { AvailableCount: > 0 } resets)
+        {
+            tooltip += $"; {resets.AvailableCount} reset{(resets.AvailableCount == 1 ? "" : "s")}";
+        }
+
+        return TruncateTooltip(tooltip);
     }
 
     private static string BuildClaudeStaleTooltip(ClaudeUsageSnapshot snapshot)
@@ -4473,8 +4551,13 @@ internal sealed class TrayApplication : IDisposable
         int fiveHourRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.FiveHourUsedPercent);
         int sevenDayRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.SevenDayUsedPercent);
 
-        return TruncateTooltip(
-            $"Claude: 5h left {fiveHourRemaining}%, 7d left {sevenDayRemaining}% (last known)");
+        string tooltip = $"Claude: 5h left {fiveHourRemaining}%, 7d left {sevenDayRemaining}% (last known)";
+        if (snapshot.ResetCredits is { AvailableCount: > 0 } staleResets)
+        {
+            tooltip += $"; {staleResets.AvailableCount} reset{(staleResets.AvailableCount == 1 ? "" : "s")}";
+        }
+
+        return TruncateTooltip(tooltip);
     }
 
     private static string BuildClaudeHeadline(ClaudeUsageSnapshot snapshot)
@@ -6152,7 +6235,18 @@ internal sealed record ClaudeUsageSnapshot(
     double SevenDayUsedPercent,
     DateTimeOffset? FiveHourResetAt,
     DateTimeOffset? SevenDayResetAt,
-    string SourceFile);
+    string SourceFile,
+    ClaudeResetCreditsSnapshot? ResetCredits = null);
+
+internal sealed record ClaudeResetEntry(
+    string Title,
+    DateTimeOffset? ExpiresAt);
+
+internal sealed record ClaudeResetCreditsSnapshot(
+    DateTimeOffset Timestamp,
+    int AvailableCount,
+    IReadOnlyList<ClaudeResetEntry> Entries,
+    string Source);
 
 internal sealed record ClaudeUsageReadResult(ClaudeUsageSnapshot? Snapshot, string? ErrorMessage);
 
@@ -6175,11 +6269,11 @@ internal sealed class ClaudeUsageReader
         try
         {
             ClaudeCredential credential = ReadCredential();
-            ClaudeHttpResponse response = SendUsageRequest(credential.AccessToken);
+            ClaudeHttpResponse response = SendUsageRequestWithFallback(credential.AccessToken);
             if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized && credential.CanRefresh)
             {
                 credential = RefreshCredential(credential);
-                response = SendUsageRequest(credential.AccessToken);
+                response = SendUsageRequestWithFallback(credential.AccessToken);
             }
 
             if (!response.IsSuccessStatusCode)
@@ -6201,16 +6295,136 @@ internal sealed class ClaudeUsageReader
         }
     }
 
-    private static ClaudeHttpResponse SendUsageRequest(string accessToken)
+    private static ClaudeHttpResponse SendUsageRequestWithFallback(string accessToken)
     {
-        using HttpRequestMessage request = new(HttpMethod.Get, UsageEndpoint);
+        ClaudeHttpResponse response = SendUsageRequest(accessToken, withResetInventory: true);
+        if ((response.StatusCode == System.Net.HttpStatusCode.BadRequest ||
+             response.StatusCode == System.Net.HttpStatusCode.Forbidden) &&
+            (response.Body is null || !response.Body.Contains("user:profile", StringComparison.Ordinal)))
+        {
+            // The optional reset-inventory query is rejected by some accounts/proxies.
+            // Retry once without it so usage windows still load.
+            response = SendUsageRequest(accessToken, withResetInventory: false);
+        }
+
+        return response;
+    }
+
+    private static ClaudeHttpResponse SendUsageRequest(string accessToken, bool withResetInventory = true)
+    {
+        string claudeVersion = GetClaudeCodeVersion();
+        string endpoint = withResetInventory ? $"{UsageEndpoint}?cedar_ember=1" : UsageEndpoint;
+        using HttpRequestMessage request = new(HttpMethod.Get, endpoint);
         request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {accessToken}");
         request.Headers.TryAddWithoutValidation("Accept", "application/json");
-        request.Headers.TryAddWithoutValidation("User-Agent", "limits/1.3");
+        request.Headers.TryAddWithoutValidation("anthropic-beta", "oauth-2025-04-20");
+        // The reset inventory (cedar_ember) is server-gated on the CLI version:
+        // an outdated version string yields eligible=false with no grants.
+        request.Headers.TryAddWithoutValidation("User-Agent", withResetInventory
+            ? $"claude-cli/{claudeVersion} (external, cli)"
+            : $"claude-code/{claudeVersion}");
 
         using HttpResponseMessage response = HttpClient.Send(request);
         string responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
         return new ClaudeHttpResponse(response.StatusCode, responseBody);
+    }
+
+    private static string? _cachedClaudeVersion;
+    private static DateTimeOffset _cachedClaudeVersionAt;
+    private static readonly object ClaudeVersionLock = new();
+    private const string ClaudeVersionFallback = "2.1.0";
+
+    private static string GetClaudeCodeVersion()
+    {
+        lock (ClaudeVersionLock)
+        {
+            if (_cachedClaudeVersion is not null &&
+                DateTimeOffset.Now - _cachedClaudeVersionAt < TimeSpan.FromHours(1))
+            {
+                return _cachedClaudeVersion;
+            }
+        }
+
+        string detected = DetectClaudeCodeVersion() ?? ClaudeVersionFallback;
+        lock (ClaudeVersionLock)
+        {
+            _cachedClaudeVersion = detected;
+            _cachedClaudeVersionAt = DateTimeOffset.Now;
+            return detected;
+        }
+    }
+
+    private static string? DetectClaudeCodeVersion()
+    {
+        foreach (string binary in ResolveClaudeBinaries())
+        {
+            try
+            {
+                using Process process = new();
+                process.StartInfo = new ProcessStartInfo
+                {
+                    FileName = binary,
+                    Arguments = "--version",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+                process.Start();
+                if (!process.WaitForExit(10_000))
+                {
+                    try { process.Kill(); } catch { }
+                    continue;
+                }
+
+                string output = process.StandardOutput.ReadToEnd() + " " + process.StandardError.ReadToEnd();
+                Match match = Regex.Match(output, @"\d+\.\d+\.\d+");
+                if (match.Success)
+                {
+                    return match.Value;
+                }
+            }
+            catch
+            {
+                // Try the next candidate binary.
+            }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<string> ResolveClaudeBinaries()
+    {
+        HashSet<string> seen = new(StringComparer.OrdinalIgnoreCase);
+        List<string> candidates = [];
+        string? pathVariable = Environment.GetEnvironmentVariable("PATH");
+        if (!string.IsNullOrWhiteSpace(pathVariable))
+        {
+            foreach (string directory in pathVariable.Split(Path.PathSeparator))
+            {
+                if (string.IsNullOrWhiteSpace(directory))
+                {
+                    continue;
+                }
+
+                candidates.Add(Path.Combine(directory.Trim(), "claude.cmd"));
+                candidates.Add(Path.Combine(directory.Trim(), "claude.exe"));
+            }
+        }
+
+        string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        if (!string.IsNullOrWhiteSpace(appData))
+        {
+            candidates.Add(Path.Combine(appData, "npm", "claude.cmd"));
+        }
+
+        foreach (string candidate in candidates)
+        {
+            if (seen.Add(candidate) && File.Exists(candidate))
+            {
+                yield return candidate;
+            }
+        }
     }
 
     private static string ResolveClaudeHome()
@@ -6392,7 +6606,209 @@ internal sealed class ClaudeUsageReader
             sevenDay.UsedPercent,
             fiveHour.ResetsAt,
             sevenDay.ResetsAt,
-            UsageEndpoint);
+            UsageEndpoint,
+            ParseClaudeResetCredits(root));
+    }
+
+    internal static ClaudeResetCreditsSnapshot? ParseClaudeResetCredits(JsonElement root)
+    {
+        // Mirrors CodexBar's cedar_ember parsing: eligible must be true, grants capped,
+        // malformed grants dropped, total capped at 50. Never throws.
+        try
+        {
+            if (!root.TryGetProperty("cedar_ember", out JsonElement resetBlock) ||
+                resetBlock.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+
+            if (!resetBlock.TryGetProperty("eligible", out JsonElement eligibleElement) ||
+                eligibleElement.ValueKind != JsonValueKind.True)
+            {
+                return null;
+            }
+
+            if (!resetBlock.TryGetProperty("grants", out JsonElement grantsElement) ||
+                grantsElement.ValueKind != JsonValueKind.Array)
+            {
+                return null;
+            }
+
+            const int maxGrantRecords = 200;
+            const int maxResets = 50;
+            int recordCount = 0;
+            foreach (JsonElement _ in grantsElement.EnumerateArray())
+            {
+                recordCount++;
+                if (recordCount > maxGrantRecords)
+                {
+                    return null;
+                }
+            }
+
+            if (recordCount > maxGrantRecords)
+            {
+                return null;
+            }
+
+            DateTimeOffset now = DateTimeOffset.Now;
+            List<ClaudeResetEntry> entries = [];
+            int total = 0;
+            foreach (JsonElement grant in grantsElement.EnumerateArray())
+            {
+                if (grant.ValueKind != JsonValueKind.Object)
+                {
+                    continue;
+                }
+
+                if (!TryReadInt(grant, "resets_left", out int resetsLeft) || resetsLeft <= 0)
+                {
+                    continue;
+                }
+
+                if (TryReadInt(grant, "resets_total", out int resetsTotal) && resetsTotal < resetsLeft)
+                {
+                    continue;
+                }
+
+                if (!grant.TryGetProperty("paused", out JsonElement pausedElement) ||
+                    (pausedElement.ValueKind != JsonValueKind.True && pausedElement.ValueKind != JsonValueKind.False) ||
+                    pausedElement.GetBoolean())
+                {
+                    continue;
+                }
+
+                if (!TryReadOptionalDate(grant, "starts_at", out DateTimeOffset? startsAt) ||
+                    !TryReadOptionalDate(grant, "ends_at", out DateTimeOffset? endsAt))
+                {
+                    continue;
+                }
+
+                if (startsAt is { } start && start > now)
+                {
+                    continue;
+                }
+
+                if (endsAt is { } end && end <= now)
+                {
+                    continue;
+                }
+
+                if (total + resetsLeft > maxResets)
+                {
+                    return null;
+                }
+
+                string title = ReadClaudeGrantTitle(grant);
+                for (int i = 0; i < resetsLeft; i++)
+                {
+                    entries.Add(new ClaudeResetEntry(title, endsAt));
+                }
+
+                total += resetsLeft;
+            }
+
+            if (entries.Count == 0)
+            {
+                return null;
+            }
+
+            entries.Sort(static (a, b) =>
+                (a.ExpiresAt ?? DateTimeOffset.MaxValue).CompareTo(b.ExpiresAt ?? DateTimeOffset.MaxValue));
+            return new ClaudeResetCreditsSnapshot(now, entries.Count, entries, UsageEndpoint);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string ReadClaudeGrantTitle(JsonElement grant)
+    {
+        foreach (string name in new[] { "label", "title", "name" })
+        {
+            if (grant.TryGetProperty(name, out JsonElement element) &&
+                element.ValueKind == JsonValueKind.String &&
+                !string.IsNullOrWhiteSpace(element.GetString()))
+            {
+                return element.GetString()!.Trim();
+            }
+        }
+
+        if (grant.TryGetProperty("clears", out JsonElement clears) &&
+            clears.ValueKind == JsonValueKind.Array)
+        {
+            List<string> scopes = [];
+            foreach (JsonElement item in clears.EnumerateArray())
+            {
+                if (item.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(item.GetString()))
+                {
+                    scopes.Add(item.GetString()!);
+                }
+            }
+
+            bool mentionsFable = scopes.Any(scope => scope.Contains("fable", StringComparison.OrdinalIgnoreCase));
+            bool mentionsFiveHour = scopes.Any(scope => scope.Contains("five_hour", StringComparison.OrdinalIgnoreCase));
+            bool mentionsSevenDay = scopes.Any(scope => scope.Contains("seven_day", StringComparison.OrdinalIgnoreCase));
+            if (mentionsFable && !mentionsFiveHour && !mentionsSevenDay)
+            {
+                return "Fable reset";
+            }
+
+            if (mentionsFiveHour || mentionsSevenDay)
+            {
+                return "Full reset";
+            }
+        }
+
+        return "Reset";
+    }
+
+    private static bool TryReadInt(JsonElement parent, string propertyName, out int value)
+    {
+        value = 0;
+        if (!parent.TryGetProperty(propertyName, out JsonElement element))
+        {
+            return false;
+        }
+
+        if (element.ValueKind == JsonValueKind.Number && element.TryGetInt32(out int parsed))
+        {
+            value = parsed;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryReadOptionalDate(JsonElement parent, string propertyName, out DateTimeOffset? value)
+    {
+        value = null;
+        if (!parent.TryGetProperty(propertyName, out JsonElement element) ||
+            element.ValueKind == JsonValueKind.Null ||
+            element.ValueKind == JsonValueKind.Undefined)
+        {
+            return true;
+        }
+
+        if (element.ValueKind != JsonValueKind.String)
+        {
+            return false;
+        }
+
+        string? text = element.GetString();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return true;
+        }
+
+        if (DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out DateTimeOffset parsed))
+        {
+            value = parsed;
+            return true;
+        }
+
+        return false;
     }
 
     private static bool TryReadLimit(JsonElement root, string name, out UsageLimit limit)
