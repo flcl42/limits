@@ -1778,7 +1778,12 @@ internal sealed partial class TrayApplication : IDisposable
             ["isAvailable"] = true,
             ["rolling"] = BuildOpenCodeGoWindowCounterJson(snapshot.Rolling, OpenCodeGoLimits.RollingUsd),
             ["weekly"] = BuildOpenCodeGoWindowCounterJson(snapshot.Weekly, OpenCodeGoLimits.WeeklyUsd),
-            ["monthly"] = BuildOpenCodeGoWindowCounterJson(snapshot.Monthly, null)
+            ["monthly"] = BuildOpenCodeGoWindowCounterJson(snapshot.Monthly, null),
+            ["extraUsage"] = new JsonObject
+            {
+                ["active"] = IsOpenCodeGoExtraUsage(snapshot),
+                ["resetsAt"] = FormatCounterTimestamp(GetOpenCodeGoRefillAt(snapshot))
+            }
         };
     }
 
@@ -2772,9 +2777,16 @@ internal sealed partial class TrayApplication : IDisposable
                 updated = _openCodeUpdatedText;
                 if (_lastOpenCodeGoSnapshot is { } openCode)
                 {
-                    rows.Add(CreateQuotaRow("5h limit", openCode.Rolling.UsedPercent, 100d - openCode.Rolling.UsedPercent, openCode.Rolling.ResetAt));
-                    rows.Add(CreateQuotaRow("Weekly limit", openCode.Weekly.UsedPercent, 100d - openCode.Weekly.UsedPercent, openCode.Weekly.ResetAt));
-                    rows.Add(CreateQuotaRow("Monthly limit", openCode.Monthly.UsedPercent, 100d - openCode.Monthly.UsedPercent, openCode.Monthly.ResetAt));
+                    if (IsOpenCodeGoExtraUsage(openCode))
+                    {
+                        rows.Add(CreateExtraUsageRow(GetOpenCodeGoRefillAt(openCode)));
+                    }
+                    else
+                    {
+                        rows.Add(CreateQuotaRow("5h limit", openCode.Rolling.UsedPercent, 100d - openCode.Rolling.UsedPercent, openCode.Rolling.ResetAt));
+                        rows.Add(CreateQuotaRow("Weekly limit", openCode.Weekly.UsedPercent, 100d - openCode.Weekly.UsedPercent, openCode.Weekly.ResetAt));
+                        rows.Add(CreateQuotaRow("Monthly limit", openCode.Monthly.UsedPercent, 100d - openCode.Monthly.UsedPercent, openCode.Monthly.ResetAt));
+                    }
                 }
                 break;
 
@@ -2976,6 +2988,19 @@ internal sealed partial class TrayApplication : IDisposable
             FormatUsagePercent(remainingPercent),
             FormatBalloonCountdown(resetAt),
             includeDaysInReset ? FormatBalloonResetWithDays(resetAt) : FormatBalloonResetAt(resetAt));
+    }
+
+    private static UsageBalloonRow CreateExtraUsageRow(DateTimeOffset? refillAt)
+    {
+        // No API exposes the Console credit balance to the Go key, so the
+        // remaining balance stays unknown ("?"); the refill countdown tells
+        // when quota windows reopen and credit billing stops.
+        return new UsageBalloonRow(
+            "Extra Usage (credits)",
+            "billing",
+            "?",
+            FormatBalloonCountdown(refillAt),
+            FormatBalloonResetAt(refillAt));
     }
 
     private static void AddSpendRow(List<UsageBalloonRow> rows, string label, decimal? amount)
@@ -4233,9 +4258,41 @@ internal sealed partial class TrayApplication : IDisposable
 
     private static string BuildOpenCodeGoSummary(OpenCodeGoUsageSnapshot snapshot)
     {
+        if (IsOpenCodeGoExtraUsage(snapshot))
+        {
+            return $"Extra Usage (credits), quota back {FormatResetCountdown(GetOpenCodeGoRefillAt(snapshot))}";
+        }
+
         return $"5h {CodexUsageMath.GetRemainingPercent(snapshot.Rolling.UsedPercent)}% left, " +
                $"weekly {CodexUsageMath.GetRemainingPercent(snapshot.Weekly.UsedPercent)}% left, " +
                $"monthly {CodexUsageMath.GetRemainingPercent(snapshot.Monthly.UsedPercent)}% left";
+    }
+
+    private static bool IsOpenCodeGoExtraUsage(OpenCodeGoUsageSnapshot snapshot)
+    {
+        return IsExhaustedGoWindow(snapshot.Rolling) ||
+               IsExhaustedGoWindow(snapshot.Weekly) ||
+               IsExhaustedGoWindow(snapshot.Monthly);
+    }
+
+    private static bool IsExhaustedGoWindow(OpenCodeGoUsageWindow window)
+    {
+        // An exhausted window reports status "rate-limited", but the endpoint was
+        // observed flipping it back to "ok" at 100% between calls, so a full
+        // window counts as exhausted either way. Usage then falls back to the
+        // Console credit balance when Extra Usage is on.
+        return string.Equals(window.Status, "rate-limited", StringComparison.OrdinalIgnoreCase) ||
+               window.UsedPercent >= 100d;
+    }
+
+    private static DateTimeOffset? GetOpenCodeGoRefillAt(OpenCodeGoUsageSnapshot snapshot)
+    {
+        return new[] { snapshot.Rolling, snapshot.Weekly, snapshot.Monthly }
+            .Where(IsExhaustedGoWindow)
+            .Select(window => window.ResetAt)
+            .Where(resetAt => resetAt is not null)
+            .OrderBy(resetAt => resetAt)
+            .FirstOrDefault();
     }
 
     private static string FormatOpenCodeGoError(string text, string? goUsageError)
