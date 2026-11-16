@@ -210,6 +210,23 @@ Branches: `master` holds the common features documented above. Personal-only
 integrations (UNET ISP balance, NBRB BYN rates, private calendar feed,
 pause/resume batch watchdog) live in the `flcl` branch.
 
+Personal (`flcl`) releases are published as *draft* releases in the same repo,
+so they stay invisible to the public while the owner can install them with one
+command. Cut a new one from the `flcl` branch (tag scheme `v<version>-flcl.N`):
+
+```powershell
+dotnet publish .\limits.csproj -c Release -r win-x64 -o .\publish\flcl-stage -p:PublishAot=true -p:SelfContained=true -p:InvariantGlobalization=true
+Copy-Item .\publish\flcl-stage\limits.exe .\publish\limits-flcl.exe -Force
+gh release create v1.6.2-flcl.2 .\publish\limits-flcl.exe --draft --title "limits flcl (private draft)" --notes "Personal build from flcl branch." --target flcl
+```
+
+Install the newest flcl draft to `C:\Programs` (replaces the running tray app,
+Windows logon keeps using it):
+
+```powershell
+.\install-flcl.ps1
+```
+
 The app uses raw Win32 tray APIs and does not depend on the Windows Desktop framework.
 
 Download the latest released executable to the current directory:
