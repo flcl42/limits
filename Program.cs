@@ -9934,12 +9934,14 @@ internal static class TrayIconRenderer
         UnknownColor: 0xFF444444,
         DangerColor: 0xFF9D2B22,
         WarningColor: 0xFF8C5D00,
-        SafeColor: 0xFF1E6F36);
+        SafeColor: 0xFF1E6F36,
+        EmptyBarColor: 0xFFBDBDBD);
     private static readonly IconPalette DarkThemePalette = new(
         UnknownColor: 0xFFD8D8D8,
         DangerColor: 0xFFFF6C62,
         WarningColor: 0xFFF1C84A,
-        SafeColor: 0xFF72E089);
+        SafeColor: 0xFF72E089,
+        EmptyBarColor: 0xFF555555);
 
     private static readonly IReadOnlyDictionary<char, string[]> Glyphs = new Dictionary<char, string[]>
     {
@@ -10287,22 +10289,26 @@ internal static class TrayIconRenderer
             pixels,
             0,
             GetUsageRatio(snapshot.CpuUsagePercent),
-            ColorForUsage(snapshot.CpuUsagePercent, palette, CpuBarColor));
+            ColorForUsage(snapshot.CpuUsagePercent, palette, CpuBarColor),
+            palette.EmptyBarColor);
         DrawUsageBar(
             pixels,
             4,
             GetUsageRatio(snapshot.GpuUsagePercent),
-            ColorForUsage(snapshot.GpuUsagePercent, palette, GpuBarColor));
+            ColorForUsage(snapshot.GpuUsagePercent, palette, GpuBarColor),
+            palette.EmptyBarColor);
         DrawUsageBar(
             pixels,
             8,
             GetUsageRatio(snapshot.RamUsagePercent),
-            ColorForUsage(snapshot.RamUsagePercent, palette, RamBarColor));
+            ColorForUsage(snapshot.RamUsagePercent, palette, RamBarColor),
+            palette.EmptyBarColor);
         DrawUsageBar(
             pixels,
             12,
             GetUsageRatio(snapshot.VramUsagePercent),
-            ColorForUsage(snapshot.VramUsagePercent, palette, VramBarColor));
+            ColorForUsage(snapshot.VramUsagePercent, palette, VramBarColor),
+            palette.EmptyBarColor);
         return CreateNativeIcon(pixels);
     }
 
@@ -10446,14 +10452,13 @@ internal static class TrayIconRenderer
         }
     }
 
-    private static void DrawUsageBar(uint[] pixels, int y, double? ratio, uint fillColor)
+    private static void DrawUsageBar(uint[] pixels, int y, double? ratio, uint fillColor, uint emptyColor)
     {
         const int segmentCount = 5;
         const int segmentWidth = 2;
         const int segmentGap = 1;
         const int startX = 1;
         const int height = 3;
-        const uint EmptyBarColor = 0xFF555555;
         int filledSegments = ratio is null
             ? 0
             : Math.Clamp((int)Math.Round(ratio.Value * segmentCount, MidpointRounding.AwayFromZero), 0, segmentCount);
@@ -10461,10 +10466,10 @@ internal static class TrayIconRenderer
         for (int segment = 0; segment < segmentCount; segment++)
         {
             uint color = ratio is null
-                ? EmptyBarColor
+                ? emptyColor
                 : segment < filledSegments
                     ? fillColor
-                    : EmptyBarColor;
+                    : emptyColor;
             int x = startX + (segment * (segmentWidth + segmentGap));
             for (int row = y; row < y + height; row++)
             {
@@ -10695,7 +10700,7 @@ internal static class TrayIconRenderer
         }
     }
 
-    private sealed record IconPalette(uint UnknownColor, uint DangerColor, uint WarningColor, uint SafeColor);
+    private sealed record IconPalette(uint UnknownColor, uint DangerColor, uint WarningColor, uint SafeColor, uint EmptyBarColor);
 }
 
 internal sealed class DiskSettingsWindow : IDisposable
