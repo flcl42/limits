@@ -1,10 +1,12 @@
 # limits
 
-![limits Claude card](docs/counters.png)
+<p align="center">
+  <img src="docs/counters.png" alt="limits Claude card" />
+</p>
 
-*Claude usage card (1:1) above the tray with all icons: quota windows on top,
+<p align="center"><i>Claude usage card (1:1) above the tray with all icons: quota windows on top,
 banked limit resets in a separate table with title and expiry. The native tray
-tooltip is disabled — hovering an icon shows only this card.*
+tooltip is disabled — hovering an icon shows only this card.</i></p>
 
 Windows background monitor for Codex, Claude, Kimi, DeepSeek, Devin, OpenCode,
 OpenRouter, and hardware health. The CPU/GPU load-bars icon is always present in
