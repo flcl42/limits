@@ -128,7 +128,14 @@ a daily quota. These are exposed under
 `openCode.go.rolling`, `openCode.go.weekly`, and `openCode.go.monthly`, each with
 `status`, `usedPercent`, `remainingPercent`, `limitUsd`, and `resetAt`. OpenCode
 states that included monthly usage varies by model, so the monthly `limitUsd` is
-null rather than assuming one fixed dollar cap. The API key is used only as a
+null rather than assuming one fixed dollar cap. When any window reports
+`status: "rate-limited"` (or 100% used — the endpoint flip-flops between the
+two for exhausted windows), the details card replaces the three quota rows with
+a single `Extra Usage (credits)` row, since requests then bill the Console
+credit balance when Extra Usage is on; no API exposes that balance to the Go
+key, so it stays unknown and only the quota refill countdown is shown. The
+WebSocket `go` object carries an `extraUsage` flag (`active` plus `resetsAt`)
+for the same state. The API key is used only as a
 bearer credential and is never included in the WebSocket payload.
 
 OpenRouter balance is read from `GET https://openrouter.ai/api/v1/key` (key
