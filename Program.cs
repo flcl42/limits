@@ -10351,18 +10351,18 @@ internal static class TrayIconRenderer
         DrawUsageBar(
             pixels,
             4,
-            GetUsageRatio(snapshot.GpuUsagePercent),
-            ColorForUsage(snapshot.GpuUsagePercent, palette, GpuBarColor),
-            palette.EmptyBarColor);
-        DrawUsageBar(
-            pixels,
-            8,
             GetUsageRatio(snapshot.RamUsagePercent),
             ColorForUsage(snapshot.RamUsagePercent, palette, RamBarColor),
             palette.EmptyBarColor);
         DrawUsageBar(
             pixels,
-            12,
+            9,
+            GetUsageRatio(snapshot.GpuUsagePercent),
+            ColorForUsage(snapshot.GpuUsagePercent, palette, GpuBarColor),
+            palette.EmptyBarColor);
+        DrawUsageBar(
+            pixels,
+            13,
             GetUsageRatio(snapshot.VramUsagePercent),
             ColorForUsage(snapshot.VramUsagePercent, palette, VramBarColor),
             palette.EmptyBarColor);
